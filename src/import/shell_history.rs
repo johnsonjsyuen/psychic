@@ -23,7 +23,7 @@ use std::path::{Component, Path, PathBuf};
 
 /// One command from a history file, with when it ran if the file says.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct HistoryCommand {
+pub(crate) struct HistoryCommand {
     pub text: String,
     pub timestamp: Option<i64>,
 }
@@ -89,7 +89,7 @@ fn unmetafy(bytes: &[u8]) -> Vec<u8> {
 /// `~/.zsh_history`: either plain lines, or `: <start>:<elapsed>;<command>`
 /// with `EXTENDED_HISTORY`. A command spanning lines ends each but the last
 /// with a backslash.
-pub(super) fn parse_zsh(bytes: &[u8]) -> Vec<HistoryCommand> {
+pub(crate) fn parse_zsh(bytes: &[u8]) -> Vec<HistoryCommand> {
     let text = String::from_utf8_lossy(&unmetafy(bytes)).into_owned();
     let mut commands = Vec::new();
     let mut pending: Option<HistoryCommand> = None;
@@ -133,7 +133,7 @@ fn parse_zsh_line(line: &str) -> HistoryCommand {
 
 /// `~/.bash_history`: one command per line, each preceded by `#<epoch>` when
 /// `HISTTIMEFORMAT` was set.
-pub(super) fn parse_bash(bytes: &[u8]) -> Vec<HistoryCommand> {
+pub(crate) fn parse_bash(bytes: &[u8]) -> Vec<HistoryCommand> {
     let text = String::from_utf8_lossy(bytes);
     let mut commands = Vec::new();
     let mut timestamp = None;
@@ -155,7 +155,7 @@ pub(super) fn parse_bash(bytes: &[u8]) -> Vec<HistoryCommand> {
 /// `fish_history`: a YAML-like list of `- cmd: <command>` entries with a
 /// `  when: <epoch>` line. Newlines and backslashes in the command are escaped
 /// as `\n` and `\\`.
-pub(super) fn parse_fish(bytes: &[u8]) -> Vec<HistoryCommand> {
+pub(crate) fn parse_fish(bytes: &[u8]) -> Vec<HistoryCommand> {
     let text = String::from_utf8_lossy(bytes);
     let mut commands: Vec<HistoryCommand> = Vec::new();
     for line in text.lines() {
@@ -346,6 +346,65 @@ fn resolve(word: &str, cwd: Option<&Path>, home: &Path) -> Option<PathBuf> {
     cwd.map(|cwd| join_logically(cwd, path))
 }
 
+/// A simple command's name and arguments, as the replay sees it.
+struct NamedCommand {
+    name: String,
+    arguments: Vec<Option<String>>,
+}
+
+/// Skip `FOO=bar` assignments and `builtin`/`command` in front, and split off
+/// the command name. `None` when there is no name, or it is unknown.
+fn command_words(words: Vec<Option<String>>) -> Option<NamedCommand> {
+    let mut words = words.into_iter().skip_while(|word| match word {
+        Some(word) => {
+            word.contains('=') && !word.starts_with('=') || word == "builtin" || word == "command"
+        }
+        None => false,
+    });
+    let Some(Some(name)) = words.next() else {
+        return None;
+    };
+    Some(NamedCommand {
+        name,
+        arguments: words.collect(),
+    })
+}
+
+/// What one simple command does to the directory the replay believes it is in.
+enum CwdStep {
+    /// `cd`/`pushd`: the target before it is checked on disk; `None` = unknowable.
+    Cd(Option<PathBuf>),
+    /// A command in [`CWD_LOSING_COMMANDS`].
+    Lost,
+    Unchanged,
+}
+
+fn cwd_step(
+    name: &str,
+    arguments: &[Option<String>],
+    cwd: Option<&Path>,
+    previous: Option<&Path>,
+    home: &Path,
+) -> CwdStep {
+    if name == "cd" || name == "pushd" {
+        let operands: Vec<&Option<String>> = arguments
+            .iter()
+            .filter(|word| !matches!(word, Some(word) if word.starts_with('-') && word != "-"))
+            .collect();
+        let target = match operands.as_slice() {
+            [] => Some(home.to_path_buf()),
+            [Some(word)] if word == "-" => previous.map(Path::to_path_buf),
+            [Some(word)] => resolve(word, cwd, home),
+            _ => None,
+        };
+        CwdStep::Cd(target)
+    } else if CWD_LOSING_COMMANDS.contains(&name) {
+        CwdStep::Lost
+    } else {
+        CwdStep::Unchanged
+    }
+}
+
 /// Replay `commands` from `$HOME`, reporting every directory `cd`'d into and
 /// every path handed to an editor or pager. `probe` says whether a path exists
 /// and what it is, and returns `None` for anything off limits.
@@ -368,55 +427,67 @@ pub(super) fn replay(
 
     for command in commands {
         for words in simple_commands(&command.text) {
-            // Skip `FOO=bar` assignments and `builtin`/`command` in front.
-            let mut words = words.into_iter().skip_while(|word| match word {
-                Some(word) => {
-                    word.contains('=') && !word.starts_with('=')
-                        || word == "builtin"
-                        || word == "command"
-                }
-                None => false,
-            });
-            let Some(Some(name)) = words.next() else {
+            let Some(NamedCommand { name, arguments }) = command_words(words) else {
                 continue;
             };
-            let arguments: Vec<Option<String>> = words.collect();
-
-            if name == "cd" || name == "pushd" {
-                let operands: Vec<&Option<String>> = arguments
-                    .iter()
-                    .filter(
-                        |word| !matches!(word, Some(word) if word.starts_with('-') && word != "-"),
-                    )
-                    .collect();
-                let target = match operands.as_slice() {
-                    [] => Some(home.to_path_buf()),
-                    [Some(word)] if word == "-" => previous.clone(),
-                    [Some(word)] => resolve(word, cwd.as_deref(), home),
-                    _ => None,
-                };
-                let target = target.filter(|path| probe(path) == Some(PathKind::Dir));
-                if let Some(target) = &target {
-                    sightings.push(sight(target.clone(), command.timestamp));
-                }
-                previous = std::mem::replace(&mut cwd, target);
-            } else if CWD_LOSING_COMMANDS.contains(&name.as_str()) {
-                previous = cwd.take();
-            } else if OPENING_COMMANDS.contains(&name.as_str()) {
-                for word in arguments.iter().flatten() {
-                    if word.starts_with('-') || word.starts_with('+') {
-                        continue;
+            match cwd_step(&name, &arguments, cwd.as_deref(), previous.as_deref(), home) {
+                CwdStep::Cd(target) => {
+                    let target = target.filter(|path| probe(path) == Some(PathKind::Dir));
+                    if let Some(target) = &target {
+                        sightings.push(sight(target.clone(), command.timestamp));
                     }
-                    if let Some(path) = resolve(word, cwd.as_deref(), home)
-                        && probe(&path).is_some()
-                    {
-                        sightings.push(sight(path, command.timestamp));
+                    previous = std::mem::replace(&mut cwd, target);
+                }
+                CwdStep::Lost => previous = cwd.take(),
+                CwdStep::Unchanged if OPENING_COMMANDS.contains(&name.as_str()) => {
+                    for word in arguments.iter().flatten() {
+                        if word.starts_with('-') || word.starts_with('+') {
+                            continue;
+                        }
+                        if let Some(path) = resolve(word, cwd.as_deref(), home)
+                            && probe(&path).is_some()
+                        {
+                            sightings.push(sight(path, command.timestamp));
+                        }
                     }
                 }
+                CwdStep::Unchanged => {}
             }
         }
     }
     sightings
+}
+
+/// For each command, the directory it was typed in, as far as a replay from
+/// `$HOME` can tell: the state *before* the command's own `cd`s apply. `None`
+/// where the replay has lost track. `is_dir` decides whether a `cd` target
+/// exists. The output has one entry per command.
+pub(crate) fn replay_cwds(
+    commands: &[HistoryCommand],
+    home: &Path,
+    is_dir: &mut dyn FnMut(&Path) -> bool,
+) -> Vec<Option<PathBuf>> {
+    let mut out = Vec::with_capacity(commands.len());
+    let mut cwd: Option<PathBuf> = Some(home.to_path_buf());
+    let mut previous: Option<PathBuf> = None;
+    for command in commands {
+        out.push(cwd.clone());
+        for words in simple_commands(&command.text) {
+            let Some(NamedCommand { name, arguments }) = command_words(words) else {
+                continue;
+            };
+            match cwd_step(&name, &arguments, cwd.as_deref(), previous.as_deref(), home) {
+                CwdStep::Cd(target) => {
+                    let target = target.filter(|path| is_dir(path));
+                    previous = std::mem::replace(&mut cwd, target);
+                }
+                CwdStep::Lost => previous = cwd.take(),
+                CwdStep::Unchanged => {}
+            }
+        }
+    }
+    assert_eq!(out.len(), commands.len(), "one directory per command");
+    out
 }
 
 #[cfg(test)]
@@ -576,6 +647,44 @@ mod tests {
                 &[("/h/notes.md", PathKind::File)]
             ),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn replay_cwds_reports_where_each_command_was_typed() {
+        let commands: Vec<HistoryCommand> = [
+            "cd a",
+            "ls",
+            "cd b && make",
+            "z foo",
+            "ls",
+            "cd /h/a",
+            "pwd",
+        ]
+        .iter()
+        .map(|line| command(line, None))
+        .collect();
+        let dirs = ["/h", "/h/a", "/h/a/b"];
+        let mut is_dir = |path: &Path| dirs.iter().any(|dir| Path::new(dir) == path);
+
+        let cwds: Vec<Option<String>> = replay_cwds(&commands, Path::new("/h"), &mut is_dir)
+            .into_iter()
+            .map(|cwd| cwd.map(|cwd| cwd.display().to_string()))
+            .collect();
+
+        let some = |dir: &str| Some(dir.to_string());
+        assert_eq!(
+            cwds,
+            vec![
+                some("/h"),
+                some("/h/a"),
+                some("/h/a"),
+                some("/h/a/b"),
+                None,
+                None,
+                some("/h/a")
+            ],
+            "a command's own cd does not apply to itself; a lost cwd is regained by an absolute cd"
         );
     }
 }

@@ -2,6 +2,7 @@ mod analytics;
 mod analyze_perf;
 mod app;
 mod cli;
+mod cmd;
 mod context;
 mod db;
 mod feature_defs;
@@ -223,6 +224,12 @@ fn main() -> Result<()> {
         .clone()
         .or_else(|| cli::get_default_data_dir().ok());
 
+    // Runs on every prompt, in the background. It never sets up the logger and
+    // never opens app.log: speed, and command text cannot reach a log that is not open.
+    if let Some(Commands::TrackCommand(args)) = &cli.command {
+        return cmd::run_track_command(data_dir.as_deref(), args);
+    }
+
     // Generate session ID early so we can include it in all logs
     let session_id = create_session_id();
 
@@ -271,6 +278,11 @@ fn main() -> Result<()> {
             .context("No data directory: pass --data-dir, or set HOME")?;
 
         match command {
+            Commands::TrackCommand(_) => unreachable!("handled before the logger is set up"),
+            Commands::History(args) => {
+                drop(log_rx); // nobody drains it in command mode; fern's sink then drops sends (main.rs:255-262)
+                return cmd::run_history(&data_dir, args);
+            }
             Commands::GenerateFeatures { format } => {
                 // Create data directory if it doesn't exist
                 std::fs::create_dir_all(&data_dir)?;

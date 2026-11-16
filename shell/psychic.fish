@@ -89,3 +89,46 @@ if not set -q PSYCHIC_NO_CTRL_T
         bind -M insert \ct __psychic_insert_path
     end
 end
+
+# =============================================================================
+# Command history: record each command for `psychic history` (Ctrl-R)
+# =============================================================================
+
+# Off until `psychic history --enable`. PSYCHIC_HISTORY=0 or 1 overrides.
+set -g __psychic_session "$fish_pid-"(random)
+set -g __psychic_cmd_pwd $PWD
+
+function __psychic_history_enabled
+    switch "$PSYCHIC_HISTORY"
+        case 0
+            return 1
+        case 1
+            return 0
+    end
+    set -l dir $HOME/.local/share/psychic
+    set -q PSYCHIC_DATA_DIR; and set dir $PSYCHIC_DATA_DIR
+    test -e $dir/history-enabled
+end
+
+# Before a command runs: remember where it was typed.
+function __psychic_preexec --on-event fish_preexec
+    set -g __psychic_cmd_pwd $PWD
+end
+
+# After it: one background call with how it went. Disowned, so fish prints no
+# "Job has ended" line.
+function __psychic_postexec --on-event fish_postexec
+    set -l __psychic_status $status
+    __psychic_history_enabled; or return
+    set -q fish_private_mode; and return
+    test -n "$argv[1]"; or return
+    string match -q -- ' *' "$argv[1]"; and return
+    set -l __psychic_bin psychic
+    set -q PSYCHIC_BIN; and set __psychic_bin $PSYCHIC_BIN
+    set -l __psychic_dir
+    set -q PSYCHIC_DATA_DIR; and set __psychic_dir --data-dir $PSYCHIC_DATA_DIR
+    command $__psychic_bin $__psychic_dir track-command --cwd "$__psychic_cmd_pwd" \
+        --exit-code $__psychic_status --duration-ms "$CMD_DURATION" \
+        --session "$__psychic_session" -- "$argv[1]" >/dev/null 2>&1 &
+    disown 2>/dev/null
+end

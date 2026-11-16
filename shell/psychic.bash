@@ -93,3 +93,59 @@ if [[ $- == *i* && -z "${PSYCHIC_NO_CTRL_T-}" && "${BASH_VERSINFO[0]}" -ge 4 ]];
         \builtin bind -x '"\C-t": __psychic_insert_path'
     fi
 fi
+
+# =============================================================================
+# Command history: record each command for `psychic history` (Ctrl-R)
+# =============================================================================
+
+# Off until `psychic history --enable`. PSYCHIC_HISTORY=0 or 1 overrides.
+__psychic_session="$$-${RANDOM}${RANDOM}"
+__psychic_hist_primed=''
+__psychic_hist_seen=''
+__psychic_cmd_pwd="${PWD}"
+__psychic_hist_re='^[[:space:]]*([0-9]+)[*]?[[:space:]]+([0-9]+)[[:space:]](.*)$'
+
+__psychic_history_enabled() {
+    case "${PSYCHIC_HISTORY-}" in
+        0) \builtin return 1 ;;
+        1) \builtin return 0 ;;
+    esac
+    [[ -e "${PSYCHIC_DATA_DIR:-${HOME}/.local/share/psychic}/history-enabled" ]]
+}
+
+# Before each prompt: if bash added a new entry to its history, record it.
+__psychic_history_hook() {
+    \builtin local __psychic_status=$?
+    \builtin local __psychic_pwd="${__psychic_cmd_pwd}"
+    __psychic_cmd_pwd="${PWD}"
+    __psychic_history_enabled || \builtin return "${__psychic_status}"
+
+    \builtin local __psychic_entry __psychic_key=''
+    __psychic_entry="$(HISTTIMEFORMAT='%s ' \builtin history 1)"
+    if [[ "${__psychic_entry}" =~ ${__psychic_hist_re} ]]; then
+        __psychic_key="${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
+    fi
+    if [[ -z "${__psychic_hist_primed}" ]]; then
+        __psychic_hist_primed=1
+        __psychic_hist_seen="${__psychic_key}"
+        \builtin return "${__psychic_status}"
+    fi
+    if [[ -z "${__psychic_key}" || "${__psychic_key}" == "${__psychic_hist_seen}" ]]; then
+        \builtin return "${__psychic_status}"
+    fi
+    __psychic_hist_seen="${__psychic_key}"
+
+    \builtin local __psychic_start="${BASH_REMATCH[2]}" __psychic_text="${BASH_REMATCH[3]}" __psychic_now=''
+    \builtin printf -v __psychic_now '%(%s)T' -1 2>/dev/null || __psychic_now=''
+    # In a subshell, so the shell prints no job number or "Done" line.
+    (\command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
+        track-command --cwd "${__psychic_pwd}" --exit-code "${__psychic_status}" \
+        --started-at "${__psychic_start}" \
+        ${__psychic_now:+--duration-ms} ${__psychic_now:+"$(( (__psychic_now - __psychic_start) * 1000 ))"} \
+        --session "${__psychic_session}" -- "${__psychic_text}" >/dev/null 2>&1 &)
+    \builtin return "${__psychic_status}"
+}
+
+if [[ ";${PROMPT_COMMAND:-};" != *";__psychic_history_hook;"* ]]; then
+    PROMPT_COMMAND="__psychic_history_hook${PROMPT_COMMAND:+;${PROMPT_COMMAND}}"
+fi

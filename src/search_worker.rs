@@ -2148,6 +2148,11 @@ mod fresh_install_tests {
         assert_eq!(
             tables,
             vec![
+                "command_events",
+                "command_imports",
+                "command_runs",
+                "commands",
+                "deleted_commands",
                 "events",
                 "hidden_prefixes",
                 "import_runs",
@@ -2160,7 +2165,21 @@ mod fresh_install_tests {
         indexes.sort();
         assert_eq!(
             indexes,
-            vec!["idx_events_action", "idx_events_engagement"],
+            vec![
+                "idx_command_events_command",
+                "idx_command_events_pick",
+                "idx_command_runs_command",
+                "idx_command_runs_cwd",
+                "idx_command_runs_hook",
+                "idx_command_runs_import",
+                "idx_command_runs_prev",
+                "idx_command_runs_repo",
+                "idx_command_runs_session",
+                "idx_command_runs_time",
+                "idx_commands_template",
+                "idx_events_action",
+                "idx_events_engagement"
+            ],
             "a new database is created with the indexes, not left to a migration"
         );
     }

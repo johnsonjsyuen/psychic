@@ -2747,6 +2747,90 @@ Why dual dispatch: File for persistence, memory for debug pane. Never use eprint
 **Scroll event deduplication:** HashSet<(query, full_path)> tracks scrolled files per session.
 Why: User might scroll up/down many times. Only log once per (query, file) combination.
 
+### Shell history search: `src/cmd/`
+
+Ctrl-R over the user's shell history, ranked by directory, repository and
+the previous command. Specified in `docs/ctrl-r/` (start at its README); built
+in phases. **Phase A, "Record", is what exists today:** commands are recorded
+and imported, and `psychic history` manages them. The picker (`psychic
+history` with no action flag, Phase B) and `--retrain` (Phase C) exit with
+"not built yet".
+
+New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
+`history_mode` and `ToggleHistoryMode` already mean directory back/forward.
+
+| File | Does |
+|---|---|
+| `cmd/mod.rs` | `run_track_command`, `run_history`, and the `--enable/--disable/--status/--import/--purge` actions |
+| `cmd/cli.rs` | `TrackCommandArgs`, `HistoryArgs` (clap) |
+| `cmd/tuning.rs` | Every tunable constant of the feature |
+| `cmd/store.rs` | The command tables and every SQL statement on them (`CmdStore`); a plan test per indexed statement |
+| `cmd/template.rs` | Word splitting and `templatize` (`cd foo` -> `cd PATH`); own-command detection |
+| `cmd/repo.rs` | `find_repo_root`: nearest ancestor with a `.git` entry, on the logical path |
+| `cmd/privacy.rs` | Opt-in marker, `PSYCHIC_HISTORY_IGNORE` globs, permissions, FNV-1a tombstones |
+| `cmd/track.rs` | `psychic track-command` |
+| `cmd/backfill.rs` | Import from Atuin, zsh, bash and fish history |
+
+**Tables** (same `events.db`, created by `store::create_schema`, which
+`Database::prepare_schema` calls once per file per process): `commands` (one
+row per exact text, with aggregates kept up to date on every insert so the
+picker never counts runs), `command_runs` (one row per execution: start, cwd,
+repo root, exit code, duration, shell session, previous command within 30
+minutes in the same session, `hook` or `import`), `command_events` (written by
+Phase B), `command_imports` (which sources were imported) and
+`deleted_commands` (tombstones: the hash of a deleted text, never the text).
+A partial unique index on `(command_id, started_at) WHERE source = 'import'`
+makes imports idempotent.
+
+**Recording.** Off until `psychic history --enable` writes the marker file
+`history-enabled` into the data dir. The blocks appended to
+`shell/psychic.{zsh,bash,fish}` test that file with a shell builtin on every
+prompt (no process when off; `PSYCHIC_HISTORY=0|1` overrides), stash the
+command, its `$PWD` and start time before it runs, and make one background
+`psychic track-command ... -- TEXT` call before the next prompt. zsh uses
+`preexec`/`precmd`; fish `fish_preexec`/`fish_postexec`; bash prepends a
+function to `PROMPT_COMMAND` that reads `history 1` - no DEBUG trap and no
+`PS0`, so it cannot fight bash-preexec or Starship, and `HISTCONTROL` /
+`HISTIGNORE` are honoured because only what bash itself kept is recorded.
+`PSYCHIC_BIN` and `PSYCHIC_DATA_DIR` point the hooks at another build and
+data dir (tests use them). Known bash gaps: an immediate repeat under
+`ignoredups`/`ignoreboth` is not added to bash's history and so not recorded;
+two identical commands in the same second under `erasedups` count once; a
+tool prepended to `PROMPT_COMMAND` after psychic that does not preserve `$?`
+makes the recorded exit code its own (load psychic last); durations have
+1-second resolution.
+
+**`track-command`** is dispatched in `main` before the logger is set up, so
+it never opens `app.log` and command text cannot reach a log. It trims the
+text and skips it when empty, over 8,192 bytes, psychic's own (`psychic`,
+`p`, `pd`, `pc` as the command word) or matching `PSYCHIC_HISTORY_IGNORE`
+(colon-separated globs over the whole text, matched by a 60-line matcher
+rather than a regex crate). Then one `Database::new`, a permissions check and
+a five-statement transaction. Measured at Phase A (release build, 300 runs
+each, spawned from Python, so including about 1.2 ms of spawn cost): p50
+5.4 ms, p95 7.6 ms for 300 distinct commands; p50 5.4 ms, p95 6.9 ms for one
+command repeated. The budget (B4) is 10 ms p95.
+
+**Privacy.** Every `CmdStore::open` makes the data dir `0700` and `events.db`,
+its `-wal`/`-shm`, the marker and the command model files `0600` (only when
+they differ; file-only users who never enable history keep their modes).
+Errors from the command code name the operation and SQLite error code, never
+a bound value. `--purge` empties the five tables, `VACUUM`s, and removes the
+command model; the marker is left alone. Deleting one command leaves a
+tombstone so a later import does not restore it. Shell history files are
+never edited.
+
+**Import** (`--import`, and the first `--enable` unless `--no-import`):
+Atuin's `history.db` first (opened read-only; true cwd, exit codes and
+durations; units told apart by magnitude; skipped with a reason if its schema
+is not the expected one), then `~/.zsh_history` (and `$ZDOTDIR`'s), `~/.bash_history`
+and fish's history, through the parsers of `import/shell_history.rs`. The cwd
+of each file entry comes from `replay_cwds`, the same `cd` replay the path
+import uses (state before the entry's own `cd`). Entries without a timestamp
+get synthetic ones, one second apart, ending at the file's mtime, and are
+imported once per file only. Nothing at or after the first hook-recorded run
+is imported (the hook has it).
+
 ## Page-Based Caching
 
 **Problem:** Scrolling results list had noticeable lag when file list was large.
@@ -3221,6 +3305,15 @@ psychic import             # replaces the previous import
 psychic import --dry-run   # print what it would store
 psychic import --undo      # forget everything imported
 
+# Shell history search (Ctrl-R; see "Shell history search")
+psychic history --enable [--no-import]   # start recording; imports history the first time
+psychic history --disable                # stop recording; keeps what is recorded
+psychic history --status
+psychic history --import                 # Atuin, zsh, bash, fish history
+psychic history --purge [--yes]          # delete every recorded command
+psychic track-command --cwd DIR --exit-code N [--started-at S] [--duration-ms MS] --session ID -- TEXT
+                                         # what the shell hooks call; never logs
+
 # Internal commands (development/debugging)
 psychic internal analyze-perf
 psychic internal print-log
@@ -3242,4 +3335,5 @@ uv run train.py features.csv <output_prefix> [--data-dir DIR]
 - `~/.local/share/psychic/features.csv` - Generated training features
 - `~/.local/share/psychic/feature_schema.json` - Feature definitions, for `train.py` and `bench/model.py`
 - `~/.local/share/psychic/app.log` - Application logs
+- `~/.local/share/psychic/history-enabled` - Shell history recording is on while this exists
 - `~/.local/share/psychic/training.log` - Background model retraining output

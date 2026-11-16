@@ -92,3 +92,50 @@ if [[ -z "${PSYCHIC_NO_CTRL_T-}" ]]; then
     done
     \builtin unset __psychic_keymap
 fi
+
+# =============================================================================
+# Command history: record each command for `psychic history` (Ctrl-R)
+# =============================================================================
+
+# Off until `psychic history --enable`. PSYCHIC_HISTORY=0 or 1 overrides.
+\builtin zmodload zsh/datetime 2>/dev/null
+\builtin typeset -g __psychic_session="$$-${RANDOM}${RANDOM}"
+\builtin typeset -g __psychic_cmd='' __psychic_cmd_pwd='' __psychic_cmd_start=''
+
+function __psychic_history_enabled() {
+    case "${PSYCHIC_HISTORY-}" in
+        0) \builtin return 1 ;;
+        1) \builtin return 0 ;;
+    esac
+    [[ -e "${PSYCHIC_DATA_DIR:-${HOME}/.local/share/psychic}/history-enabled" ]]
+}
+
+# Before a command runs: remember it, where it was typed and when.
+function __psychic_preexec() {
+    __psychic_cmd=''
+    __psychic_history_enabled || \builtin return 0
+    [[ -n "$1" ]] || \builtin return 0
+    [[ -o histignorespace && "$1" == ' '* ]] && \builtin return 0
+    [[ -n "${HISTORY_IGNORE-}" && "$1" == ${~HISTORY_IGNORE} ]] && \builtin return 0
+    __psychic_cmd="$1"
+    __psychic_cmd_pwd="${PWD}"
+    __psychic_cmd_start="${EPOCHREALTIME-}"
+}
+
+# Before the next prompt: one background call with how it went.
+function __psychic_precmd() {
+    \builtin local __psychic_status=$?
+    [[ -n "${__psychic_cmd}" ]] || \builtin return 0
+    \builtin local __psychic_ms=''
+    [[ -n "${__psychic_cmd_start}" ]] && (( __psychic_ms = (EPOCHREALTIME - __psychic_cmd_start) * 1000 ))
+    \command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
+        track-command --cwd "${__psychic_cmd_pwd}" --exit-code "${__psychic_status}" \
+        ${__psychic_cmd_start:+--started-at} ${__psychic_cmd_start:+"${__psychic_cmd_start%.*}"} \
+        ${__psychic_ms:+--duration-ms} ${__psychic_ms:+"${__psychic_ms%.*}"} \
+        --session "${__psychic_session}" -- "${__psychic_cmd}" >/dev/null 2>&1 &!
+    __psychic_cmd=''
+}
+
+\builtin autoload -Uz add-zsh-hook
+add-zsh-hook preexec __psychic_preexec
+add-zsh-hook precmd __psychic_precmd

@@ -329,6 +329,9 @@ fn add(shell: Shell, rc_path: &Path, home: &Path, yes: bool) -> Result<()> {
                 "Done. Open a new shell, or run `exec {}`, then try `p`, or Ctrl-T to insert a path.",
                 shell.name()
             );
+            println!(
+                "Shell history search (Ctrl-R) is off. To turn it on: psychic history --enable"
+            );
             if shell == Shell::Bash && cfg!(target_os = "macos") {
                 let profile = home.join(".bash_profile");
                 if bash_profile_skips_bashrc(read_if_present(&profile)?.as_deref()) {

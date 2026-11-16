@@ -97,6 +97,8 @@ pub fn run_track_command(data_dir: Option<&Path>, args: &cli::TrackCommandArgs) 
 pub fn run_history(data_dir: &Path, args: cli::HistoryArgs) -> anyhow::Result<()>;
 ```
 
+The `history` actions of section 13 (`enable`, `disable`, `status`, `purge`, and the import call) are private functions in `mod.rs` that write to a `&mut dyn Write` and read the environment through a small `Env` struct, so tests drive them without touching the process environment. Items specified here but first read by a later phase (the R/T read path and its row types, `recording_enabled`, `word_count`, `CMD_EVENT_WINDOW_SECS`) carry `#[allow(dead_code, reason = "...")]` naming that phase; the phase that starts using an item removes its attribute.
+
 Commit D0 adds `pub mod bench;` and `pub fn run_bench` ([04 section 2](04-bench.md#2-files-touched-and-the-two-commits)).
 
 ## 3. Constants (Phase A)
@@ -341,7 +343,7 @@ pub(super) struct NewRun<'a> {
 
 | ID | Statement | Expected plan contains |
 |---|---|---|
-| S1 | `INSERT INTO commands (text, template, first_run_at, last_run_at) VALUES (?1, ?2, ?3, ?3) ON CONFLICT(text) DO NOTHING` | `sqlite_autoindex_commands_1` |
+| S1 | `INSERT INTO commands (text, template, first_run_at, last_run_at) VALUES (?1, ?2, ?3, ?3) ON CONFLICT(text) DO NOTHING` | - (SQLite prints no plan for a plain `INSERT`; the `ON CONFLICT` check uses `sqlite_autoindex_commands_1`) |
 | S2 | `SELECT id FROM commands WHERE text = ?1` | `sqlite_autoindex_commands_1` |
 | S3 | `SELECT command_id, started_at FROM command_runs WHERE shell_session = ?1 AND started_at <= ?2 ORDER BY started_at DESC, id DESC LIMIT 1` | `idx_command_runs_session` |
 | S4 | `INSERT OR IGNORE INTO command_runs (command_id, started_at, cwd, repo_root, exit_code, duration_ms, shell_session, prev_command_id, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)` | - |
@@ -426,7 +428,7 @@ Row structs are plain `pub(super)` structs in `store.rs` with the listed fields.
 | `picks_since(cutoff: i64)` | R8 | `Vec<PickRow { command_id: i64, query: String, timestamp: i64, episode_queries: Vec<String> }>` (unparseable JSON -> empty vector) |
 | `command_dirs(command_id: i64)` | R9 | `Vec<DirUse { dir: String, runs: u32, last_run_at: i64 }>` |
 | `command_predecessors(command_id: i64)` | R10 | `Vec<PrecededBy { template: String, runs: u32 }>` |
-| `log_events(now: i64, events: &[NewEvent])` (one transaction) | E1 | `()`; `NewEvent` has one field per E1 parameter except `timestamp`, which the method takes as `now: i64` |
+| `log_events(now: i64, events: &[NewEvent])` (one transaction) | E1 | `()`; `NewEvent` has one field per E1 parameter except `timestamp`, which the method takes as `now: i64`; `action` is `enum EventAction { Impression, Pick }`, `episode_queries` is `Option<&[String]>` and is written as a JSON array |
 | `count_pick(command_id: i64)` | E2 | `()` |
 | `delete_command(command_id: i64, text: &str, now: i64)` | D1-D5 | `()` |
 | `purge()` | P1 | `PurgeCounts { commands: u64, runs: u64 }` (counted before deleting) |
@@ -866,6 +868,8 @@ function __psychic_postexec --on-event fish_postexec
 end
 ```
 
+fish >= 4 also sets `fish_private_mode` for `fish --no-config`, so such a shell records nothing.
+
 No `--started-at`: `track.rs` step 6 derives it from `--duration-ms`
 (`$CMD_DURATION` is milliseconds). `$status` is read on the first line, before
 anything can overwrite it.
@@ -873,7 +877,12 @@ anything can overwrite it.
 ## 12. Backfill
 
 `src/cmd/backfill.rs`:
-`pub(super) fn run(store: &CmdStore, home: &Path, now: i64, env_ignore: Option<&str>) -> anyhow::Result<BackfillReport>`.
+`pub(super) fn run(store: &CmdStore, locations: &Locations, home: &Path, now: i64, env_ignore: Option<&str>) -> anyhow::Result<BackfillReport>`,
+with `pub(super) fn Locations::discover(home: &Path, xdg_data_home: Option<&Path>, zdotdir: Option<&Path>) -> Locations { atuin, zsh: Vec<PathBuf>, bash, fish }`
+(the paths of 12.1). The caller (`mod.rs`) reads `$XDG_DATA_HOME` and `$ZDOTDIR`; the importer
+never reads the process environment, so tests can point it at a scratch home without the
+real `$XDG_DATA_HOME` leaking in. A `--enable` that needs to import with `HOME` unset fails
+with `HOME is not set, so psychic can't find your shell history` before the marker is written.
 Runs synchronously (a) inside `--enable` under the condition of section 13.1,
 and (b) on `psychic history --import`. Idempotent: running it twice
 inserts nothing the second time.
@@ -900,7 +909,7 @@ is not consulted (it is rarely exported).
 | `src/import/mod.rs`, after `is_off_limits` ([:188](../../src/import/mod.rs)) | Add `pub(crate) fn is_dir_within_limits(path: &Path, home: &Path) -> bool { path.is_absolute() && !is_off_limits(path, home) && resolve_safely(path, home).is_some_and(\|r\| r.kind == PathKind::Dir) }`. It goes through `resolve_safely` ([:255](../../src/import/mod.rs)), not `Path::is_dir`, so a symlink into a macOS protected folder is never followed |
 | [src/import/shell_history.rs:26](../../src/import/shell_history.rs) | `pub(super) struct HistoryCommand` -> `pub(crate)` |
 | [src/import/shell_history.rs:92](../../src/import/shell_history.rs), [:136](../../src/import/shell_history.rs), [:158](../../src/import/shell_history.rs) | `parse_zsh`, `parse_bash`, `parse_fish`: `pub(super)` -> `pub(crate)` |
-| [src/import/shell_history.rs:372-383](../../src/import/shell_history.rs) | Extract into `fn command_words(words: Vec<Option<String>>) -> Option<(String, Vec<Option<String>>)>` (skips `NAME=value`, `builtin`, `command`; returns name and arguments) |
+| [src/import/shell_history.rs:372-383](../../src/import/shell_history.rs) | Extract into `fn command_words(words: Vec<Option<String>>) -> Option<NamedCommand>` with `struct NamedCommand { name: String, arguments: Vec<Option<String>> }` (a struct, not a tuple, per [llm.md](../../llm.md)) (skips `NAME=value`, `builtin`, `command`; returns name and arguments) |
 | [src/import/shell_history.rs:385-404](../../src/import/shell_history.rs) | Extract the decision into `cwd_step` (below); `replay` calls it. Behaviour of `replay` is unchanged and its tests ([:507-581](../../src/import/shell_history.rs)) pass unmodified |
 | `src/import/shell_history.rs`, after `replay` | Add `replay_cwds` (below) |
 
@@ -972,7 +981,7 @@ Schema, from Atuin's public client migrations. **Assumptions A1-A4 are from
 memory of that source and are checked at run time** by reading
 `SELECT name FROM pragma_table_info('history')`; if `command`, `timestamp`,
 `cwd`, `exit`, `duration` or `session` is missing the source is skipped with
-`BackfillReport.atuin = Skipped("unexpected schema")`.
+`unavailable: Some("unexpected schema")` on its `SourceReport`.
 
 | Atuin column | Assumption | Maps to |
 |---|---|---|
@@ -988,7 +997,11 @@ Query: `SELECT command, timestamp, duration, exit, cwd, session FROM history
 [WHERE deleted_at IS NULL] ORDER BY timestamp, id`. Each row then follows steps
 4-5 of 12.3 with `synthetic = false` and `source = Import`.
 
-`BackfillReport { sources: Vec<SourceReport { key, found, inserted, skipped }> }`
+`BackfillReport { sources: Vec<SourceReport { kind, key, found, inserted, skipped, unavailable: Option<&'static str> }> }`
+(`unavailable` is `Some("locked")` or `Some("unexpected schema")` when Atuin could not be read; a missing
+file is `None` with `found 0`). A source's whole file is one transaction that also writes its
+`command_imports` row, so a failed file leaves no trace (E-R-14). The filter of 12.3 step 4 that
+also applies to `track-command` (empty, too long, own, ignored) is one function, `track::is_recordable`.
 with `summary()` = `Imported <total> commands (atuin <n>, zsh <n>, bash <n>, fish <n>).`
 where each number is `inserted` with `,` as thousands separator, zsh sums its
 files, and a skipped Atuin source prints `atuin skipped (<reason>)` in place of
@@ -1106,10 +1119,10 @@ One `#[test]` per shell. Binary: `env!("CARGO_BIN_EXE_psychic")`.
 | Skip rule | If `Command::new(<shell>).arg("--version")` fails to spawn: `println!("skipped: <shell> not installed")` and return (pass) |
 | Scratch | `T = temp_dir()/psychic-shell-<shell>-<pid>`; `T/home`, `T/data`, `T/work/sub`; `T/hook` = stdout of `psychic <shell>` |
 | Environment (cleared, then) | `HOME=T/home`, `PATH` inherited, `TERM=dumb`, `PSYCHIC_BIN=<binary>`, `PSYCHIC_DATA_DIR=T/data`, `PSYCHIC_HISTORY=1`, `PSYCHIC_NO_RETRAIN=1`, `HISTFILE=T/home/hist`; bash also `HISTCONTROL=ignorespace`, `HISTIGNORE='secret*'`; zsh also `ZDOTDIR=T/home` |
-| Launch | On a pty (`libc::openpty`; child via `std::process::Command` with the slave as stdin/stdout/stderr and `pre_exec` doing `setsid()` + `ioctl(0, TIOCSCTTY, 0)`; window 24x80). zsh: `zsh -f -i`; bash: `bash --norc --noprofile -i`; fish: `fish --no-config -i -C 'source T/hook'` (the hook is loaded before the first prompt, because `fish_postexec` would otherwise record the `source` line itself). cwd `T/work` |
-| Drive | A reader thread drains the master. Write each line + `\n`, sleeping 150 ms between lines |
+| Launch | On a pty (`libc::openpty`; child via `std::process::Command` with the slave as stdin/stdout/stderr and `pre_exec` doing `setsid()` + `ioctl(0, TIOCSCTTY, 0)`; window 24x80). zsh: `zsh -f -i`; bash: `bash --norc --noprofile -i`; fish: `fish -i -C 'source T/hook'` with `XDG_CONFIG_HOME=T/home/.config` and `XDG_DATA_HOME=T/home/.local/share` (not `--no-config`: fish 4 sets `fish_private_mode` under `--no-config`, and the hook records nothing in private mode) (the hook is loaded before the first prompt, because `fish_postexec` would otherwise record the `source` line itself). cwd `T/work` |
+| Drive | A reader thread drains the master. Write each line + `\n`, sleeping 500 ms before the first line and 150 ms between lines |
 | Lines | (zsh only) `setopt histignorespace`, `HISTORY_IGNORE='secret*'`; then for all: (zsh, bash) `source T/hook`; then `true`, `false`, `cd sub`, `echo in-sub`, ` echo leading-space`, (zsh, bash) `secret-thing`, `echo 'multi` / `line'`; then the single byte `0x04` (Ctrl-D on an empty line ends all three shells without a command that could itself be recorded) |
-| Wait | Child exit within 30 s (else kill and fail). Then poll `SELECT COUNT(*) FROM command_runs` every 50 ms for up to 5 s until it equals the expected count |
+| Wait | Child exit within 30 s (else kill and fail). The `0x04` is re-sent every 2 s until the shell exits: fish 4.2 sometimes drops a Ctrl-D that arrives while it is still finishing the previous command (seen with recording off too, after a `cd` whose upstream `track-visit` hook fails), and a second Ctrl-D on an empty line does nothing else. Then poll `SELECT COUNT(*) FROM command_runs` every 50 ms for up to 5 s until it equals the expected count |
 | Expected rows, ordered by `started_at, id` (text / cwd / exit_code / source) | `true` / `T/work` / 0 / hook; `false` / `T/work` / 1 / hook; `cd sub` / `T/work` / 0 / hook; `echo in-sub` / `T/work/sub` / 0 / hook; the multi-line echo: text starts with `echo 'multi`, contains a newline or `;`, ends with `line'` / `T/work/sub` / 0 / hook. Exactly 5 rows; no text contains `leading-space` or `secret`; all 5 share one `shell_session`; `commands.template` of `cd sub` is `cd PATH` |
 
 The pty helper (about 60 lines) lives in `tests/support/mod.rs`, declared with
@@ -1132,7 +1145,7 @@ same module. It is not shared with `src/`.
 | E-R-10 | History file missing or unreadable | `fs::read` error | Source reports `found 0` | Other sources continue | `log::info!("import: <kind> history not readable")` |
 | E-R-11 | History file is not valid UTF-8 | - | `from_utf8_lossy` (upstream parsers, [src/import/shell_history.rs:93](../../src/import/shell_history.rs)) | - | None |
 | E-R-12 | Atuin DB missing | `!path.exists()` | Source skipped, `found 0` | - | None |
-| E-R-13 | Atuin DB locked or unexpected schema | open/query error, or `pragma_table_info` check fails | `Skipped("locked")` / `Skipped("unexpected schema")` in the report; summary prints `atuin skipped (<reason>)` | Shell files still import | `log::warn!` with the reason, no row data |
+| E-R-13 | Atuin DB locked or unexpected schema | open/query error, or `pragma_table_info` check fails | `unavailable: Some("locked")` / `Some("unexpected schema")` in the report; summary prints `atuin skipped (<reason>)` | Shell files still import | `log::warn!` with the reason, no row data |
 | E-R-14 | Import transaction fails mid-file | rusqlite error | Roll back that file's transaction; `command_imports` not updated; continue with the next source | A later `--import` retries the file (synthetic entries included, since I2 has no row) | `log::error!("import of <source_key> failed: <sqlite code>")` |
 | E-R-15 | `--purge` without `--yes` and stdin is not a terminal | `!std::io::stdin().is_terminal()` | `bail!("stdin is not a terminal, so psychic can't ask before deleting; pass --yes")` (wording as [src/shell_init.rs:269-271](../../src/shell_init.rs)) | Nothing deleted | stderr via `main` |
 | E-R-16 | zsh without `zsh/datetime` | `EPOCHREALTIME` empty | Hook omits `--started-at` and `--duration-ms` | `track.rs` uses `now`; duration NULL | None |
@@ -1140,6 +1153,7 @@ same module. It is not shared with `src/`.
 | E-R-18 | bash history disabled or command suppressed by `HISTCONTROL`/`HISTIGNORE` | No new history key | Not recorded | By design | None |
 | E-R-19 | Two `track-command` processes at once | SQLite write lock | Second waits on `busy_timeout` | - | None |
 | E-R-20 | Clock goes backwards between runs | `started_at` smaller than the session's last | S3 (`started_at <= ?2`) finds an older predecessor or none; S5 keeps `last_run_at` as the max | - | None |
+| E-R-22 | `--import`, or a first `--enable` that imports, with `HOME` unset | `env.home()` is `None` | `Err("HOME is not set, so psychic can't find your shell history")`, exit 1 | `--enable`: marker not written | stderr via `main` |
 | E-R-21 | A shell needed by a shell test is not installed | `--version` spawn fails | Test prints `skipped: ...` and passes | - | test stdout |
 
 ## 17. References

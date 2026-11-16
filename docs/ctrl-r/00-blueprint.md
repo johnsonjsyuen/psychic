@@ -106,13 +106,13 @@ selection --> println!(command) on stdout, exit 0 --> widget replaces the prompt
 
 | File | Responsibility | Phase | Spec |
 |---|---|---|---|
-| `mod.rs` | Entry points `run_history`, `run_track_command` (A), `run_bench` (D0); `mod` declarations | A | [01 section 2](01-record.md#2-files-touched) |
+| `mod.rs` | Entry points `run_history`, `run_track_command` (A), `run_bench` (D0); the `history` actions of [01 section 13](01-record.md#13-psychic-history-actions-built-in-this-phase); `mod` declarations | A | [01 section 2](01-record.md#2-files-touched) |
 | `cli.rs` | clap structs `HistoryArgs`, `TrackCommandArgs` | A | [01 section 4](01-record.md#4-cli-surface) |
 | `tuning.rs` | Every tunable constant of the feature | A, B, C | [01 section 3](01-record.md#3-constants-phase-a), [02 section 3](02-browse.md#3-constants-phase-b), [03 section 3](03-learn.md#3-constants-phase-c) |
 | `store.rs` | DDL and every SQL statement on the command tables | A | [01 section 5](01-record.md#5-schema), [01 section 6](01-record.md#6-sql-statements) |
 | `template.rs` | Raw word splitting, `templatize`, own-command detection | A | [01 section 7](01-record.md#7-templating) |
 | `repo.rs` | `find_repo_root` | A | [01 section 8](01-record.md#8-git-repository-root) |
-| `privacy.rs` | Opt-in marker, ignore globs, permissions, tombstone hash, purge | A | [01 section 10](01-record.md#10-privacy) |
+| `privacy.rs` | Opt-in marker, ignore globs, permissions, tombstone hash, removal of the command model on purge (the SQL of purge is `CmdStore::purge`) | A | [01 section 10](01-record.md#10-privacy) |
 | `track.rs` | `psychic track-command` | A | [01 section 9](01-record.md#9-track-command) |
 | `backfill.rs` | Shell-history and Atuin import | A | [01 section 12](01-record.md#12-backfill) |
 | `index.rs` | `CommandIndex`: in-memory statistics, filled from SQL or by replay | B | [02 section 5](02-browse.md#5-commandindex) |

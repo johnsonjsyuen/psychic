@@ -86,6 +86,12 @@ pub enum Commands {
         /// Directory path to track
         path: PathBuf,
     },
+    /// Search your shell history (what Ctrl-R runs), or manage what is recorded
+    ///
+    /// Off until `psychic history --enable`. Nothing leaves your machine.
+    History(crate::cmd::cli::HistoryArgs),
+    /// Record a command that just ran (for shell integration hooks)
+    TrackCommand(crate::cmd::cli::TrackCommandArgs),
     /// Manage directories hidden from search results
     ///
     /// Hiding only suppresses results. Nothing is deleted: the events under a
