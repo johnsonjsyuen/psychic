@@ -15,7 +15,6 @@ pub(super) const CMD_SEQUENCE_MAX_GAP_SECS: i64 = 1800;
 pub(super) const CMD_MARKER_FILE: &str = "history-enabled";
 
 /// 30 days: how far back individual runs and picks are loaded at picker start.
-#[allow(dead_code, reason = "read by the picker (Phase B)")]
 pub(super) const CMD_EVENT_WINDOW_SECS: i64 = 2_592_000;
 
 /// First words that are never recorded: psychic's own commands.

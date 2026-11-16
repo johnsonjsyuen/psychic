@@ -510,6 +510,9 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             Commands::Internal { command } => match command {
+                InternalCommands::BenchHistory(args) => {
+                    return cmd::run_bench(&data_dir, cli.data_dir.is_some(), args);
+                }
                 InternalCommands::AnalyzePerf => {
                     let log_path = data_dir.join("app.log");
                     analyze_perf::analyze_perf(&log_path)?;

@@ -24,7 +24,7 @@ P="cargo run --release --"; W=/tmp/psychic-bench
 $P --data-dir $W/cmd-synth-small internal bench-history generate --commands 2000 --runs 20000 --seed 1
 $P --data-dir $W/cmd-synth-small internal bench-history stats
 $P --data-dir $W/cmd-agent internal bench-history extract-agent && $P --data-dir $W/cmd-agent internal bench-history stats
-$P --data-dir $W/cmd-real history --import && $P --data-dir $W/cmd-real internal bench-history stats
+$P --data-dir $W/cmd-real history --import && $P --data-dir $W/cmd-real internal bench-history stats   # real $HOME: the import reads its files
 for C in cmd-real cmd-agent cmd-synth-small; do
   $P --data-dir $W/$C internal bench-history relevance --seeds 5 --folds --json $W/$C/relevance.json --md $W/$C/relevance.md
 done
@@ -38,8 +38,8 @@ ls ~/.local/share/psychic -la     # mtimes unchanged by any command above
 
 | Commit | New files | Upstream edits |
 |---|---|---|
-| **D0** (after Phase A; developed in parallel with B, committed **before** B, which rebases onto it) | `src/cmd/corpus.rs`; `src/cmd/bench.rs` with the clap types and the `generate`, `extract-agent`, `stats` arms | [src/cli.rs:121-157](../../src/cli.rs): add `InternalCommands::BenchHistory(crate::cmd::bench::BenchArgs)` with the doc comment `/// Benchmark shell history search: build corpora, measure relevance and latency`. [src/main.rs:500](../../src/main.rs) (the `Commands::Internal` match): add `InternalCommands::BenchHistory(args) => return cmd::run_bench(&data_dir, cli.data_dir.is_some(), args),` |
-| **D** (after Phase C) | The `relevance`, `twostage`, `latency` arms in `src/cmd/bench.rs`; `bench/history.py`; `docs/ctrl-r/results.md`; one test added to `src/cmd/render.rs` (TC-N-10) | `docs/how-it-works.md`: add the command benchmarks to "The two benchmark harnesses" ([docs/how-it-works.md:2906](../how-it-works.md)) |
+| **D0** (after Phase A; developed in parallel with B, committed **before** B, which rebases onto it) | `src/cmd/corpus.rs`; `src/cmd/bench.rs` with `BenchArgs` and the `Generate`, `ExtractAgent`, `Stats` variants and arms (no stubs for the rest) | [src/cli.rs:121-157](../../src/cli.rs): add `InternalCommands::BenchHistory(crate::cmd::bench::BenchArgs)` with the doc comment `/// Benchmark shell history search: build corpora, measure relevance and latency`. [src/main.rs:500](../../src/main.rs) (the `Commands::Internal` match): add `InternalCommands::BenchHistory(args) => return cmd::run_bench(&data_dir, cli.data_dir.is_some(), args),` |
+| **D** (after Phase C) | The `Relevance`, `Twostage`, `Latency` variants of section 3 and their arms in `src/cmd/bench.rs`; `bench/history.py`; `docs/ctrl-r/results.md`; one test added to `src/cmd/render.rs` (TC-N-10) | `docs/how-it-works.md`: add the command benchmarks to "The two benchmark harnesses" ([docs/how-it-works.md:2906](../how-it-works.md)) |
 
 `bench/harness.py`, `bench/run.py` and `bench/model.py` are imported or run, never edited (ADR-19).
 
@@ -51,12 +51,13 @@ pub fn run_bench(data_dir: &Path, data_dir_was_given: bool, args: bench::BenchAr
 **Data-dir guard**, first statement of `run_bench`: `bail!("bench-history needs
 an explicit --data-dir that is not your real data directory")` unless
 `data_dir_was_given` and `data_dir != cli::get_default_data_dir()` (compared
-after `canonicalize` when both exist). Benchmarks and tests never write to
+after `canonicalize` when both exist, else after `std::path::absolute`). Benchmarks and tests never write to
 `~/.local/share/psychic`.
 
 ## 3. CLI surface
 
-`psychic --data-dir DIR internal bench-history <SUBCOMMAND>`
+`psychic --data-dir DIR internal bench-history <SUBCOMMAND>`. D0 builds the
+first three variants; D adds the other three.
 
 ```rust
 #[derive(clap::Args, Debug)] pub struct BenchArgs { #[command(subcommand)] pub command: BenchCommand }
@@ -125,7 +126,7 @@ Transcript format (verified on this machine against Claude Code transcripts of
 
 | Line | Fields used |
 |---|---|
-| any line | top-level `cwd` (string, absent on some lines), `sessionId` (string), `timestamp` (RFC 3339 string) |
+| any line | top-level `cwd` (string, absent on some lines), `sessionId` (string), `agentId` (string, on sub-agent transcripts only; they carry their parent's `sessionId`), `timestamp` (RFC 3339 string) |
 | `type == "assistant"` | `message.content[]` blocks with `type == "tool_use"`, `name == "Bash"`, `id`, `input.command` (string), `input.run_in_background` (optional bool) |
 | `type == "user"` | `message.content[]` blocks with `type == "tool_result"`, `tool_use_id`, `is_error` (bool) |
 
@@ -136,19 +137,27 @@ parsing; several blocks on one line are handled in array order):
 | Step | Rule |
 |---|---|
 | Track cwd | `last_cwd` = the most recent top-level `cwd` seen in this file |
-| Tool use | For each Bash `tool_use` block: skip when `run_in_background == true`, when `timestamp` is missing or unparseable (`str::parse::<jiff::Timestamp>`), or when `input.command` is not a string. Otherwise remember `pending[id] = { text, cwd: line cwd or last_cwd, started_at: seconds, started_ms, session: sessionId or the file stem }` |
-| Tool result | For a `tool_result` whose `tool_use_id` is pending: `exit_code = if is_error { 1 } else { 0 }`; `duration_ms = result timestamp - started_ms` when the result line has a timestamp and the difference is `>= 0` |
+| Tool use | For each Bash `tool_use` block (counted in `tool_uses`), in this order: skip when `run_in_background == true` (`skipped_background`), when `timestamp` is missing or unparseable (`str::parse::<jiff::Timestamp>`; `skipped_no_timestamp`), when `input.command` is not a string (`skipped_malformed`), or when the trimmed text fails `track::is_recordable(text, None)` (`skipped_filtered`). Otherwise keep `{ text: trimmed, cwd: line cwd or last_cwd, started_at: seconds, started_ms, session }` and remember `pending[id]` (a block without a string `id` is kept with no result). `session` = `sessionId` (else the file stem), plus `:<agentId>` when the line has one: parallel sub-agents of one session are separate shells, as two terminals would be |
+| Tool result | For a `tool_result` whose `tool_use_id` is pending (then no longer pending): `exit_code = if is_error { 1 } else { 0 }`; `duration_ms = result timestamp - started_ms` when the result line has a timestamp and the difference is `>= 0` |
 | End of file | Every pending entry is kept; without a result its `exit_code` and `duration_ms` are NULL |
 
-Then all entries of all files are sorted by `(started_at, file path, line number)`
-and written inside one `CmdStore::transaction` with `record_run_in`: `source = Hook` (they carry true cwd
+Then all entries of all files are stably sorted by `(started_ms, file path, line number)`
+(block order within a line is kept) and written inside one `CmdStore::transaction` with `record_run_in`: `source = Hook` (they carry true cwd
 and outcome), `shell_session = "agent:<session>"`, `repo_root =
-find_repo_root(cwd)`, `template = templatize(text)`. The filters of
+find_repo_root(cwd)` (memoised per cwd), `template = templatize(text)`. The filters of
 [01 section 9](01-record.md#9-track-command) steps 2-4 apply (empty, over
 `CMD_MAX_TEXT_BYTES`, psychic's own commands); `PSYCHIC_HISTORY_IGNORE` does not.
 Exit status is a boolean in the transcripts, so `exit_code` is 0 or 1 only.
-`AgentReport { files, tool_uses, kept, skipped_background, skipped_no_timestamp, skipped_filtered, with_result }`
-is printed as one line each.
+`AgentReport { files, tool_uses, kept, skipped_background, skipped_no_timestamp, skipped_malformed, skipped_filtered, with_result }`
+is printed as one `key: value` line each, in that order (`files: 194`,
+`tool uses: 5821`, `skipped background: 53`, ...).
+
+Measured on the authoring machine (2026-11-17): 194 files, 5,821 Bash uses,
+5,724 kept, but **5,690 distinct texts**: an agent almost never types the same
+command twice (mean text length 546 characters: heredocs, `cd X && ...`
+chains, one-off pipelines), so the immediate-repeat share is 0.001 and only
+about 0.6% of runs are reachable lookups (section 5.2). This corpus cannot
+decide R1 on that machine either; see [README](README.md) residual item 10.
 
 ### 4.3 Corpus 3: synthetic generator
 
@@ -157,7 +166,7 @@ is printed as one line each.
 Deterministic for a given `(commands, runs, seed, anchor)`. One random stream:
 `next() = { state = splitmix64(state); state }` starting from `state = seed`
 (`splitmix64` as [03 section 5.2](03-learn.md#52-groups-from-executed-commands));
-`u()` = `next() as f64 / 2^64`; `below(n)` = `next() % n`.
+`u()` = `(next() >> 11) as f64 / 2^53` (in `[0, 1)`, never 1.0, so `p_new = 1` always takes the new branch); `below(n)` = `next() % n`.
 
 World:
 
@@ -172,10 +181,16 @@ World:
 
 State: `seen` (commands `0..seen` have run), per-directory list of seen commands
 homed there (in first-run order), current `dir` (initially `dirs[below(40)]`, drawn once before the loop),
-current `session` (initially 0), the session's last 3 commands, `t` (seconds,
-starts at 0), `retry: Option<i>` (initially `None`). Every `u()`/`below()` in
-the table below is drawn in the order written, including when its result is
-not needed.
+current `session` (initially 0), the session's last 3 commands (the last 3
+runs, newest first; duplicates allowed), `t` (seconds,
+starts at 0), `retry: Option<i>` (initially `None`). Draws happen in the order
+written, and only on the branch taken: the always-drawn ones are `g`, the
+move `u()`, `x`, `c` (when choosing), the outcome `u()` and `below(5000)`; the
+retry `u()` is drawn only when `retry` is `Some`; the repeat branch draws one
+`u()` for its weighted pick only when the last-3 is non-empty; the chain
+branch draws nothing; the directory branch draws one `u()` for its Zipf pick
+only when the list is non-empty; the global pick (directly or as a
+fall-through) draws one `u()`.
 
 For each run `n` in `0..runs`:
 
@@ -198,14 +213,24 @@ runs are an immediate repeat of the session's previous command; mean gap about 3
 runs); `commands / runs` of the runs are a never-before-seen command. The
 generator writes no `command_events` (section 12, E-N-10).
 
+Measured at D0 (release build, `--seed 1 --anchor 1794873600`): 2,000 / 20,000
+in 0.2 s, 4.3 MB after `VACUUM`, immediate-repeat share 0.471, span 68.2 days;
+50,000 / 500,000 in 7.6 s, 120.7 MB as written and 111.4 MB after `VACUUM`
+(B7 budget 300 MB; `command_runs` 33 MB plus seven run indexes 67 MB),
+immediate-repeat share 0.459, span 1,758.8 days, 8,725 runs in the last 30 days.
+
 ### 4.4 `stats`
 
-Prints one `key: value` line each: `commands`, `runs`, `runs by source`,
-`span days`, `runs in last 30 days of the corpus`, `with cwd`, `with exit code`,
-`synthetic timestamps` (share of `import-synth:` rows), `sessions`,
-`immediate repeat share` (runs whose command equals the previous run of the same
-session), `first-ever share`, `pick episodes`. No command text. Computed in memory from
-`counts`, `all_commands`, `all_runs`, `all_events` ([01 section 6.5](01-record.md#65-cmdstore-methods-and-row-types)); `bench.rs` and `corpus.rs` contain no SQL.
+Prints one `key: value` line each: `commands`, `runs`, `runs by source`
+(`hook <n>, import <n>`), `span days` (newest minus oldest `started_at`, one
+decimal), `runs in last 30 days of the corpus` (`started_at > newest -
+CMD_EVENT_WINDOW_SECS`), `with cwd`, `with exit code`,
+`synthetic timestamps` (share of `import-synth:` rows), `sessions` (distinct
+`shell_session`), `immediate repeat share` (runs whose command equals the previous run of the same
+session), `first-ever share` (runs that are their command's first),
+`pick episodes` (`pick` rows in `command_events`). Shares are of all runs, three
+decimals, `0.000` on an empty history; counts are plain integers. No command text. Computed in memory from
+`counts`, `all_runs`, `all_events` ([01 section 6.5](01-record.md#65-cmdstore-methods-and-row-types)); `bench.rs` and `corpus.rs` contain no SQL.
 
 ## 5. Relevance benchmark
 
@@ -554,11 +579,11 @@ Work top to bottom; within a row try the listed values one at a time.
 | TC-N-02 | seed aggregation | per-seed top1 `[0.50, 0.52, 0.54]` | `mean 0.52, sd 0.02, min 0.50, max 0.54` | one seed -> `sd 0` |
 | TC-N-03 | generator structure | `generate(commands 500, runs 20_000, seed 7, anchor 1_800_000_000)` | Exactly 500 commands and 20,000 runs; newest `started_at == anchor - 60`; immediate-repeat share (as `stats` defines it) between 0.40 and 0.60; mean gap between 200 and 400 s; 40 or fewer distinct cwds; every `repo_root` is a prefix of its `cwd` | `commands == runs` -> every run is a new command |
 | TC-N-04 | generator determinism | The same arguments twice into two stores; then seed 8 | The first two have identical `(text, started_at, cwd, exit_code)` sequences; seed 8 differs | - |
-| TC-N-05 | transcript parsing | A fixture of 10 JSONL lines (8 assistant lines and the 2 result lines): Bash use with result (`is_error` false), use with error result, background use, use without timestamp, use on a line without `cwd` after a line with one, a non-Bash tool use, a malformed line, a use with no result | 4 kept: exit 0 with duration, exit 1, cwd carried forward, exit NULL; report counts `skipped_background 1`, `skipped_no_timestamp 1` | `input.command` not a string -> skipped |
+| TC-N-05 | transcript parsing | A fixture of 10 JSONL lines (8 assistant lines and the 2 result lines): Bash use with result (`is_error` false), use with error result, background use, use without timestamp, use on a line without `cwd` after a line with one, a non-Bash tool use, a malformed line, a use with no result | 4 kept: exit 0 with duration, exit 1, cwd carried forward, exit NULL; report counts `tool_uses 6`, `skipped_background 1`, `skipped_no_timestamp 1`, `with_result 2` | `input.command` not a string -> `skipped_malformed`; own or empty text -> `skipped_filtered`; two uses on one line keep their order; `agentId` -> session `<sessionId>:<agentId>` |
 | TC-N-06 | systematic sample | 10 reachable runs, `max_test_runs` 3 | stride 3 -> ordinals 0, 3, 6, 9 | `max_test_runs >= reachable` -> all |
 | TC-N-07 | slices | Target last run 601 s ago in another dir; 600 s ago same dir; an `import-synth:` run 5,000 s ago | `gt10min`+`other_dir`; neither; not in `gt10min` | unknown `run.cwd` -> never `other_dir` |
 | TC-N-08 | verdicts | Cells where model - recency is +0.12 on the R1 cell (`n` 300) and -0.02 on `all/len0` | R1 PASS, R2 FAIL naming `all/len0` | R1 cell with `n` 150 -> `INCONCLUSIVE` |
-| TC-N-09 | data-dir guard | `run_bench(default dir, true, ..)`, `run_bench(tmp, false, ..)` | Both `Err` with the guard message | `run_bench(tmp, true, Stats)` on an empty dir succeeds and prints zeros |
+| TC-N-09 (in `bench.rs`, so `cargo test cmd::bench` runs it) | data-dir guard | `run_bench(default dir, true, ..)`, `run_bench(tmp, false, ..)` | Both `Err` with the guard message | `run_bench(tmp, true, Stats)` on an empty dir succeeds and prints zeros |
 | TC-N-10 | render purity (B5), in `src/cmd/render.rs` | `include_str!("render.rs")` with the `#[cfg(test)]` module cut off | Contains none of `rusqlite`, `std::fs`, `std::env`, `Instant::now`, `Timestamp::now`, `std::process`, `log::` | - |
 | TC-N-11 | baselines | 3 candidates with (`last_run_at`, `fuzzy`) = (10, 5), (30, 5), (20, 9) | `recency` order: 2nd, 3rd, 1st; `fzf_scored` order: 3rd, 2nd, 1st | equal `last_run_at` -> higher `db_id` first |
 
@@ -568,7 +593,7 @@ Work top to bottom; within a row try the listed values one at a time.
 |---|---|---|---|---|
 | IT-N-01 | Relevance end to end | Temp data dir; `generate(300, 6000, seed 3, anchor fixed)`; `relevance --seeds 2 --max-test-runs 200 --json out.json` | Exit 0; JSON parses; has `splits.holdout.cells` for 4 rankers x 4 lengths x slice `all`; for `recency` and `heuristic` `sd == 0`; `unreachable.all` between 0 and 1; `verdicts` has R1, R2, R3; a second run produces a byte-identical JSON apart from `date` | `remove_dir_all` |
 | IT-N-02 | Replay state equals a fresh load | Same data; a `Replayer` with every run applied versus `CommandIndex::load` at `now` = newest run + 1 for one (cwd, repo, session) | `rank_commands(.., None)` over all commands returns the same order of `db_id`s from both, for queries `""` and `g` | `remove_dir_all` |
-| IT-N-03 | Agent extraction | Temp projects dir: `p1/s1.jsonl`, `p1/s1/subagents/a.jsonl` (fixture lines of TC-N-05 with distinct timestamps), a non-JSONL file | Runs from both files; `shell_session` values `agent:<id>`; rows in global time order with `prev_command_id` set inside one session; `source = 'hook'`; the fixture files' mtimes unchanged | `remove_dir_all` |
+| IT-N-03 | Agent extraction | Temp projects dir: `p1/s1.jsonl` (the TC-N-05 fixture), `p1/s1/subagents/agent-a9.jsonl` (two uses with `agentId` `a9`, timed between the main file's first two), a non-JSONL file | Runs from both files; `shell_session` values `agent:s1` and `agent:s1:a9`; rows in global time order with `prev_command_id` set inside one session only; `source = 'hook'`; the fixture files' mtimes unchanged | `remove_dir_all` |
 | IT-N-04 | Two-stage check | IT-N-01's data plus `retrain`; `twostage --queries 40` with `CMD_STAGE2_K` larger than the corpus | Overlap 1.0 and top-1 agreement 1.0 (no cut applies); exit 0 | `remove_dir_all` |
 | IT-N-05 | Real data dir is never written | Record size and mtime of every file in `get_default_data_dir()` (skip if it does not exist); run IT-N-01's commands | Unchanged afterwards | none |
 | IT-N-06 | No text leaks from the benchmark | IT-N-01 with one command text replaced by `SENTINEL_c0ffee` | Neither stdout, the JSON nor the Markdown contains `SENTINEL_c0ffee` | `remove_dir_all` |

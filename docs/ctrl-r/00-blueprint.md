@@ -125,7 +125,7 @@ selection --> println!(command) on stdout, exit 0 --> widget replaces the prompt
 | `features.rs` | `CommandFeature`, `COMMAND_FEATURE_REGISTRY`, 23 features | C | [03 section 4](03-learn.md#4-features) |
 | `train.rs` | Replay, group building, fit, model files, lock, detached retrain | C | [03 section 5](03-learn.md#5-training-set-replay), [03 section 6](03-learn.md#6-fit-and-model-files) |
 | `corpus.rs` | Agent-transcript extractor, synthetic generator | D0 (parallel with B) | [04 section 4](04-bench.md#4-corpora) |
-| `bench.rs` | `psychic internal bench-history` | D0 (clap types, `generate`, `extract-agent`, `stats`), D (the rest) | [04 section 3](04-bench.md#3-cli-surface) |
+| `bench.rs` | `psychic internal bench-history` | D0 (`BenchArgs` with `generate`, `extract-agent`, `stats`), D (`relevance`, `twostage`, `latency`) | [04 section 3](04-bench.md#3-cli-surface) |
 | `tests/shell_hooks.rs`, `tests/support/mod.rs` (repo root) | pty-driven zsh/bash/fish hook tests; the shared pty helper | A | [01 section 15.3](01-record.md#153-shell-level-tests-testsshell_hooksrs) |
 | `tests/picker.rs` (repo root) | pty-driven picker test | B | [02 section 14.2](02-browse.md#142-integration-tests) |
 | `bench/history.py` (repo root) | pty benchmarks for command mode | D | [04 section 6](04-bench.md#6-performance-benchmarks) |

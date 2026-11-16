@@ -2751,10 +2751,11 @@ Why: User might scroll up/down many times. Only log once per (query, file) combi
 
 Ctrl-R over the user's shell history, ranked by directory, repository and
 the previous command. Specified in `docs/ctrl-r/` (start at its README); built
-in phases. **Phase A, "Record", is what exists today:** commands are recorded
-and imported, and `psychic history` manages them. The picker (`psychic
-history` with no action flag, Phase B) and `--retrain` (Phase C) exit with
-"not built yet".
+in phases. **Phase A, "Record", and the benchmark corpora of Phase D0 are what
+exists today:** commands are recorded and imported, `psychic history` manages
+them, and `psychic internal bench-history` builds and describes benchmark
+corpora. The picker (`psychic history` with no action flag, Phase B) and
+`--retrain` (Phase C) exit with "not built yet".
 
 New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
 `history_mode` and `ToggleHistoryMode` already mean directory back/forward.
@@ -2770,6 +2771,8 @@ New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
 | `cmd/privacy.rs` | Opt-in marker, `PSYCHIC_HISTORY_IGNORE` globs, permissions, FNV-1a tombstones |
 | `cmd/track.rs` | `psychic track-command` |
 | `cmd/backfill.rs` | Import from Atuin, zsh, bash and fish history |
+| `cmd/bench.rs` | `psychic internal bench-history`: clap types, the data-dir guard's callee, `stats` |
+| `cmd/corpus.rs` | The seeded synthetic generator and the Claude Code transcript extractor |
 
 **Tables** (same `events.db`, created by `store::create_schema`, which
 `Database::prepare_schema` calls once per file per process): `commands` (one
@@ -2830,6 +2833,23 @@ import uses (state before the entry's own `cd`). Entries without a timestamp
 get synthetic ones, one second apart, ending at the file's mtime, and are
 imported once per file only. Nothing at or after the first hook-recorded run
 is imported (the hook has it).
+
+**Benchmark corpora** (`psychic --data-dir DIR internal bench-history
+generate|extract-agent|stats`; `docs/ctrl-r/04-bench.md` section 4). Every
+subcommand refuses to run without an explicit `--data-dir`, or with the real
+one, and `generate`/`extract-agent` refuse a data dir that already holds
+commands. Both builders write through `CmdStore::record_run_in`, so a corpus
+is ordinary recorded history. `generate --commands N --runs M --seed S
+[--anchor T]` simulates a user over 40 directories in 8 repositories: one
+splitmix64 stream, Zipf popularity, per-directory favourites, edit-build-test
+chains, session repeats and retry-after-failure, about 300 s between runs;
+the same arguments give a byte-identical history. 50,000 commands / 500,000
+runs take 7.6 s and 111 MB after `VACUUM`. `extract-agent [--projects-dir D]`
+reads `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR`'s) read-only
+and records each Bash tool call with its cwd, time, exit status (`is_error`
+-> 1) and duration, in session `agent:<sessionId>[:<agentId>]`. `stats`
+prints aggregates only: counts, span, shares with cwd and exit code,
+sessions, immediate-repeat and first-ever shares, pick episodes.
 
 ## Page-Based Caching
 

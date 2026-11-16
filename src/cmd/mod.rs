@@ -3,7 +3,9 @@
 //! The specification is `docs/ctrl-r/` (start at its README); this module is
 //! Phase A, "Record": the command tables (`store`), `psychic track-command`
 //! (`track`), opt-in and privacy (`privacy`), templating (`template`), the
-//! repository root (`repo`) and the shell history import (`backfill`).
+//! repository root (`repo`) and the shell history import (`backfill`). Phase
+//! D0 adds the benchmark corpora: `psychic internal bench-history` (`bench`)
+//! and the synthetic and agent-transcript corpus builders (`corpus`).
 //!
 //! Identifiers say `cmd`/`command`, never `history`: `src/history.rs` and
 //! `history_mode` already mean directory back/forward (ADR-1).
@@ -12,7 +14,9 @@
 //! (`docs/ctrl-r/01-record.md` section 10.6), and nothing here uses `eprintln!`.
 
 mod backfill;
+pub mod bench;
 pub mod cli;
+mod corpus;
 mod privacy;
 mod repo;
 pub mod store;
@@ -71,6 +75,33 @@ pub fn run_history(data_dir: &Path, args: cli::HistoryArgs) -> Result<()> {
         bail!("psychic history: not built yet (Phase C)")
     } else {
         bail!("psychic history: not built yet (Phase B)")
+    }
+}
+
+/// `psychic internal bench-history`. Refuses to run unless `--data-dir` was
+/// given and is not the real data directory: benchmarks never write there.
+pub fn run_bench(data_dir: &Path, data_dir_was_given: bool, args: bench::BenchArgs) -> Result<()> {
+    let real = crate::cli::get_default_data_dir().ok();
+    if !data_dir_was_given || real.is_some_and(|real| same_dir(data_dir, &real)) {
+        bail!("bench-history needs an explicit --data-dir that is not your real data directory");
+    }
+    let env = bench::BenchEnv {
+        now: jiff::Timestamp::now().as_second(),
+        home: std::env::var_os("HOME").map(PathBuf::from),
+        claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+    };
+    bench::run(data_dir, args.command, &env, &mut std::io::stdout().lock())
+}
+
+/// Whether two paths name one directory: compared canonicalised when both
+/// exist, else as absolute paths.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => match (std::path::absolute(a), std::path::absolute(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a == b,
+        },
     }
 }
 

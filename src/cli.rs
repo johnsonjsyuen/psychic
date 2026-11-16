@@ -125,6 +125,8 @@ pub enum HiddenCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum InternalCommands {
+    /// Benchmark shell history search: build corpora, measure relevance and latency
+    BenchHistory(crate::cmd::bench::BenchArgs),
     /// Analyze performance timings from the latest psychic run
     AnalyzePerf,
     /// Print the application log file
