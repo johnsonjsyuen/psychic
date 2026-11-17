@@ -230,7 +230,7 @@ pub(super) fn first_command_word(text: &str) -> Option<&str> {
         .map(|entry| entry.word.text)
 }
 
-/// Whether `text` runs psychic itself (`psychic`, `p`, `pd`, `pc`), which is
+/// Whether `text` runs psychic itself (`psychic`, `p`, `pd`, `pc`, `ph`), which is
 /// never recorded.
 pub(super) fn is_own_command(text: &str) -> bool {
     first_command_word(text).is_some_and(|word| CMD_OWN_COMMANDS.contains(&word))
@@ -339,6 +339,7 @@ mod tests {
     fn own_commands_are_recognised_by_their_first_word_only() {
         assert!(is_own_command("p"));
         assert!(is_own_command("pd foo"));
+        assert!(is_own_command("ph git"));
         assert!(is_own_command("psychic history"));
         assert!(!is_own_command("echo psychic"));
         assert!(!is_own_command("python"));

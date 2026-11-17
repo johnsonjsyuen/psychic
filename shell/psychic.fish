@@ -147,16 +147,20 @@ end
 # Ctrl-R: search command history in psychic
 # =============================================================================
 
-# Enter on a command replaces the command line with it; Escape leaves it alone.
-# Does nothing (and prints nothing) when the binary is not installed.
-function __psychic_history_widget
+# The picker, searching for $argv[1] first. Prints the pick, or nothing
+# (Escape). Fails, printing nothing, when the binary is not installed.
+function __psychic_history_run
     set -l __psychic_bin psychic
     set -q PSYCHIC_BIN; and set __psychic_bin $PSYCHIC_BIN
-    command -q $__psychic_bin; or return
+    command -q $__psychic_bin; or return 1
     set -l __psychic_dir
     set -q PSYCHIC_DATA_DIR; and set __psychic_dir --data-dir $PSYCHIC_DATA_DIR
-    set -l __psychic_query (commandline | string collect)
-    set -l result (command $__psychic_bin $__psychic_dir history --session="$__psychic_session" --cwd="$PWD" --query="$__psychic_query" | string collect)
+    command $__psychic_bin $__psychic_dir history --session="$__psychic_session" --cwd="$PWD" --query="$argv[1]"
+end
+
+# Enter on a command replaces the command line with it; Escape leaves it alone.
+function __psychic_history_widget
+    set -l result (__psychic_history_run (commandline | string collect) | string collect)
     if test -n "$result"
         commandline --replace -- $result
     end
@@ -164,16 +168,55 @@ function __psychic_history_widget
 end
 
 # Bound to Ctrl-R only where history search is on and nothing else has claimed
-# the key. Set PSYCHIC_NO_CTRL_R before loading this to skip it; bind the
-# function yourself with, e.g.,
+# the key, in the default and insert modes each. Set PSYCHIC_NO_CTRL_R before
+# loading this to skip it; bind the function yourself with, e.g.,
 #   bind \cx\cr __psychic_history_widget
-if not set -q PSYCHIC_NO_CTRL_R; and __psychic_history_enabled
+# What became of it goes into PSYCHIC_CTRL_R, for `psychic history --status`:
+# bound (both modes), partly, taken (neither: something else has Ctrl-R),
+# recording-off or opted-out.
+if set -q PSYCHIC_NO_CTRL_R
+    set -gx PSYCHIC_CTRL_R opted-out
+else if not __psychic_history_enabled
+    set -gx PSYCHIC_CTRL_R recording-off
+else
     # --user: fish 4 lists the preset binding beside the user's own. Each
     # mode on its own: a user's insert-mode Ctrl-R is theirs too.
+    set -l __psychic_bound 0
     for __psychic_mode in default insert
         set -l __psychic_current (bind --user -M $__psychic_mode \cr 2>/dev/null)
-        if test -z "$__psychic_current"; or string match -q -- '*history-pager*' $__psychic_current
+        if string match -q -- '*__psychic_history_widget*' $__psychic_current
+            set __psychic_bound (math $__psychic_bound + 1) # an earlier `source`
+        else if test -z "$__psychic_current"; or string match -q -- '*history-pager*' $__psychic_current
             bind -M $__psychic_mode \cr __psychic_history_widget
+            set __psychic_bound (math $__psychic_bound + 1)
         end
+    end
+    switch $__psychic_bound
+        case 2
+            set -gx PSYCHIC_CTRL_R bound
+        case 1
+            set -gx PSYCHIC_CTRL_R partly
+        case '*'
+            set -gx PSYCHIC_CTRL_R taken
+    end
+end
+
+# `ph [words]`: the same picker, typed instead of bound, searching for the
+# words. The pick goes onto the next prompt's command line, ready to edit and
+# run; nothing is run.
+function __psychic_history_typed
+    set -l result (__psychic_history_run "$argv" | string collect)
+    if test -n "$result"
+        commandline --replace -- $result
+    end
+    return 0
+end
+
+# Defined unless PSYCHIC_NO_PH is set or `ph` is already the user's (a
+# function or command); kept as ours when this script is sourced again.
+if not set -q PSYCHIC_NO_PH; and begin; set -q __psychic_ph_ours; or not type -q ph; end
+    set -g __psychic_ph_ours 1
+    function ph --description 'Search command history in psychic; the pick goes on the prompt'
+        __psychic_history_typed $argv
     end
 end

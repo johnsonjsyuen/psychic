@@ -405,7 +405,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         .collect();
     lines.push(Line::default());
     lines.push(Line::from(
-        "Ctrl-R in your shell opens this; Enter puts the command on your prompt.",
+        "Ctrl-R or ph in your shell opens this; Enter puts the command on your prompt.",
     ));
     let content_width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let width = (content_width + 4).min(area.width);
@@ -594,7 +594,7 @@ mod tests {
             );
         }
         assert_eq!(CMD_KEYMAP.len(), 12);
-        assert!(find(&lines, "Ctrl-R in your shell opens this").is_some());
+        assert!(find(&lines, "Ctrl-R or ph in your shell opens this").is_some());
     }
 
     #[test]

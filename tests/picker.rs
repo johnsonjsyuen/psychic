@@ -123,6 +123,10 @@ fn it_b_05_enter_prints_the_pick_and_escape_prints_nothing() {
     let (status, stdout, terminal) = pick(&scratch, &[ENTER]);
     assert!(status.success(), "{terminal}");
     assert_eq!(stdout, "echo two\n", "the newest is row 1");
+    assert!(
+        !terminal.contains("printed only"),
+        "no hint when stdout is captured: {terminal:?}"
+    );
 
     let (status, stdout, _) = pick(&scratch, &[b"one", ENTER]);
     assert!(status.success());
@@ -156,6 +160,48 @@ fn it_b_05_enter_prints_the_pick_and_escape_prints_nothing() {
         impressions[0].parse::<u32>().unwrap() >= 2,
         "{impressions:?}"
     );
+}
+
+/// IT-B-19: `psychic history` typed at the prompt (stdout the terminal):
+/// the pick is printed, then one line on stderr says how to get it onto the
+/// prompt instead, tailored to whether the integration is loaded.
+#[test]
+fn it_b_19_by_hand_the_pick_is_printed_with_a_hint() {
+    let scratch = Scratch::empty("picker", "by-hand");
+    seed(&scratch, "echo by-hand", 100, "/w");
+    for (shell, init) in [(None, true), (Some("zsh"), false)] {
+        let mut command = Command::new(BINARY);
+        command
+            .env_clear()
+            .env("HOME", scratch.path("home"))
+            .env("PATH", scratch.path_env())
+            .env("TERM", "xterm-256color")
+            .env("PSYCHIC_NO_RETRAIN", "1")
+            .arg("--data-dir")
+            .arg(scratch.path("data"))
+            .args(["history", "--cwd", "/tmp"]);
+        if let Some(shell) = shell {
+            command.env("PSYCHIC_SHELL", shell);
+        }
+        let mut pty = Pty::spawn(command, 30, 100).expect("the picker starts");
+        settle(&pty, "the picker");
+        pty.write(ENTER).unwrap();
+        let status = pty.wait(Duration::from_secs(10)).expect("the picker exits");
+        assert!(status.success());
+        settle(&pty, "the picker's exit");
+        let terminal = pty.output();
+        let left = terminal.rfind("\x1b[?1049l").expect("the picker left");
+        let after = &terminal[left..];
+        let pick = after.find("echo by-hand\r\n").expect("the pick is printed");
+        let hint = after
+            .find("psychic: printed only, not put on your prompt.")
+            .unwrap_or_else(|| panic!("no hint: {after:?}"));
+        assert!(pick < hint, "the pick first: {after:?}");
+        for needed in ["Ctrl-R", "type ph", "psychic history --status"] {
+            assert!(after[hint..].contains(needed), "{needed}: {after:?}");
+        }
+        assert_eq!(after[hint..].contains("psychic init"), init, "{after:?}");
+    }
 }
 
 #[test]
@@ -811,6 +857,9 @@ fn it_b_06_every_script_ships_the_widget_with_its_guards() {
             "PSYCHIC_NO_CTRL_R",
             "__psychic_history_enabled",
             "--query=",
+            "PSYCHIC_CTRL_R",
+            "PSYCHIC_NO_PH",
+            "__psychic_history_typed",
         ] {
             assert!(script.contains(needed), "{shell} lacks {needed}");
         }
@@ -819,4 +868,450 @@ fn it_b_06_every_script_ships_the_widget_with_its_guards() {
             "{shell} passes the query as a separate word"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// One Enter in the picker, one at the prompt (IT-B-16 to IT-B-18)
+// ---------------------------------------------------------------------------
+
+/// The prompt every shell here is given, to find it on the screen.
+const PROMPT: &str = "PROMPT> ";
+const UP: &[u8] = b"\x1b[A";
+
+/// A shell set up the way a user's startup file might: `before` runs before
+/// the psychic script is loaded, `after` after it.
+struct Setup {
+    name: &'static str,
+    before: &'static [&'static str],
+    after: &'static [&'static str],
+}
+
+/// The set-ups each shell is tried in: plain, vi editing turned on after the
+/// script (as a later line of the startup file would), and for bash the
+/// prompt of the report that started this: a two-line `PS1` and another
+/// tool's `PROMPT_COMMAND` entry.
+fn setups(shell: &str) -> Vec<Setup> {
+    match shell {
+        "bash" => vec![
+            Setup {
+                name: "plain",
+                before: &["PS1='PROMPT> '"],
+                after: &[],
+            },
+            Setup {
+                name: "two-line",
+                before: &[
+                    "PS1='top line\\nPROMPT> '",
+                    "_other_hook() { local ret=$?; return $ret; }",
+                    "PROMPT_COMMAND='_other_hook;'",
+                ],
+                after: &[],
+            },
+            Setup {
+                name: "vi",
+                before: &["PS1='PROMPT> '"],
+                after: &["set -o vi"],
+            },
+        ],
+        "zsh" => vec![
+            Setup {
+                name: "plain",
+                before: &["PROMPT='PROMPT> '"],
+                after: &[],
+            },
+            Setup {
+                name: "two-line",
+                before: &["PROMPT=$'top line\\nPROMPT> '"],
+                after: &[],
+            },
+            Setup {
+                name: "vi",
+                before: &["PROMPT='PROMPT> '"],
+                after: &["bindkey -v"],
+            },
+        ],
+        "fish" => vec![
+            Setup {
+                name: "plain",
+                before: &["function fish_prompt; printf 'PROMPT> '; end"],
+                after: &[],
+            },
+            Setup {
+                name: "vi",
+                before: &["function fish_prompt; printf 'PROMPT> '; end"],
+                after: &["fish_vi_key_bindings"],
+            },
+        ],
+        other => unreachable!("{other}"),
+    }
+}
+
+/// A scratch dir for `shell` in `setup`, recording on, with one command
+/// recorded whose run leaves a file behind: returns it and that command.
+fn marker_scratch(shell: &str, setup: &Setup, tag: &str) -> (Scratch, String) {
+    let scratch = Scratch::new(shell, &format!("{tag}-{}", setup.name));
+    let command = format!("touch {}", scratch.display("marker"));
+    seed(&scratch, &command, 100, &scratch.display("work"));
+    let join = |lines: &[&str]| lines.iter().map(|l| format!("{l}\n")).collect::<String>();
+    if shell == "fish" {
+        if !setup.before.is_empty() {
+            std::fs::write(scratch.path("fish-pre"), join(setup.before)).unwrap();
+        }
+        if !setup.after.is_empty() {
+            std::fs::write(scratch.path("fish-init"), join(setup.after)).unwrap();
+        }
+    } else {
+        let hook = std::fs::read_to_string(scratch.path("hook")).unwrap();
+        let hook = format!("{}{}\n{}", join(setup.before), hook, join(setup.after));
+        std::fs::write(scratch.path("hook"), hook).unwrap();
+    }
+    (scratch, command)
+}
+
+/// Remove the terminal's control sequences (CSI, OSC, DCS and two-byte
+/// escapes), keeping the text a reader would see.
+fn visible(raw: &str) -> String {
+    let mut text = String::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            text.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']' | 'P') => {
+                while let Some(c) = chars.next() {
+                    if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+/// After the picker gave the terminal back: the prompt was drawn again and
+/// `command` is on it, not printed as output, and has not run.
+fn assert_on_prompt(shell: &str, setup: &Setup, scratch: &Scratch, pty: &Pty, command: &str) {
+    let terminal = pty.output();
+    let left = terminal
+        .rfind("\x1b[?1049l")
+        .unwrap_or_else(|| panic!("{shell}: the picker never left:\n{terminal:?}"));
+    // A long line wraps, and shells move the cursor back with `\r`: the
+    // prompt and the start of the pick are enough.
+    let after = visible(&terminal[left..]).replace('\r', "");
+    let start = command.split(' ').next().unwrap();
+    assert!(
+        after.contains(&format!("{PROMPT}{start} ")),
+        "{shell} {}: the prompt, then the pick on it; after the picker:\n{after:?}",
+        setup.name
+    );
+    assert!(
+        !scratch.path("marker").exists(),
+        "{shell} {}: the pick ran before the second Enter:\n{after:?}",
+        setup.name
+    );
+}
+
+/// Enter at the shell ran the pick: its file appears (within 5 s).
+fn assert_ran(shell: &str, setup: &Setup, scratch: &Scratch, pty: &Pty) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !scratch.path("marker").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        scratch.path("marker").exists(),
+        "{shell} {}: Enter at the prompt did not run the pick:\n{}",
+        setup.name,
+        visible(&pty.output())
+    );
+}
+
+/// The runs the shell recorded (not the seed's), as text.
+fn recorded_runs(scratch: &Scratch, expected: usize) -> Vec<String> {
+    rows_when(
+        &scratch.db(),
+        "SELECT c.text FROM command_runs r JOIN commands c ON c.id = r.command_id \
+         WHERE r.shell_session <> 'seed' ORDER BY r.id",
+        expected,
+    )
+}
+
+/// IT-B-16: Ctrl-R, Enter in the picker: the pick is on a freshly drawn
+/// prompt and has not run; Enter at the prompt runs it.
+fn check_widget_runs_on_the_second_enter(shell: &str) {
+    if !installed(shell) {
+        return;
+    }
+    for setup in setups(shell) {
+        let (scratch, command) = marker_scratch(shell, &setup, "second-enter");
+        let mut pty = start_shell(
+            shell,
+            &scratch,
+            shell_command(shell, &scratch, OptIn::Marker),
+        );
+        pty.write(CTRL_R).unwrap();
+        settle(&pty, "the picker");
+        pty.write(ENTER).unwrap();
+        settle(&pty, shell);
+        assert_on_prompt(shell, &setup, &scratch, &pty, &command);
+        pty.write(ENTER).unwrap();
+        assert_ran(shell, &setup, &scratch, &pty);
+        let terminal = finish(shell, pty);
+        assert_eq!(
+            recorded_runs(&scratch, 1),
+            [command.as_str()],
+            "{shell} {}: the pick ran once\n{}",
+            setup.name,
+            visible(&terminal)
+        );
+        println!("{shell} {}: one Enter picks, the next runs", setup.name);
+    }
+}
+
+#[test]
+fn zsh_ctrl_r_runs_the_pick_only_on_the_second_enter() {
+    check_widget_runs_on_the_second_enter("zsh");
+}
+
+#[test]
+fn bash_ctrl_r_runs_the_pick_only_on_the_second_enter() {
+    check_widget_runs_on_the_second_enter("bash");
+}
+
+#[test]
+fn fish_ctrl_r_runs_the_pick_only_on_the_second_enter() {
+    check_widget_runs_on_the_second_enter("fish");
+}
+
+/// IT-B-17: `ph` typed at the prompt, Enter in the picker: zsh and fish put
+/// the pick on the next prompt; bash puts it in the history list and says to
+/// press Up. Nothing runs until Enter at the prompt; the run is recorded
+/// once, `ph` itself never, and the pick names the shell's session.
+fn check_typed_function(shell: &str) {
+    if !installed(shell) {
+        return;
+    }
+    let setup = &setups(shell)[0];
+    let (scratch, command) = marker_scratch(shell, setup, "typed");
+    let mut pty = start_shell(
+        shell,
+        &scratch,
+        shell_command(shell, &scratch, OptIn::Marker),
+    );
+    pty.write_line("ph touch").unwrap();
+    settle(&pty, "the picker");
+    pty.write(ENTER).unwrap();
+    settle(&pty, shell);
+    if shell == "bash" {
+        let terminal = visible(&pty.output());
+        assert!(
+            terminal.contains("psychic: press Up to get the command on your prompt"),
+            "bash says how to get the pick:\n{terminal}"
+        );
+        assert!(!scratch.path("marker").exists(), "bash ran the pick");
+        pty.write(UP).unwrap();
+        settle(&pty, shell);
+        let after_up = visible(&pty.output()).replace('\r', "");
+        let hint = after_up.rfind("press Up").unwrap();
+        assert!(
+            after_up[hint..].contains(&format!("{PROMPT}touch ")),
+            "Up brought the pick back:\n{after_up}"
+        );
+    } else {
+        assert_on_prompt(shell, setup, &scratch, &pty, &command);
+    }
+    assert!(!scratch.path("marker").exists(), "{shell}: the pick ran");
+    pty.write(ENTER).unwrap();
+    assert_ran(shell, setup, &scratch, &pty);
+    let terminal = finish(shell, pty);
+
+    let runs = recorded_runs(&scratch, 1);
+    assert_eq!(
+        runs,
+        [command.as_str()],
+        "{shell}: the pick ran once and `ph` is not recorded\n{}",
+        visible(&terminal)
+    );
+    let picks = query(
+        &scratch.db(),
+        "SELECT e.query, e.shell_session = (SELECT shell_session FROM command_runs \
+         WHERE shell_session <> 'seed') FROM command_events e WHERE e.action = 'pick'",
+    );
+    assert_eq!(
+        picks,
+        ["touch|1"],
+        "{shell}: one pick, with the words as its query, in the shell's session"
+    );
+    println!("{shell}: ph puts the pick where one Enter runs it");
+}
+
+#[test]
+fn zsh_ph_puts_the_pick_on_the_next_prompt() {
+    check_typed_function("zsh");
+}
+
+#[test]
+fn bash_ph_puts_the_pick_in_the_history_list() {
+    check_typed_function("bash");
+}
+
+#[test]
+fn fish_ph_puts_the_pick_on_the_next_prompt() {
+    check_typed_function("fish");
+}
+
+/// IT-B-18: `ph` is never defined over the user's own `ph`, nor with
+/// PSYCHIC_NO_PH; PSYCHIC_CTRL_R says what became of Ctrl-R.
+fn check_ph_guard_and_ctrl_r_state(shell: &str) {
+    if !installed(shell) {
+        return;
+    }
+    // What `ph` is, with its body, then the state; and the user's own `ph`.
+    // And Ctrl-R taken in every keymap or mode the script would bind.
+    let (show, own, taken) = match shell {
+        "zsh" => (
+            "{ which ph; echo state=$PSYCHIC_CTRL_R; } > ",
+            "alias ph='echo mine'",
+            own_bindings(shell)[0],
+        ),
+        "bash" => (
+            "{ type ph; echo state=$PSYCHIC_CTRL_R; } > ",
+            "alias ph='echo mine'",
+            "for m in emacs vi-insert vi-command; do \
+             bind -m $m '\"\\C-r\": forward-search-history'; done",
+        ),
+        "fish" => (
+            "begin; type ph; echo state=$PSYCHIC_CTRL_R; end 2>&1 > ",
+            "function ph; echo mine; end",
+            own_bindings(shell)[0],
+        ),
+        other => unreachable!("{other}"),
+    };
+    /// Whose `ph` the shell has.
+    #[derive(Debug, PartialEq)]
+    enum Ph {
+        Ours,
+        Users,
+        None,
+    }
+    /// One start of the shell, and what it should end up with.
+    struct Case<'a> {
+        tag: &'a str,
+        opt_in: OptIn,
+        env: &'a [(&'a str, &'a str)],
+        /// A line of the user's, run before the script.
+        user_line: Option<&'a str>,
+        ph: Ph,
+        /// The expected `PSYCHIC_CTRL_R`.
+        state: &'a str,
+    }
+    let cases = [
+        Case {
+            tag: "state-on",
+            opt_in: OptIn::Marker,
+            env: &[],
+            user_line: None,
+            ph: Ph::Ours,
+            state: "bound",
+        },
+        Case {
+            tag: "state-own",
+            opt_in: OptIn::Marker,
+            env: &[],
+            user_line: Some(own),
+            ph: Ph::Users,
+            state: "bound",
+        },
+        Case {
+            tag: "state-no-ph",
+            opt_in: OptIn::Marker,
+            env: &[("PSYCHIC_NO_PH", "1"), ("PSYCHIC_NO_CTRL_R", "1")],
+            user_line: None,
+            ph: Ph::None,
+            state: "opted-out",
+        },
+        Case {
+            tag: "state-off",
+            opt_in: OptIn::Off,
+            env: &[],
+            user_line: None,
+            ph: Ph::Ours,
+            state: "recording-off",
+        },
+        Case {
+            tag: "state-taken",
+            opt_in: OptIn::Marker,
+            env: &[],
+            user_line: Some(taken),
+            ph: Ph::Ours,
+            state: "taken",
+        },
+    ];
+    for Case {
+        tag,
+        opt_in,
+        env,
+        user_line,
+        ph,
+        state,
+    } in cases
+    {
+        let scratch = Scratch::new(shell, tag);
+        if let Some(user_line) = user_line {
+            if shell == "fish" {
+                std::fs::write(scratch.path("fish-pre"), user_line).unwrap();
+            } else {
+                let hook = std::fs::read_to_string(scratch.path("hook")).unwrap();
+                std::fs::write(scratch.path("hook"), format!("{user_line}\n{hook}")).unwrap();
+            }
+        }
+        let mut command = shell_command(shell, &scratch, opt_in);
+        command.envs(env.iter().copied());
+        let mut pty = start_shell(shell, &scratch, command);
+        pty.write_line(&format!("{show}{}", scratch.display("state")))
+            .unwrap();
+        let terminal = finish(shell, pty);
+        let shown = std::fs::read_to_string(scratch.path("state"))
+            .unwrap_or_else(|_| panic!("{shell} {tag}: nothing shown:\n{terminal}"));
+        let found = match (
+            shown.contains("__psychic_history_typed"),
+            shown.contains("mine"),
+        ) {
+            (true, false) => Ph::Ours,
+            (false, true) => Ph::Users,
+            (false, false) => Ph::None,
+            (true, true) => panic!("{shell} {tag}: both: {shown}"),
+        };
+        assert_eq!(found, ph, "{shell} {tag}: {shown}");
+        assert!(
+            shown.contains(&format!("state={state}\n")),
+            "{shell} {tag}: {shown}"
+        );
+    }
+    println!("{shell}: ph and PSYCHIC_CTRL_R as expected");
+}
+
+#[test]
+fn zsh_ph_and_ctrl_r_state_respect_the_user() {
+    check_ph_guard_and_ctrl_r_state("zsh");
+}
+
+#[test]
+fn bash_ph_and_ctrl_r_state_respect_the_user() {
+    check_ph_guard_and_ctrl_r_state("bash");
+}
+
+#[test]
+fn fish_ph_and_ctrl_r_state_respect_the_user() {
+    check_ph_guard_and_ctrl_r_state("fish");
 }

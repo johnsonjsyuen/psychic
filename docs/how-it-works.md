@@ -2090,7 +2090,8 @@ It owns no content. It assembles what is already declared elsewhere:
 
 - keyboard and mouse bindings from `keymap::KEYMAP`
 - command line subcommands from the clap definition in `cli.rs`
-- shell functions (`p`, `pd`, `pc`) parsed out of the embedded `shell/psychic.zsh`,
+- shell functions (`p`, `pd`, `pc`, `ph`) parsed out of the embedded `shell/psychic.zsh`
+  (`name() {`, or `function name {` for one defined conditionally),
   taking each function's description from the comment above it
 
 **Layout:** `lay_out(&blocks, available_width)` returns equal-width columns:
@@ -2523,6 +2524,7 @@ define the same commands; the help screen reads them out of the zsh one.
 - `pd xy` - `cd` to `xy` if it is a directory; otherwise to `psychic jump xy`, with no TUI; if nothing matches, the TUI opens with `xy` typed in. See "Jumping without the TUI" below.
 - `pd -i xy` - the TUI with `xy` typed in (`--query=xy`)
 - `pc` - launch psychic in current-directory-only mode (same as `psychic --filter=cwd --on-cwd-visit=print-to-stdout`)
+- `ph [words]` - the command-history picker, typed rather than bound to Ctrl-R, searching for the words. zsh and fish put the pick on the next prompt's line (`print -rz`, `commandline --replace`); bash cannot from a plain function, so it adds the pick to the history list (`history -s`) and says to press Up. Nothing is run. Not defined over a `ph` the user already has, nor with `PSYCHIC_NO_PH`
 - **Automatic directory tracking**: The shell integration adds a `chpwd` hook that automatically tracks every directory you visit via `cd`. This allows psychic to learn which directories you frequently visit without requiring explicit clicks.
 - Without shell integration, Ctrl-J spawns a new shell in the selected directory (old behavior)
 - **Ctrl-T** inserts a path picked in psychic at the cursor, as fzf's Ctrl-T does: it runs
@@ -2532,7 +2534,8 @@ define the same commands; the help screen reads them out of the zsh one.
   trailing space.
 - **Ctrl-R** (once `psychic history --enable` is on) opens the command-history
   picker with the line being edited as the query and replaces the line with
-  the pick; see "Shell history search" below.
+  the pick; see "Shell history search" below. `psychic history` typed by hand
+  can only print the pick; it says so on stderr and points at Ctrl-R and `ph`.
 
 **Ctrl-T never takes a key someone else has.** Each script binds it only where it
 still does the shell's default (`transpose-chars`), or nothing: an fzf binding,
@@ -2846,7 +2849,7 @@ psychic last); durations have 1-second resolution.
 **`track-command`** is dispatched in `main` before the logger is set up, so
 it never opens `app.log` and command text cannot reach a log. It trims the
 text and skips it when empty, over 8,192 bytes, psychic's own (`psychic`,
-`p`, `pd`, `pc` as the command word) or matching `PSYCHIC_HISTORY_IGNORE`
+`p`, `pd`, `pc`, `ph` as the command word) or matching `PSYCHIC_HISTORY_IGNORE`
 (colon-separated globs over the whole text, matched by a 60-line matcher
 rather than a regex crate). Then one `Database::new`, a permissions check and
 a five-statement transaction. A non-UTF-8 `$PWD` or text is stored lossily
@@ -3036,12 +3039,19 @@ picker leaves the line alone. The pick is not run: the user presses Enter, and
 the recording hook records that run once, in the same session, so training can
 tie it to the pick event (same command and session, run within 300 s). Bound
 only when recording is on, `PSYCHIC_NO_CTRL_R` is unset, and Ctrl-R still has
-the shell's default binding (zsh `history-incremental-search-backward` in
-emacs, `redisplay` in viins; bash `reverse-search-history`, no `bind -x` on it;
-fish no user binding, asked per mode with `bind --user -M <mode> \cr` because
-fish 4 lists the preset beside the user's), so fzf's or Atuin's Ctrl-R is never taken over. bash
-binds with `bind -x` and never calls `history -s`. fish's widget checks the
-binary with `command -q` first and stays quiet without it.
+the shell's default binding, in each keymap or mode on its own (zsh
+`history-incremental-search-backward` or its pattern variant in emacs,
+`redisplay` in viins; bash `reverse-search-history` in emacs, vi-insert and
+vi-command, each bound with `bind -m KEYMAP -x`, so a later `set -o vi` keeps
+it; fish no user binding, asked per mode with `bind --user -M <mode> \cr` because
+fish 4 lists the preset beside the user's), so fzf's or Atuin's Ctrl-R is never taken over.
+What became of it is exported as `PSYCHIC_CTRL_R` (`bound`, `partly`, `taken`,
+`recording-off`, `opted-out`, `old-bash`), which `psychic history --status`
+explains, with the command that shows the binding and how to bind the picker to
+another key. fish's widget checks the binary with `command -q` first and stays
+quiet without it. The widget's `bind -x` never calls `history -s`; only `ph`
+does, and it then tells the recording hook to skip that prompt, so the pick is
+not taken for a command that ran.
 `tests/picker.rs` drives the picker alone and under each shell's Ctrl-R on a pty.
 
 **Benchmark corpora** (`psychic --data-dir DIR internal bench-history
@@ -3598,7 +3608,8 @@ psychic history --status
 psychic history --import                 # Atuin, zsh, bash, fish history
 psychic history --purge [--yes]          # delete every recorded command
 psychic history [--query Q] [--session ID] [--cwd DIR]
-                                         # the picker (what Ctrl-R runs); prints the pick
+                                         # the picker (what Ctrl-R and ph run); prints the pick,
+                                         # plus a hint on stderr when typed at a terminal
 psychic track-command --cwd DIR --exit-code N [--started-at S] [--duration-ms MS] --session ID -- TEXT
                                          # what the shell hooks call; never logs
 

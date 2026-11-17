@@ -176,12 +176,17 @@ add-zsh-hook precmd __psychic_precmd
 # Ctrl-R: search command history in psychic
 # =============================================================================
 
+# The picker, searching for $1 first. Prints the pick, or nothing (Escape).
+__psychic_history_run() {
+    \command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
+        history --session="${__psychic_session}" --cwd="${PWD}" --query="$1"
+}
+
 # Enter on a command replaces the line being edited with it; Escape leaves the
 # line alone. What is already typed becomes the search.
 __psychic_history_widget() {
     \builtin local result
-    result="$(\command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
-        history --session="${__psychic_session}" --cwd="${PWD}" --query="${BUFFER}")"
+    result="$(__psychic_history_run "${BUFFER}")"
     if [[ -n "${result}" ]]; then
         BUFFER="${result}"
         CURSOR=${#BUFFER}
@@ -190,16 +195,55 @@ __psychic_history_widget() {
 }
 \builtin zle -N __psychic_history_widget
 
-# Bound to Ctrl-R only where history search is on and Ctrl-R still does what
-# zsh does by default. Set PSYCHIC_NO_CTRL_R before loading this to skip it;
-# bind the widget yourself with, e.g.,
+# Bound to Ctrl-R only where history search is on, in each of the emacs and
+# viins keymaps where Ctrl-R is still one of zsh's own (its default, or a
+# history search oh-my-zsh and others bind). A plugin that binds Ctrl-R after
+# this runs wins: load this last. Set PSYCHIC_NO_CTRL_R before loading this to
+# skip it; bind the widget yourself with, e.g.,
 #   bindkey '^X^R' __psychic_history_widget
-if [[ -z "${PSYCHIC_NO_CTRL_R-}" ]] && __psychic_history_enabled; then
+# What became of it goes into PSYCHIC_CTRL_R, for `psychic history --status`:
+# bound (both keymaps), partly, taken (neither: something else has Ctrl-R),
+# recording-off or opted-out.
+if [[ -n "${PSYCHIC_NO_CTRL_R-}" ]]; then
+    PSYCHIC_CTRL_R=opted-out
+elif ! __psychic_history_enabled; then
+    PSYCHIC_CTRL_R=recording-off
+else
+    __psychic_keymaps=''
     for __psychic_keymap in emacs viins; do
         case "$(\builtin bindkey -M "${__psychic_keymap}" '^R' 2>/dev/null)" in
-            *history-incremental-search-backward|*redisplay|*undefined-key|'')
-                \builtin bindkey -M "${__psychic_keymap}" '^R' __psychic_history_widget ;;
+            *history-incremental-search-backward|*history-incremental-pattern-search-backward|*redisplay|*undefined-key|'')
+                \builtin bindkey -M "${__psychic_keymap}" '^R' __psychic_history_widget
+                __psychic_keymaps+=' bound' ;;
+            *__psychic_history_widget) __psychic_keymaps+=' bound' ;; # an earlier `source`
+            *) __psychic_keymaps+=' taken' ;;
         esac
     done
-    \builtin unset __psychic_keymap
+    case "${__psychic_keymaps}" in
+        ' bound bound') PSYCHIC_CTRL_R=bound ;;
+        *bound*) PSYCHIC_CTRL_R=partly ;;
+        *) PSYCHIC_CTRL_R=taken ;;
+    esac
+    \builtin unset __psychic_keymap __psychic_keymaps
+fi
+export PSYCHIC_CTRL_R
+
+# `ph [words]`: the same picker, typed instead of bound, searching for the
+# words. The pick goes onto the next prompt's line (`print -rz`), ready to
+# edit and run; nothing is run.
+__psychic_history_typed() {
+    \builtin local result
+    result="$(__psychic_history_run "$*")" || \builtin return
+    [[ -n "${result}" ]] && \builtin print -rz -- "${result}"
+    \builtin return 0
+}
+
+# Defined unless PSYCHIC_NO_PH is set or `ph` is already the user's (an alias,
+# function or command); kept as ours when this script is sourced again.
+if [[ -z "${PSYCHIC_NO_PH-}" ]] && { [[ -n "${__psychic_ph_ours-}" ]] || ! \builtin whence ph >/dev/null; }; then
+    __psychic_ph_ours=1
+    # Search command history; the pick goes on your prompt to edit and run
+    function ph {
+        __psychic_history_typed "$@"
+    }
 fi

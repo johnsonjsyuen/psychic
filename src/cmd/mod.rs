@@ -29,6 +29,7 @@ mod features;
 mod fuzzy;
 mod fzf;
 mod index;
+mod integration;
 mod keys;
 mod model;
 mod privacy;
@@ -149,6 +150,10 @@ struct Env {
     history: Option<String>,
     /// `PSYCHIC_HISTORY_IGNORE`.
     ignore: Option<String>,
+    /// `PSYCHIC_SHELL`, exported by the shell integration.
+    shell: Option<String>,
+    /// `PSYCHIC_CTRL_R`, exported by the shell integration.
+    ctrl_r: Option<String>,
 }
 
 impl Env {
@@ -159,6 +164,15 @@ impl Env {
             zdotdir: std::env::var_os("ZDOTDIR").map(PathBuf::from),
             history: std::env::var("PSYCHIC_HISTORY").ok(),
             ignore: std::env::var("PSYCHIC_HISTORY_IGNORE").ok(),
+            shell: std::env::var("PSYCHIC_SHELL").ok(),
+            ctrl_r: std::env::var("PSYCHIC_CTRL_R").ok(),
+        }
+    }
+
+    fn integration(&self) -> integration::Integration<'_> {
+        integration::Integration {
+            shell: self.shell.as_deref(),
+            ctrl_r: self.ctrl_r.as_deref(),
         }
     }
 
@@ -208,7 +222,7 @@ fn enable(data_dir: &Path, import: bool, now: i64, env: &Env, out: &mut dyn Writ
     PSYCHIC_HISTORY_IGNORE (colon-separated patterns; it must be exported).
   Recorded anyway: lines a zsh zshaddhistory hook rejects; add them to PSYCHIC_HISTORY_IGNORE.
   Stored in: {}/events.db (readable only by you). Nothing leaves this machine.
-  Ctrl-R: open a new shell to get the binding.
+  Ctrl-R: open a new shell to get the binding; ph works in this one.
   Undo: psychic history --disable   Delete everything: psychic history --purge
 ",
         data_dir.display()
@@ -253,6 +267,9 @@ fn status(data_dir: &Path, env: &Env, out: &mut dyn Write) -> Result<()> {
     )?;
     writeln!(out, "picks: {}", counts.picks)?;
     writeln!(out, "{}", model_line(data_dir))?;
+    for line in integration::status_lines(env.integration()) {
+        writeln!(out, "{}", line)?;
+    }
     Ok(())
 }
 
@@ -350,6 +367,8 @@ mod tests {
             zdotdir: None,
             history: None,
             ignore: None,
+            shell: None,
+            ctrl_r: None,
         }
     }
 
@@ -419,7 +438,9 @@ mod tests {
         assert_eq!(
             text(out),
             format!(
-                "recording: on\ndata dir: {}\ncommands: 1\nruns: 2 (hook 2, import 0)\npicks: 0\nmodel: none\n",
+                "recording: on\ndata dir: {}\ncommands: 1\nruns: 2 (hook 2, import 0)\npicks: 0\nmodel: none\n\
+                 shell integration: not loaded in this shell; set it up with: psychic init\n\
+                 Ctrl-R: not psychic's here (it needs the shell integration)\n",
                 data.display()
             )
         );

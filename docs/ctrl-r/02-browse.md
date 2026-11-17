@@ -33,7 +33,7 @@ this phase is built to the design in section 12 so that they pass there.
 
 ## 2. Files touched
 
-New files: `src/cmd/{index,rank,worker,fuzzy,events,keys,app,render,terminal}.rs`,
+New files: `src/cmd/{index,rank,worker,fuzzy,events,keys,app,render,terminal,integration}.rs`,
 `tests/picker.rs`. Extended: `src/cmd/mod.rs` (the no-action branch of
 `run_history`), `src/cmd/tuning.rs` (section 3), `src/cmd/store.rs` (R1 split
 by id and the start-up reader methods, [01 section 6.5](01-record.md#65-cmdstore-methods-and-row-types)),
@@ -94,7 +94,7 @@ no action flag runs `cmd::app::run`.
 
 | Outcome | stdout | Exit code |
 |---|---|---|
-| Enter on a row | The command text followed by `\n` (`println!`), written after the terminal is restored | 0 |
+| Enter on a row | The command text followed by `\n` (`println!`), written after the terminal is restored. When stdout is a terminal (typed by hand), the one-line hint of section 11.4 follows on stderr | 0 |
 | Esc / Ctrl-C / Ctrl-D, or Enter with an empty list | nothing | 0 |
 | Start-up failure (no tty, database unreadable) | nothing; the error on stderr through `main` | 1 |
 
@@ -769,7 +769,7 @@ feature `name = value` when `features` is non-empty (names from
 
 Help overlay (Ctrl-G / F1): a centred bordered box listing every `CMD_KEYMAP`
 row as `keys  description`, generated from the table (section 9), followed by
-the line `Ctrl-R in your shell opens this; Enter puts the command on your prompt.`
+the line `Ctrl-R or ph in your shell opens this; Enter puts the command on your prompt.`
 
 ## 9. Keys
 
@@ -854,9 +854,17 @@ prompt buffer with the pick and passes the current buffer as the initial query
 (what fzf and Atuin do). Bound only when all hold at the time the script is
 sourced: recording is enabled (`__psychic_history_enabled`,
 [01 section 11](01-record.md#11-shell-hooks)), `PSYCHIC_NO_CTRL_R` is unset, and
-Ctrl-R still has the shell's default binding. A user who enables history in a
+Ctrl-R still has the shell's default binding, checked and bound in each
+editing keymap or mode on its own (zsh `emacs`, `viins`; bash `emacs`,
+`vi-insert`, `vi-command`; fish `default`, `insert`), so turning on vi editing
+later in the startup file keeps it. A user who enables history in a
 running shell gets the binding in the next shell (`--enable` says so,
 [01 section 13.1](01-record.md#131---enable---no-import)).
+
+Each script also exports `PSYCHIC_CTRL_R`, what became of the binding, for
+`--status` (section 11.4), and defines `ph`, the same picker typed at the
+prompt (section 11.4). The picker command line lives once per script, in
+`__psychic_history_run`, which both use.
 
 ### 11.1 zsh
 
@@ -865,12 +873,17 @@ running shell gets the binding in the next shell (`--enable` says so,
 # Ctrl-R: search command history in psychic
 # =============================================================================
 
+# The picker, searching for $1 first. Prints the pick, or nothing (Escape).
+__psychic_history_run() {
+    \command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
+        history --session="${__psychic_session}" --cwd="${PWD}" --query="$1"
+}
+
 # Enter on a command replaces the line being edited with it; Escape leaves the
 # line alone. What is already typed becomes the search.
 __psychic_history_widget() {
     \builtin local result
-    result="$(\command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
-        history --session="${__psychic_session}" --cwd="${PWD}" --query="${BUFFER}")"
+    result="$(__psychic_history_run "${BUFFER}")"
     if [[ -n "${result}" ]]; then
         BUFFER="${result}"
         CURSOR=${#BUFFER}
@@ -879,23 +892,68 @@ __psychic_history_widget() {
 }
 \builtin zle -N __psychic_history_widget
 
-# Bound to Ctrl-R only where history search is on and Ctrl-R still does what
-# zsh does by default. Set PSYCHIC_NO_CTRL_R before loading this to skip it;
-# bind the widget yourself with, e.g.,
+# Bound to Ctrl-R only where history search is on, in each of the emacs and
+# viins keymaps where Ctrl-R is still one of zsh's own (its default, or a
+# history search oh-my-zsh and others bind). A plugin that binds Ctrl-R after
+# this runs wins: load this last. Set PSYCHIC_NO_CTRL_R before loading this to
+# skip it; bind the widget yourself with, e.g.,
 #   bindkey '^X^R' __psychic_history_widget
-if [[ -z "${PSYCHIC_NO_CTRL_R-}" ]] && __psychic_history_enabled; then
+# What became of it goes into PSYCHIC_CTRL_R, for `psychic history --status`:
+# bound (both keymaps), partly, taken (neither: something else has Ctrl-R),
+# recording-off or opted-out.
+if [[ -n "${PSYCHIC_NO_CTRL_R-}" ]]; then
+    PSYCHIC_CTRL_R=opted-out
+elif ! __psychic_history_enabled; then
+    PSYCHIC_CTRL_R=recording-off
+else
+    __psychic_keymaps=''
     for __psychic_keymap in emacs viins; do
         case "$(\builtin bindkey -M "${__psychic_keymap}" '^R' 2>/dev/null)" in
-            *history-incremental-search-backward|*redisplay|*undefined-key|'')
-                \builtin bindkey -M "${__psychic_keymap}" '^R' __psychic_history_widget ;;
+            *history-incremental-search-backward|*history-incremental-pattern-search-backward|*redisplay|*undefined-key|'')
+                \builtin bindkey -M "${__psychic_keymap}" '^R' __psychic_history_widget
+                __psychic_keymaps+=' bound' ;;
+            *__psychic_history_widget) __psychic_keymaps+=' bound' ;; # an earlier `source`
+            *) __psychic_keymaps+=' taken' ;;
         esac
     done
-    \builtin unset __psychic_keymap
+    case "${__psychic_keymaps}" in
+        ' bound bound') PSYCHIC_CTRL_R=bound ;;
+        *bound*) PSYCHIC_CTRL_R=partly ;;
+        *) PSYCHIC_CTRL_R=taken ;;
+    esac
+    \builtin unset __psychic_keymap __psychic_keymaps
+fi
+export PSYCHIC_CTRL_R
+
+# `ph [words]`: the same picker, typed instead of bound, searching for the
+# words. The pick goes onto the next prompt's line (`print -rz`), ready to
+# edit and run; nothing is run.
+__psychic_history_typed() {
+    \builtin local result
+    result="$(__psychic_history_run "$*")" || \builtin return
+    [[ -n "${result}" ]] && \builtin print -rz -- "${result}"
+    \builtin return 0
+}
+
+# Defined unless PSYCHIC_NO_PH is set or `ph` is already the user's (an alias,
+# function or command); kept as ours when this script is sourced again.
+if [[ -z "${PSYCHIC_NO_PH-}" ]] && { [[ -n "${__psychic_ph_ours-}" ]] || ! \builtin whence ph >/dev/null; }; then
+    __psychic_ph_ours=1
+    # Search command history; the pick goes on your prompt to edit and run
+    function ph {
+        __psychic_history_typed "$@"
+    }
 fi
 ```
 
 zsh defaults: `^R` is `history-incremental-search-backward` in `emacs` and
-`redisplay` in `viins`.
+`redisplay` in `viins`; oh-my-zsh's `lib/key-bindings.zsh` binds
+`history-incremental-search-backward` again, and
+`history-incremental-pattern-search-backward` is zsh's own too, so both are
+taken over. A plugin that rebinds `^R` after the script runs (loaded later in
+`.zshrc`, or deferred to the first prompt) wins; `--status` says to load
+psychic last. `print -rz` puts `ph`'s pick on the buffer stack, which the next
+prompt's line editor starts with: `-r`, so a backslash in the command is kept.
 
 ### 11.2 bash
 
@@ -904,28 +962,115 @@ zsh defaults: `^R` is `history-incremental-search-backward` in `emacs` and
 # Ctrl-R: search command history in psychic
 # =============================================================================
 
+# The picker, searching for $1 first. Prints the pick, or nothing (Escape).
+__psychic_history_run() {
+    \command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
+        history --session="${__psychic_session}" --cwd="${PWD}" --query="$1"
+}
+
 # Enter on a command replaces the line being edited with it; Escape leaves the
 # line alone. Needs bash 4 or newer, for READLINE_LINE.
 __psychic_history_widget() {
     \builtin local result
-    result="$(\command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
-        history --session="${__psychic_session}" --cwd="${PWD}" --query="${READLINE_LINE}")" || return
+    result="$(__psychic_history_run "${READLINE_LINE}")" || return
     [[ -n "${result}" ]] || return
     READLINE_LINE="${result}"
     READLINE_POINT=${#READLINE_LINE}
 }
 
-# Bound only in an interactive bash 4+, where history search is on and Ctrl-R
-# still does what readline does by default. Set PSYCHIC_NO_CTRL_R before
-# loading this to skip it; bind the function yourself with, e.g.,
-#   bind -x '"\C-x\C-r": __psychic_history_widget'
-if [[ $- == *i* && -z "${PSYCHIC_NO_CTRL_R-}" && "${BASH_VERSINFO[0]}" -ge 4 ]] && __psychic_history_enabled; then
-    if ! \builtin bind -X 2>/dev/null | \command grep -q '^"\\C-r"' &&
-        \builtin bind -p 2>/dev/null | \command grep -q '^"\\C-r": reverse-search-history'; then
-        \builtin bind -x '"\C-r": __psychic_history_widget'
+# Binds Ctrl-R in one keymap if it still does what readline does by default
+# there, and adds `bound` (Ctrl-R is the widget now) or `taken` to
+# __psychic_keymaps.
+# From bash 5.1 each keymap has its own `bind -x` commands; before, one
+# command per key sequence serves every keymap, so a `bind -x` of anyone
+# else's (fzf's) on Ctrl-R anywhere keeps it in all of them.
+__psychic_history_bind() {
+    \builtin local keymap="$1" readline unix
+    readline="$(\builtin bind -m "${keymap}" -p 2>/dev/null | \command grep '^"\\C-r":')"
+    unix="$(\builtin bind -m "${keymap}" -X 2>/dev/null | \command grep '^"\\C-r"')"
+    if [[ "${readline}" == *': reverse-search-history' ]] &&
+        { [[ -n "${__psychic_hist_new}" ]] || [[ -z "${unix}" || "${unix}" == *__psychic_history_widget* ]]; }; then
+        \builtin bind -m "${keymap}" -x '"\C-r": __psychic_history_widget'
+        __psychic_keymaps+=' bound'
+    elif [[ -z "${readline}" && "${unix}" == *__psychic_history_widget* ]]; then
+        __psychic_keymaps+=' bound' # already, from an earlier `source`
+    else
+        __psychic_keymaps+=' taken'
     fi
+}
+
+# Bound only in an interactive bash 4+, where history search is on, in each of
+# the emacs, vi-insert and vi-command keymaps where Ctrl-R still does what
+# readline does by default (so `set -o vi` later in ~/.bashrc keeps it). Set
+# PSYCHIC_NO_CTRL_R before loading this to skip it; bind the function
+# yourself with, e.g.,
+#   bind -x '"\C-x\C-r": __psychic_history_widget'
+# What became of it goes into PSYCHIC_CTRL_R, for `psychic history --status`:
+# bound (all three keymaps), partly, taken (none: something else has Ctrl-R),
+# recording-off, opted-out or old-bash.
+if [[ $- == *i* ]]; then
+    if [[ -n "${PSYCHIC_NO_CTRL_R-}" ]]; then
+        PSYCHIC_CTRL_R=opted-out
+    elif ((BASH_VERSINFO[0] < 4)); then
+        PSYCHIC_CTRL_R=old-bash
+    elif ! __psychic_history_enabled; then
+        PSYCHIC_CTRL_R=recording-off
+    else
+        __psychic_keymaps=''
+        __psychic_history_bind emacs
+        __psychic_history_bind vi-insert
+        __psychic_history_bind vi-command
+        case "${__psychic_keymaps}" in
+            ' bound bound bound') PSYCHIC_CTRL_R=bound ;;
+            *bound*) PSYCHIC_CTRL_R=partly ;;
+            *) PSYCHIC_CTRL_R=taken ;;
+        esac
+        \builtin unset __psychic_keymaps
+    fi
+    export PSYCHIC_CTRL_R
+fi
+
+# `ph [words]`: the same picker, typed instead of bound, searching for the
+# words. bash gives a plain function no way to fill the next prompt's line
+# (READLINE_LINE counts only under `bind -x`), so the pick goes into the
+# history list instead: Up brings it back, ready to edit and run. Nothing is
+# run, and the hook does not take the new history entry for a command that
+# ran: with nothing to compare with, it records nothing at this prompt.
+__psychic_history_typed() {
+    \builtin local result
+    result="$(__psychic_history_run "$*")" || return
+    [[ -n "${result}" ]] || return 0
+    \builtin history -s -- "${result}"
+    __psychic_hist_count=''
+    \builtin printf '%s\n' 'psychic: press Up to get the command on your prompt' >&2
+}
+
+# Defined unless PSYCHIC_NO_PH is set or `ph` is already the user's (an alias,
+# function or command); kept as ours when this script is sourced again.
+if [[ -z "${PSYCHIC_NO_PH-}" ]] && { [[ -n "${__psychic_ph_ours-}" ]] || ! \builtin type -t ph >/dev/null 2>&1; }; then
+    __psychic_ph_ours=1
+    # Search command history; the pick goes on your prompt to edit and run
+    function ph {
+        __psychic_history_typed "$@"
+    }
 fi
 ```
+
+Checked on bash 5.3.9 (and 4.4 and 5.0 in containers): `bind -x` binds in the
+current keymap only, so the old single `bind -x` left Ctrl-R as readline's
+search after a later `set -o vi`; each keymap is now bound with `bind -m`.
+`bind -m KEYMAP -p` does not list a key bound with `-x`, so a
+`reverse-search-history` line there means the key is still readline's own in
+that keymap. Before 5.1, `bind -x` keeps one command per key sequence for
+every keymap (`bind -X` lists it under each), so there a `bind -x` of anyone
+else's on Ctrl-R keeps the key in every keymap. A plain function cannot set the
+next prompt's line (`READLINE_LINE` counts only under `bind -x`; measured: a
+function assigning it leaves the next prompt empty), so `ph` puts the pick in
+the history list with `history -s`, which replaces the history entry of the
+`ph` line itself when bash added one; it then empties
+`__psychic_hist_count`, so the recording hook has nothing to compare with at
+this prompt and does not take the new entry for a command that ran (01 section
+11.3).
 
 ### 11.3 fish
 
@@ -934,16 +1079,20 @@ fi
 # Ctrl-R: search command history in psychic
 # =============================================================================
 
-# Enter on a command replaces the command line with it; Escape leaves it alone.
-# Does nothing (and prints nothing) when the binary is not installed.
-function __psychic_history_widget
+# The picker, searching for $argv[1] first. Prints the pick, or nothing
+# (Escape). Fails, printing nothing, when the binary is not installed.
+function __psychic_history_run
     set -l __psychic_bin psychic
     set -q PSYCHIC_BIN; and set __psychic_bin $PSYCHIC_BIN
-    command -q $__psychic_bin; or return
+    command -q $__psychic_bin; or return 1
     set -l __psychic_dir
     set -q PSYCHIC_DATA_DIR; and set __psychic_dir --data-dir $PSYCHIC_DATA_DIR
-    set -l __psychic_query (commandline | string collect)
-    set -l result (command $__psychic_bin $__psychic_dir history --session="$__psychic_session" --cwd="$PWD" --query="$__psychic_query" | string collect)
+    command $__psychic_bin $__psychic_dir history --session="$__psychic_session" --cwd="$PWD" --query="$argv[1]"
+end
+
+# Enter on a command replaces the command line with it; Escape leaves it alone.
+function __psychic_history_widget
+    set -l result (__psychic_history_run (commandline | string collect) | string collect)
     if test -n "$result"
         commandline --replace -- $result
     end
@@ -951,17 +1100,56 @@ function __psychic_history_widget
 end
 
 # Bound to Ctrl-R only where history search is on and nothing else has claimed
-# the key. Set PSYCHIC_NO_CTRL_R before loading this to skip it; bind the
-# function yourself with, e.g.,
+# the key, in the default and insert modes each. Set PSYCHIC_NO_CTRL_R before
+# loading this to skip it; bind the function yourself with, e.g.,
 #   bind \cx\cr __psychic_history_widget
-if not set -q PSYCHIC_NO_CTRL_R; and __psychic_history_enabled
+# What became of it goes into PSYCHIC_CTRL_R, for `psychic history --status`:
+# bound (both modes), partly, taken (neither: something else has Ctrl-R),
+# recording-off or opted-out.
+if set -q PSYCHIC_NO_CTRL_R
+    set -gx PSYCHIC_CTRL_R opted-out
+else if not __psychic_history_enabled
+    set -gx PSYCHIC_CTRL_R recording-off
+else
     # --user: fish 4 lists the preset binding beside the user's own. Each
     # mode on its own: a user's insert-mode Ctrl-R is theirs too.
+    set -l __psychic_bound 0
     for __psychic_mode in default insert
         set -l __psychic_current (bind --user -M $__psychic_mode \cr 2>/dev/null)
-        if test -z "$__psychic_current"; or string match -q -- '*history-pager*' $__psychic_current
+        if string match -q -- '*__psychic_history_widget*' $__psychic_current
+            set __psychic_bound (math $__psychic_bound + 1) # an earlier `source`
+        else if test -z "$__psychic_current"; or string match -q -- '*history-pager*' $__psychic_current
             bind -M $__psychic_mode \cr __psychic_history_widget
+            set __psychic_bound (math $__psychic_bound + 1)
         end
+    end
+    switch $__psychic_bound
+        case 2
+            set -gx PSYCHIC_CTRL_R bound
+        case 1
+            set -gx PSYCHIC_CTRL_R partly
+        case '*'
+            set -gx PSYCHIC_CTRL_R taken
+    end
+end
+
+# `ph [words]`: the same picker, typed instead of bound, searching for the
+# words. The pick goes onto the next prompt's command line, ready to edit and
+# run; nothing is run.
+function __psychic_history_typed
+    set -l result (__psychic_history_run "$argv" | string collect)
+    if test -n "$result"
+        commandline --replace -- $result
+    end
+    return 0
+end
+
+# Defined unless PSYCHIC_NO_PH is set or `ph` is already the user's (a
+# function or command); kept as ours when this script is sourced again.
+if not set -q PSYCHIC_NO_PH; and begin; set -q __psychic_ph_ours; or not type -q ph; end
+    set -g __psychic_ph_ours 1
+    function ph --description 'Search command history in psychic; the pick goes on the prompt'
+        __psychic_history_typed $argv
     end
 end
 ```
@@ -985,6 +1173,50 @@ pty tests wait for fish's first prompt mark before typing.
 | Cursor after a pick | End of the buffer |
 | Empty result (cancel) | Buffer untouched |
 | The picked command is not executed | The user presses Enter |
+| `ph [words]` | The picker with the words as the query: zsh `print -rz`, fish `commandline --replace` (the next prompt's line), bash `history -s` and `psychic: press Up to get the command on your prompt` on stderr. Defined unless `PSYCHIC_NO_PH` is set or `ph` is already an alias, function or command (kept as ours when the script is sourced again, by `__psychic_ph_ours`). `ph` is in `CMD_OWN_COMMANDS`, so it is never recorded |
+
+### 11.4 Typed by hand, and `--status`
+
+A user's first try may be to type `psychic history` at the prompt. The picker
+cannot reach the shell's line editor from there: it can only print. When stdout
+is a terminal (no widget or `ph` captured it), the pick is printed as always
+and one line follows on stderr (`integration::by_hand_hint`, no command text):
+
+```
+psychic: printed only, not put on your prompt. To get a pick on the prompt, ready to run, press Ctrl-R or type ph instead. Ctrl-R opens something else? See psychic history --status
+```
+
+Without `PSYCHIC_SHELL` (integration not loaded), `press Ctrl-R or type ph
+instead` reads `set up the shell integration (psychic init), then press Ctrl-R
+or type ph`. With stdout a pipe or file nothing is added: the widgets get only
+the command. Typing into the terminal's input queue (`TIOCSTI`) was rejected:
+Linux 6.2+ disables it by default and it lets one program type commands into
+another's terminal.
+
+`--status` ends with the integration lines of `integration::status_lines`,
+from `PSYCHIC_SHELL` and `PSYCHIC_CTRL_R` as the shell exported them when it
+loaded the script:
+
+| `PSYCHIC_CTRL_R` | `Ctrl-R:` line |
+|---|---|
+| `bound` | `psychic's picker, bound when this shell started; if it opens something else, a plugin rebound it later: load psychic last` |
+| `partly` | `psychic's picker in some editing modes only; something else had Ctrl-R in the others when this shell started` |
+| `taken` | `left alone: something else (fzf, Atuin, a plugin) had Ctrl-R when this shell started` |
+| `recording-off` | `not bound: recording was off when this shell started; open a new shell` |
+| `opted-out` | `not bound: PSYCHIC_NO_CTRL_R is set` |
+| `old-bash` | `not bound: needs bash 4 or newer` |
+| unset | `unknown: this shell loaded an older integration; open a new shell` |
+
+Before it: `shell integration: <PSYCHIC_SHELL>`. After it, for zsh, bash and
+fish: `  see what Ctrl-R runs: <command>   (psychic's is __psychic_history_widget)`
+(`bindkey -M emacs '^R'; bindkey -M viins '^R'`, `bind -X | grep -F '\C-r'`,
+`bind \cr`); for `partly` and `taken` also
+`  bind psychic's to another key: <the rebind line of the script's comment>`;
+last, `ph [words]: the picker; the pick goes on your prompt to edit and run`
+(bash: `ph [words]: the picker; Up then brings the pick back to edit and run`).
+Without `PSYCHIC_SHELL` the two lines are
+`shell integration: not loaded in this shell; set it up with: psychic init` and
+`Ctrl-R: not psychic's here (it needs the shell integration)`.
 
 ## 12. Latency design
 
@@ -1118,6 +1350,10 @@ a 200-key series), the heuristic + sort its 1.5 ms at p50 but not at p95
 | Print the pick while the alternate screen is active by writing to `/dev/tty` | `println!` to stdout after `leave_tui` | stdout is the widget's pipe |
 | Execute the picked command, or append a newline that the shell would run | Print the text; the widget assigns the buffer | Requirement: lands on the prompt for editing |
 | Take over Ctrl-R when the user rebound it (fzf, Atuin) or when recording is off | The three binding guards of section 11 | Never break a working Ctrl-R |
+| Bind Ctrl-R with one `bind -x` (bash) or in one keymap | `bind -m` per keymap, each with its own guard (section 11.2) | A later `set -o vi` left readline's search on Ctrl-R |
+| Leave `psychic history` typed at the prompt as a silent dead end, or type the pick into the terminal (`TIOCSTI`) | Print it, plus the stderr hint of section 11.4; `ph` for a typed entry | A user typed the command, got the pick as output, and could not run it with Enter |
+| Define `ph` over the user's own `ph`, or let bash's `history -s` look like a run | The `ph` guard; `__psychic_hist_count=''` after `history -s` | A user's alias must keep working; a pick that never ran must not be recorded |
+| Check that the pick appears on screen and stop there | IT-B-16/17: no side effect after the picker's Enter, the prompt drawn before the pick, the side effect after the shell's Enter | Text on screen passes whether it is on the prompt or printed as output |
 | `--query "$BUFFER"` with a space | `--query="$BUFFER"` | A buffer beginning with `-` would parse as an option |
 | Use tuples for multi-field results (`(String, u32, i64)`) | Named structs (`DirUse`, `PrecededBy`, `Shown`) | [llm.md:5](../../llm.md) |
 | Hard-code a heuristic weight or page size in `rank.rs`/`worker.rs` | `tuning.rs` constants (section 3) | The benchmark tunes them in one place |
@@ -1169,7 +1405,7 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 | IT-B-03 | Pick logging | `CmdEvents` on a temp store; subsessions `g` (impressions for 3 rows), `gi` (`log_accept` of the same 3 rows and the pick of rank 2) | `command_events`: 3 impressions with ranks 1-3 and subsession ids, 1 pick with `episode_queries = ["g","gi"]`, `cwd`, `repo_root`, `shell_session` set; `commands.pick_count == 1` | `remove_dir_all` |
 | IT-B-04 | Render | `ratatui::backend::TestBackend` 140x30 and 100x30 with a `CmdApp` holding 3 rows (one failed, one run here, one multi-line) | 140 wide: list and preview side by side; 100 wide: stacked; the failed row has `!`, the here row `*`, the multi-line row `↵`; the preview shows `Runs` and `Last exit` lines; debug on shows `model: none`; help overlay lists 12 key rows | none |
 | IT-B-05 | Picker end to end (`tests/picker.rs`, pty helper `tests/support/mod.rs`) | Temp data dir with `echo one`, `echo two` (newer); spawn `psychic --data-dir T history --cwd /tmp` on a pty with stdout redirected to a file | Environment includes `PSYCHIC_NO_RETRAIN=1`. Before every key, wait until the pty has been quiet for 300 ms (the list is drawn). Send Enter: exit 0, file is `echo two\n`. Second run, send `one`, wait for quiet again, then Enter: `echo one\n`. Third run, send Esc: exit 0, file empty. `app.log` in T contains `cmd_first_full_render` and no `echo` | `remove_dir_all` |
-| IT-B-06 | Widget blocks ship | Output of `psychic zsh`, `psychic bash`, `psychic fish` | Each contains `__psychic_history_widget`, `PSYCHIC_NO_CTRL_R`, `__psychic_history_enabled`, and `--query=`; none contains `--query "` | none |
+| IT-B-06 | Widget blocks ship | Output of `psychic zsh`, `psychic bash`, `psychic fish` | Each contains `__psychic_history_widget`, `PSYCHIC_NO_CTRL_R`, `__psychic_history_enabled`, `--query=`, `PSYCHIC_CTRL_R`, `PSYCHIC_NO_PH` and `__psychic_history_typed`; none contains `--query "` | none |
 | IT-B-07 | No query text in logs | IT-B-05's second run with the query `SENTINELq` | `app.log` does not contain `SENTINELq` | `remove_dir_all` |
 | IT-B-08 | Ctrl-R in each shell (`tests/picker.rs`) | zsh, bash and fish on a pty with the script, recording on by the marker; `echo alpha`, `echo beta` recorded in session `seed` | Type `beta`, Ctrl-R, Enter (picker), Enter (shell): `echo beta` runs, is recorded once in the shell's session, and the one pick event has `query = beta`, the shell's session and cwd, and a timestamp 0-300 s before that run (the link `follows_pick` of [03 section 5.1](03-learn.md#51-inputs-and-the-replayer) makes, `CMD_PICK_RUN_SECS`). Then `echo kept`, Ctrl-R, Esc, Enter: `echo kept` runs as typed and no second pick is logged | Scratch dropped |
 | IT-B-09 | Binding guards | Each shell: recording on; `PSYCHIC_NO_CTRL_R=1`; recording off; the user's own Ctrl-R bound before the script (bash: a readline function, and `bind -x` as fzf does; fish: both modes, and insert mode only) | The widget is bound in the first case only; fish with only insert mode taken binds the default mode and leaves insert alone | Scratch dropped |
@@ -1179,6 +1415,14 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 | IT-B-13 | A panic gives the terminal back (`tests/picker.rs`, E-B-20) | The picker on a pty with `PSYCHIC_HISTORY_TEST_PANIC=1` | Exit 101; after the last `\x1b[?1049h`, in order: `\x1b[<1u`, `\x1b[?1000l`, `\x1b[?1049l`, `\x1b[?25h`; the panic message after them; the pty's slave termios has `ICANON` and `ECHO`; stdout empty. Fails without the hook (the guard alone restores after the message) | Scratch dropped |
 | IT-B-14 | SIGTERM and SIGHUP give the terminal back (`tests/picker.rs`, E-B-21) | The picker on a pty, settled; `kill(pid, SIGTERM)`, then a fresh one with `SIGHUP` | Killed by that signal; the restore sequences and cooked termios as IT-B-13; stdout empty. Fails without `TerminationSignals` | Scratch dropped |
 | IT-B-15 | Esc right after a delete still deletes (`tests/picker.rs`) | `echo keep-me` and `echo delete-me` recorded; the picker on a pty, settled; the test takes the write lock (`BEGIN IMMEDIATE` on its own connection), presses Delete, `y`, Esc, holds the lock 300 ms more and rolls back. Second test: the lock held until the picker exits | First: exit 0, nothing printed, `commands` holds only `echo keep-me` and `deleted_commands` one row. Second: Esc to exit takes 0.9-2.5 s (`CMD_EXIT_DELETE_WAIT_MS`, not the worker's 5 s `busy_timeout`), exit 0, and `app.log` has the warning that a delete may not have finished | Scratch dropped |
+| IT-B-16 | One Enter picks, the next runs (`tests/picker.rs`) | Each shell, recording on, `touch <scratch>/marker` recorded; set-ups: plain; bash with a two-line `PS1` and another tool's `PROMPT_COMMAND` entry; zsh with a two-line `PROMPT`; vi editing turned on after the script (`set -o vi`, `bindkey -v`, `fish_vi_key_bindings`). A known prompt `PROMPT> ` | Ctrl-R, Enter: `marker` does not exist, and after the picker's `\x1b[?1049l` the screen (escapes and `\r` removed) shows `PROMPT> touch `. Enter: `marker` appears; one run recorded. Fails with a widget that prints the pick, accepts the line, skips the prompt redraw (zsh), or binds bash's current keymap only (vi) | Scratch dropped |
+| IT-B-17 | `ph` (`tests/picker.rs`) | As IT-B-16, plain | `ph touch`, Enter in the picker: zsh and fish as IT-B-16; bash prints `psychic: press Up to get the command on your prompt`, and Up shows `PROMPT> touch `; `marker` absent until Enter at the prompt. One run recorded (no `ph` run, no run from `history -s`); one pick with `query = touch` in the shell's session. Fails without bash's `__psychic_hist_count=''` | Scratch dropped |
+| IT-B-18 | `ph` guard and `PSYCHIC_CTRL_R` | Each shell: recording on; the user's own `ph` (alias, fish function) before the script; `PSYCHIC_NO_PH` and `PSYCHIC_NO_CTRL_R`; recording off; Ctrl-R taken in every keymap | `ph` ours / the user's / absent / ours / ours; `PSYCHIC_CTRL_R` `bound`, `bound`, `opted-out`, `recording-off`, `taken` | Scratch dropped |
+| IT-B-19 | Typed by hand (`tests/picker.rs`) | The picker on a pty with stdout the pty, without and with `PSYCHIC_SHELL` | After the picker leaves: the pick, then the hint of section 11.4 naming Ctrl-R, `type ph` and `psychic history --status`; `psychic init` only without `PSYCHIC_SHELL`. IT-B-05 (stdout a file): no hint | Scratch dropped |
+
+Unit tests of `integration.rs`: every `PSYCHIC_CTRL_R` value has its own
+line; the check and rebind lines per shell; no commands for an unknown shell;
+the hint is one line naming Ctrl-R, `ph` and `--status`.
 
 `tests/support/mod.rs` holds the pty helper shared by `tests/shell_hooks.rs`
 and `tests/picker.rs` ([01 section 15.3](01-record.md#153-shell-level-tests-testsshell_hooksrs)).
@@ -1209,6 +1453,9 @@ and `tests/picker.rs` ([01 section 15.3](01-record.md#153-shell-level-tests-test
 | E-B-20 | The UI thread panics | Panic hook (UI thread only) | The hook restores the terminal (`leave_tui`'s sequence, raw mode off), then the default hook prints the message; unwinding drops `PickerTerminal`, which does nothing more | Exit 101, nothing on stdout; widget as E-B-15 | The panic message on stderr |
 | E-B-21 | SIGTERM, SIGHUP or SIGINT while the picker runs | `TerminationSignals` | `CmdEvent::Terminate`: the loop ends, the terminal is restored, nothing is printed, the process dies of the same signal | A second signal kills at once (the default action) | `log::info!` with the signal number |
 | E-B-22 | Exit (Esc, Enter, a signal) while the worker is still inside a `Delete` (its transaction, or waiting for another process's write lock) | `deleted_any` at section 4 step 8 | Pick printed first; then wait up to `CMD_EXIT_DELETE_WAIT_MS` for the worker to stop, so the delete commits before the process exits | Still busy after the wait: the process exits, the delete is rolled back and the command stays (the user deletes it again) | `log::warn!` (no text); `TIMING` `cmd_exit_delete_wait` |
+| E-B-23 | `psychic history` typed at the prompt | stdout is a terminal | The pick is printed, then the hint of section 11.4 on stderr | `ph`, or Ctrl-R | None |
+| E-B-24 | Ctrl-R is someone else's (fzf, Atuin, a plugin), or rebound after the script ran | The binding guards; `PSYCHIC_CTRL_R` | Left alone; `--status` names the state, how to see the binding and how to bind the picker to another key | `ph` | None |
+| E-B-25 | `ph` is already the user's | `whence` / `type -t` / `type -q` at load | Not defined; `ph` keeps doing what it did | Ctrl-R, or the user's own binding of `__psychic_history_widget` | None |
 
 ## 16. References
 

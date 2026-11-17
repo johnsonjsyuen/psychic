@@ -18,7 +18,7 @@ pub(super) const CMD_MARKER_FILE: &str = "history-enabled";
 pub(super) const CMD_EVENT_WINDOW_SECS: i64 = 2_592_000;
 
 /// First words that are never recorded: psychic's own commands.
-pub(super) const CMD_OWN_COMMANDS: &[&str] = &["psychic", "p", "pd", "pc"];
+pub(super) const CMD_OWN_COMMANDS: &[&str] = &["psychic", "p", "pd", "pc", "ph"];
 
 /// Commands whose every non-flag argument is a path, for templating.
 pub(super) const CMD_PATH_ARG_COMMANDS: &[&str] = &[

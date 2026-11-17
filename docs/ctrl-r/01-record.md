@@ -111,7 +111,7 @@ All in `src/cmd/tuning.rs`, each `pub(super) const` with a doc comment.
 | `CMD_SEQUENCE_MAX_GAP_SECS` | `i64` | `1800` | A run's predecessor counts as "previous command" only if it started at most this long before, in the same shell session |
 | `CMD_MARKER_FILE` | `&str` | `"history-enabled"` | Opt-in marker in the data dir |
 | `CMD_EVENT_WINDOW_SECS` | `i64` | `2_592_000` | 30 days: how far back individual runs (R4) and picks (R8) are loaded |
-| `CMD_OWN_COMMANDS` | `&[&str]` | `["psychic", "p", "pd", "pc"]` | First words that are never recorded |
+| `CMD_OWN_COMMANDS` | `&[&str]` | `["psychic", "p", "pd", "pc", "ph"]` | First words that are never recorded |
 | `CMD_PATH_ARG_COMMANDS` | `&[&str]` | `["cd","pushd","ls","ll","la","cat","less","more","bat","vim","vi","nvim","nano","emacs","hx","code","rm","rmdir","mkdir","touch","cp","mv","ln","chmod","chown","source",".","open","xdg-open","head","tail","wc","du","tree"]` | Commands whose every non-flag argument is a path for templating |
 | `CMD_WAL_TRUNCATE_BYTES` | `u64` | `2 * 1024 * 1024` | `track-command` checkpoints and truncates `events.db-wal` (W1) once it is longer than this (section 9.1) |
 
@@ -1471,7 +1471,7 @@ Shell history search is on.
     PSYCHIC_HISTORY_IGNORE (colon-separated patterns; it must be exported).
   Recorded anyway: lines a zsh zshaddhistory hook rejects; add them to PSYCHIC_HISTORY_IGNORE.
   Stored in: <data dir>/events.db (readable only by you). Nothing leaves this machine.
-  Ctrl-R: open a new shell to get the binding.
+  Ctrl-R: open a new shell to get the binding; ph works in this one.
   Undo: psychic history --disable   Delete everything: psychic history --purge
 ```
 
@@ -1485,7 +1485,10 @@ Remove the marker file if present. Print
 Prints, one per line: `recording: on|off` (marker exists; then
 ` (PSYCHIC_HISTORY=<v> overrides)` when the variable is `0` or `1`),
 `data dir: <path>`, `commands: N`, `runs: N (hook H, import I)`, `picks: N`,
-`model: none` (Phase C replaces this line, [03 section 6.4](03-learn.md#64-status-line)).
+`model: none` (Phase C replaces this line, [03 section 6.4](03-learn.md#64-status-line)),
+then the shell integration lines of [02 section 11.4](02-browse.md#114-typed-by-hand-and---status)
+(`shell integration: ...`, `Ctrl-R: ...` and, with the integration loaded, how
+to check the binding and what `ph` does). None of them holds command text.
 
 ## 14. Anti-patterns (DO NOT)
 

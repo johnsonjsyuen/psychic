@@ -16,7 +16,7 @@ use super::terminal::{self, PickerTerminal, TerminationSignals, Tui};
 use super::train::{self, CmdModelStats};
 use super::tuning::{CMD_EXIT_DELETE_WAIT_MS, CMD_PAGE_PREFETCH, CMD_TICK_MS};
 use super::worker::{self, CmdDetails, CmdRequest, CmdResponse, CmdRow, Scope};
-use super::{cli, privacy, repo};
+use super::{cli, integration, privacy, repo};
 use anyhow::Result;
 use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -639,11 +639,17 @@ pub(super) fn run(data_dir: &Path, args: &cli::HistoryArgs) -> Result<()> {
             terminal::die_of(signal);
         }
         Ok(Ended::Pick(Some(text))) => {
-            use std::io::Write;
+            use std::io::{IsTerminal, Write};
             let mut out = std::io::stdout().lock();
-            writeln!(out, "{}", text)
-                .and_then(|()| out.flush())
-                .map_err(anyhow::Error::from)
+            let printed = writeln!(out, "{}", text).and_then(|()| out.flush());
+            // stdout is a terminal only when someone typed `psychic history`
+            // at the prompt; the widgets and `ph` capture it. Say how to get
+            // the pick onto the prompt instead (section 11.4).
+            if printed.is_ok() && out.is_terminal() {
+                let hint = by_hand_hint();
+                let _ = writeln!(std::io::stderr(), "{}", hint);
+            }
+            printed.map_err(anyhow::Error::from)
         }
         Ok(Ended::Pick(None)) => Ok(()),
         Err(error) => Err(error),
@@ -654,6 +660,16 @@ pub(super) fn run(data_dir: &Path, args: &cli::HistoryArgs) -> Result<()> {
     }
     drop(app);
     printed
+}
+
+/// [`integration::by_hand_hint`] for this process's environment.
+fn by_hand_hint() -> String {
+    let shell = std::env::var("PSYCHIC_SHELL").ok();
+    let ctrl_r = std::env::var("PSYCHIC_CTRL_R").ok();
+    integration::by_hand_hint(integration::Integration {
+        shell: shell.as_deref(),
+        ctrl_r: ctrl_r.as_deref(),
+    })
 }
 
 fn event_loop(

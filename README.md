@@ -101,6 +101,7 @@ If you're using the shell integration (which you should), type
 * `p` to explore both files and directories
 * `pd` to explore just directories. Hit enter to `cd` into the selected directory
 * `pc` to explore just things under the cwd, at any depth
+* `ph` (or Ctrl-R) to search your command history, once `psychic history --enable` is on. The command you pick lands on your prompt, ready to edit and run with Enter (bash: `ph` puts it one Up-arrow away). Typing `psychic history` itself can only print it; `psychic history --status` tells you what Ctrl-R does in your shell
 
 Otherwise, type `psychic` to open the TUI. By default, it will explore both files and directories.
 

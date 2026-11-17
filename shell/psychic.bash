@@ -320,24 +320,95 @@ __psychic_history_ends
 # Ctrl-R: search command history in psychic
 # =============================================================================
 
+# The picker, searching for $1 first. Prints the pick, or nothing (Escape).
+__psychic_history_run() {
+    \command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
+        history --session="${__psychic_session}" --cwd="${PWD}" --query="$1"
+}
+
 # Enter on a command replaces the line being edited with it; Escape leaves the
 # line alone. Needs bash 4 or newer, for READLINE_LINE.
 __psychic_history_widget() {
     \builtin local result
-    result="$(\command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
-        history --session="${__psychic_session}" --cwd="${PWD}" --query="${READLINE_LINE}")" || return
+    result="$(__psychic_history_run "${READLINE_LINE}")" || return
     [[ -n "${result}" ]] || return
     READLINE_LINE="${result}"
     READLINE_POINT=${#READLINE_LINE}
 }
 
-# Bound only in an interactive bash 4+, where history search is on and Ctrl-R
-# still does what readline does by default. Set PSYCHIC_NO_CTRL_R before
-# loading this to skip it; bind the function yourself with, e.g.,
-#   bind -x '"\C-x\C-r": __psychic_history_widget'
-if [[ $- == *i* && -z "${PSYCHIC_NO_CTRL_R-}" && "${BASH_VERSINFO[0]}" -ge 4 ]] && __psychic_history_enabled; then
-    if ! \builtin bind -X 2>/dev/null | \command grep -q '^"\\C-r"' &&
-        \builtin bind -p 2>/dev/null | \command grep -q '^"\\C-r": reverse-search-history'; then
-        \builtin bind -x '"\C-r": __psychic_history_widget'
+# Binds Ctrl-R in one keymap if it still does what readline does by default
+# there, and adds `bound` (Ctrl-R is the widget now) or `taken` to
+# __psychic_keymaps.
+# From bash 5.1 each keymap has its own `bind -x` commands; before, one
+# command per key sequence serves every keymap, so a `bind -x` of anyone
+# else's (fzf's) on Ctrl-R anywhere keeps it in all of them.
+__psychic_history_bind() {
+    \builtin local keymap="$1" readline unix
+    readline="$(\builtin bind -m "${keymap}" -p 2>/dev/null | \command grep '^"\\C-r":')"
+    unix="$(\builtin bind -m "${keymap}" -X 2>/dev/null | \command grep '^"\\C-r"')"
+    if [[ "${readline}" == *': reverse-search-history' ]] &&
+        { [[ -n "${__psychic_hist_new}" ]] || [[ -z "${unix}" || "${unix}" == *__psychic_history_widget* ]]; }; then
+        \builtin bind -m "${keymap}" -x '"\C-r": __psychic_history_widget'
+        __psychic_keymaps+=' bound'
+    elif [[ -z "${readline}" && "${unix}" == *__psychic_history_widget* ]]; then
+        __psychic_keymaps+=' bound' # already, from an earlier `source`
+    else
+        __psychic_keymaps+=' taken'
     fi
+}
+
+# Bound only in an interactive bash 4+, where history search is on, in each of
+# the emacs, vi-insert and vi-command keymaps where Ctrl-R still does what
+# readline does by default (so `set -o vi` later in ~/.bashrc keeps it). Set
+# PSYCHIC_NO_CTRL_R before loading this to skip it; bind the function
+# yourself with, e.g.,
+#   bind -x '"\C-x\C-r": __psychic_history_widget'
+# What became of it goes into PSYCHIC_CTRL_R, for `psychic history --status`:
+# bound (all three keymaps), partly, taken (none: something else has Ctrl-R),
+# recording-off, opted-out or old-bash.
+if [[ $- == *i* ]]; then
+    if [[ -n "${PSYCHIC_NO_CTRL_R-}" ]]; then
+        PSYCHIC_CTRL_R=opted-out
+    elif ((BASH_VERSINFO[0] < 4)); then
+        PSYCHIC_CTRL_R=old-bash
+    elif ! __psychic_history_enabled; then
+        PSYCHIC_CTRL_R=recording-off
+    else
+        __psychic_keymaps=''
+        __psychic_history_bind emacs
+        __psychic_history_bind vi-insert
+        __psychic_history_bind vi-command
+        case "${__psychic_keymaps}" in
+            ' bound bound bound') PSYCHIC_CTRL_R=bound ;;
+            *bound*) PSYCHIC_CTRL_R=partly ;;
+            *) PSYCHIC_CTRL_R=taken ;;
+        esac
+        \builtin unset __psychic_keymaps
+    fi
+    export PSYCHIC_CTRL_R
+fi
+
+# `ph [words]`: the same picker, typed instead of bound, searching for the
+# words. bash gives a plain function no way to fill the next prompt's line
+# (READLINE_LINE counts only under `bind -x`), so the pick goes into the
+# history list instead: Up brings it back, ready to edit and run. Nothing is
+# run, and the hook does not take the new history entry for a command that
+# ran: with nothing to compare with, it records nothing at this prompt.
+__psychic_history_typed() {
+    \builtin local result
+    result="$(__psychic_history_run "$*")" || return
+    [[ -n "${result}" ]] || return 0
+    \builtin history -s -- "${result}"
+    __psychic_hist_count=''
+    \builtin printf '%s\n' 'psychic: press Up to get the command on your prompt' >&2
+}
+
+# Defined unless PSYCHIC_NO_PH is set or `ph` is already the user's (an alias,
+# function or command); kept as ours when this script is sourced again.
+if [[ -z "${PSYCHIC_NO_PH-}" ]] && { [[ -n "${__psychic_ph_ours-}" ]] || ! \builtin type -t ph >/dev/null 2>&1; }; then
+    __psychic_ph_ours=1
+    # Search command history; the pick goes on your prompt to edit and run
+    function ph {
+        __psychic_history_typed "$@"
+    }
 fi
