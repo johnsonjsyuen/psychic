@@ -322,15 +322,22 @@ pub(super) fn stage2_rows(
     index: &CommandIndex,
     ctx: &RankContext,
 ) -> Vec<CommandCandidate> {
-    let stage = (CMD_STAGE2_K, CMD_STAGE2_DIR_ROWS);
-    let (ranking, _, scored) =
-        rank_heuristic(candidates, index, ctx, CMD_STAGE2_K, 0, false, Some(stage));
-    ranking.scores[..scored]
+    // The selection of `rank_heuristic` with a model, without building a
+    // score for every candidate: training calls this once per group.
+    let (_, mut keys) = heuristic_keys(candidates, index, ctx);
+    let k = CMD_STAGE2_K.min(keys.len());
+    if k < keys.len() {
+        keys.select_nth_unstable_by(k - 1, compare);
+    }
+    let scored = if k < keys.len() {
+        let (moved, _) = dir_rows(&mut keys, k, CMD_STAGE2_DIR_ROWS, 0, candidates, index, ctx);
+        k + moved
+    } else {
+        keys.len()
+    };
+    keys[..scored]
         .iter()
-        .map(|s| CommandCandidate {
-            idx: s.idx,
-            fzf: s.parts.fzf,
-        })
+        .map(|key| candidates[key.at as usize])
         .collect()
 }
 
@@ -440,6 +447,38 @@ fn ms_since(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
 
+/// Each candidate's heuristic parts, and its sort key (in candidate order).
+fn heuristic_keys(
+    candidates: &[CommandCandidate],
+    index: &CommandIndex,
+    ctx: &RankContext,
+) -> (Vec<HeuristicParts>, Vec<SortKey>) {
+    let parallel = candidates.len() >= CMD_PAR_FILTER_MIN;
+    let part = |c: &CommandCandidate| heuristic(index, ctx, c.idx, c.fzf);
+    let parts: Vec<HeuristicParts> = if parallel {
+        candidates.par_iter().map(part).collect()
+    } else {
+        candidates.iter().map(part).collect()
+    };
+    let (lo, hi) = parts.iter().fold((i32::MAX, i32::MIN), |(lo, hi), p| {
+        (lo.min(p.fzf), hi.max(p.fzf))
+    });
+    let key = |(at, (c, p)): (usize, (&CommandCandidate, &HeuristicParts))| {
+        sort_key(index, combine(p, lo, hi), c.idx, at as u32)
+    };
+    let keys: Vec<SortKey> = if parallel {
+        candidates
+            .par_iter()
+            .zip(parts.par_iter())
+            .enumerate()
+            .map(key)
+            .collect()
+    } else {
+        candidates.iter().zip(&parts).enumerate().map(key).collect()
+    };
+    (parts, keys)
+}
+
 /// Rank `candidates` for `query` by the heuristic alone: ordered by
 /// [`rank_order`], the first `head` (or all, if fewer) exactly and the rest
 /// after them unsorted ([`CommandRanking::sort_rest`] sorts them). Matching
@@ -470,28 +509,7 @@ fn rank_heuristic(
     );
     let started = Instant::now();
     let parallel = candidates.len() >= CMD_PAR_FILTER_MIN;
-    let part = |c: &CommandCandidate| heuristic(index, ctx, c.idx, c.fzf);
-    let parts: Vec<HeuristicParts> = if parallel {
-        candidates.par_iter().map(part).collect()
-    } else {
-        candidates.iter().map(part).collect()
-    };
-    let (lo, hi) = parts.iter().fold((i32::MAX, i32::MIN), |(lo, hi), p| {
-        (lo.min(p.fzf), hi.max(p.fzf))
-    });
-    let key = |(at, (c, p)): (usize, (&CommandCandidate, &HeuristicParts))| {
-        sort_key(index, combine(p, lo, hi), c.idx, at as u32)
-    };
-    let mut keys: Vec<SortKey> = if parallel {
-        candidates
-            .par_iter()
-            .zip(parts.par_iter())
-            .enumerate()
-            .map(key)
-            .collect()
-    } else {
-        candidates.iter().zip(&parts).enumerate().map(key).collect()
-    };
+    let (parts, mut keys) = heuristic_keys(candidates, index, ctx);
     // The model's recency_rank feature counts within these.
     let newest = if with_newest {
         newest_of(
