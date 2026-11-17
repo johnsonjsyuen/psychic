@@ -12,7 +12,6 @@
 
 use super::fuzzy;
 use super::store::{CmdStore, CountRow, CwdRunsRow, FollowerRow, IdRange, PickRow, RecentRunRow};
-use super::template;
 use super::tuning::{CMD_EVENT_WINDOW_SECS, CMD_LOAD_READERS};
 use anyhow::Result;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -54,12 +53,6 @@ impl Interner {
 pub(super) struct CommandEntry {
     pub db_id: i64,
     pub text: Arc<str>,
-    /// `text.to_lowercase()`, computed once.
-    pub text_lower: Box<str>,
-    /// `text.chars().count()`.
-    pub chars: u32,
-    /// `template::word_count(text)`.
-    pub words: u32,
     /// `fuzzy::text_classes(text)`: which bytes the text holds, for the
     /// filter's prefilter.
     pub classes: u64,
@@ -83,9 +76,6 @@ impl CommandEntry {
         CommandEntry {
             db_id,
             text: Arc::from(text),
-            text_lower: text.to_lowercase().into_boxed_str(),
-            chars: text.chars().count() as u32,
-            words: template::word_count(text) as u32,
             classes: fuzzy::text_classes(text),
             last_run_at: 0,
             run_count: 0,
@@ -646,9 +636,10 @@ mod tests {
     fn add_command_fills_the_derived_text_fields() {
         let index = index_of(&["Git Commit -m 'ä b' | wc"]);
         let entry = &index.entries[0];
-        assert_eq!(&*entry.text_lower, "git commit -m 'ä b' | wc");
-        assert_eq!(entry.chars, 24);
-        assert_eq!(entry.words, 5);
+        assert_eq!(
+            entry.classes,
+            fuzzy::text_classes("Git Commit -m 'ä b' | wc")
+        );
         assert_eq!(index.idx_of(1), Some(0));
         assert_eq!(index.idx_of(2), None);
     }

@@ -139,9 +139,6 @@ impl Interner { pub fn intern(&mut self, s: &str) -> u32; pub fn get(&self, s: &
 pub(super) struct CommandEntry {
     pub db_id: i64,
     pub text: std::sync::Arc<str>,
-    pub text_lower: Box<str>,          // text.to_lowercase(), computed once
-    pub chars: u32,                    // text.chars().count()
-    pub words: u32,                    // template::word_count(text)
     pub classes: u64,                  // fuzzy::text_classes(text): one bit per byte class present (section 6.3)
     pub last_run_at: i64,
     pub run_count: u32,
@@ -182,7 +179,7 @@ pub(super) struct RankContext {
 
 | Method | Effect |
 |---|---|
-| `add_command(db_id, text) -> u32` | Push an entry with zero counts; fill `text_lower`, `chars`, `words`, `classes`; push `classes | LIVE` to `filter_classes`; register in `by_db_id`. Asserts `db_id` is new |
+| `add_command(db_id, text) -> u32` | Push an entry with zero counts; fill `classes`; push `classes | LIVE` to `filter_classes`; register in `by_db_id`. Asserts `db_id` is new |
 | `record_run(idx, at, dir: Option<u32>, repo: Option<u32>, exit: Option<i32>, prev_template: Option<u32>)` | `run_count += 1`; `success_count`/`fail_count` by `exit`; if `at >= last_run_at` then `last_exit_code = exit`; `last_run_at = max`; non-zero `exit` -> `last_fail_at = max(last_fail_at, at)`; insert `at` into `run_times` at `partition_point(\|&t\| t <= at)`; for a `Some` dir: `dir_stats[(idx, dir)].runs += 1` and its `last_run_at = max(last_run_at, at)`; for a `Some` repo: `repo_runs += 1`; for a `Some` prev_template: `followers += 1` |
 | `record_pick(idx, at, query: &str, episode_queries: &[String])` | Push `at` to `picks[idx]`, to `picks_by_query[query][idx]`, and to `episode_picks_by_query[q][idx]` for each distinct `q` in `episode_queries` |
 | `remove(idx)` | `entries[idx].deleted = true`; clear `fuzzy::LIVE` in `filter_classes[idx]` |
@@ -979,6 +976,7 @@ Targets B1-B3, B5. The decisions that make them reachable:
 | One write per frame | The terminal's writer is a 64 KiB `BufWriter` (section 4, step 5): the redraw after a keystroke went from 5.6 to 0.8 ms p50 |
 | Match once | The filter decides the match (Skim's rule, a byte scan on ASCII texts) and gives fzf's score in the same pass; Skim's score is computed for the model's rows only (section 6.3) |
 | Bounded model | At most `CMD_MODEL_MAX_TREES` (100) trees ([03 section 3](03-learn.md#3-constants-phase-c)) |
+| Less derived data at load | `CommandEntry` keeps the text and its byte classes only; the lower-case copy, the character count and the word count, which only features read, are computed for the model's rows (at most `CMD_STAGE2_K`) when it scores them ([03 section 4](03-learn.md#4-features), features 2, 3, 22, 23): one allocation and two scans fewer per command at start-up |
 
 Start-up allowances per stage; they sum to the B3 target:
 

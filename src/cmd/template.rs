@@ -29,12 +29,19 @@ pub(super) struct RawWord<'a> {
 /// the words they belong to. One pass, no allocation per word.
 pub(super) fn raw_words<'a>(text: &'a str) -> Vec<RawWord<'a>> {
     let mut words = Vec::new();
+    each_raw_word(text, |word| words.push(word));
+    words
+}
+
+/// [`raw_words`], handing each word to `visit` in order instead of
+/// collecting them.
+fn each_raw_word<'a>(text: &'a str, mut visit: impl FnMut(RawWord<'a>)) {
     let mut start: Option<usize> = None;
     let mut chars = text.char_indices().peekable();
 
-    let end_word = |words: &mut Vec<RawWord<'a>>, start: &mut Option<usize>, end: usize| {
+    let end_word = |visit: &mut dyn FnMut(RawWord<'a>), start: &mut Option<usize>, end: usize| {
         if let Some(begin) = start.take() {
-            words.push(RawWord {
+            visit(RawWord {
                 text: &text[begin..end],
                 kind: WordKind::Word,
             });
@@ -43,12 +50,12 @@ pub(super) fn raw_words<'a>(text: &'a str) -> Vec<RawWord<'a>> {
 
     while let Some((index, c)) = chars.next() {
         match c {
-            ' ' | '\t' => end_word(&mut words, &mut start, index),
+            ' ' | '\t' => end_word(&mut visit, &mut start, index),
             '&' if start.is_some_and(|begin| text[begin..index].ends_with(['<', '>'])) => {
                 // `2>&1`, `>&2`: part of the redirection word.
             }
             '\n' | ';' | '|' | '&' => {
-                end_word(&mut words, &mut start, index);
+                end_word(&mut visit, &mut start, index);
                 let doubled = matches!(c, '|' | '&') && chars.peek().is_some_and(|&(_, n)| n == c);
                 let operator = if c == '\n' {
                     ";"
@@ -58,7 +65,7 @@ pub(super) fn raw_words<'a>(text: &'a str) -> Vec<RawWord<'a>> {
                 } else {
                     &text[index..index + 1]
                 };
-                words.push(RawWord {
+                visit(RawWord {
                     text: operator,
                     kind: WordKind::Operator,
                 });
@@ -92,8 +99,7 @@ pub(super) fn raw_words<'a>(text: &'a str) -> Vec<RawWord<'a>> {
             }
         }
     }
-    end_word(&mut words, &mut start, text.len());
-    words
+    end_word(&mut visit, &mut start, text.len());
 }
 
 /// `^[A-Za-z_][A-Za-z0-9_]*=`: a `NAME=value` assignment in front of a command.
@@ -232,10 +238,11 @@ pub(super) fn is_own_command(text: &str) -> bool {
 
 /// How many words (not operators) `text` has.
 pub(super) fn word_count(text: &str) -> usize {
-    raw_words(text)
-        .iter()
-        .filter(|word| word.kind == WordKind::Word)
-        .count()
+    let mut words = 0;
+    each_raw_word(text, |word| {
+        words += usize::from(word.kind == WordKind::Word)
+    });
+    words
 }
 
 #[cfg(test)]

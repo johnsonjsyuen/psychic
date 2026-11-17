@@ -125,8 +125,8 @@ Type N = Numeric, B = Binary. Mono: `+` Increasing, `-` Decreasing, blank none.
 | # | Name | Type | Mono | Formula | Value when unknown |
 |---|---|---|---|---|---|
 | 1 | `fuzzy_score` | N | + | `fuzzy_score as f64`: Skim's score of the text for the query (`fuzzy::skim_score`). The filter no longer runs Skim on ASCII texts ([02 section 6.3](02-browse.md#63-filter)), so serving computes it in the model stage for the stage-2 rows only, and training per row | `0.0` when `query` is empty |
-| 2 | `command_starts_with_query` | B | | `1.0` if `query` non-empty and `e.text_lower.starts_with(query_lower)` | `0.0` |
-| 3 | `word_starts_with_query` | B | | `1.0` if `query` non-empty and any `e.text_lower.split_whitespace()` word starts with `query_lower` | `0.0` |
+| 2 | `command_starts_with_query` | B | | `1.0` if `query` non-empty and `e.text.to_lowercase().starts_with(query_lower)` (`lower_starts_with`: an ASCII text is compared ignoring ASCII case, without a lower-case copy; the index keeps none) | `0.0` |
+| 3 | `word_starts_with_query` | B | | `1.0` if `query` non-empty and any `e.text.to_lowercase().split_whitespace()` word starts with `query_lower` (`a_word_starts_with`, the same ASCII shortcut) | `0.0` |
 | 4 | `picks_for_this_query` | N | + | `index.picks_for_query(query, idx, now, P30)` | `0.0` |
 | 5 | `picks_in_episode_with_query` | N | + | `index.episode_picks_for_query(query, idx, now, P30)` | `0.0` |
 | 6 | `log_seconds_since_last_run` | N | - | `ln(1 + max(0, now - e.last_run_at))` | `CMD_NEVER_SECS_LOG` when `e.run_count == 0` |
@@ -145,8 +145,8 @@ Type N = Numeric, B = Binary. Mono: `+` Increasing, `-` Decreasing, blank none.
 | 19 | `success_rate` | N | | `e.success_count / (e.success_count + e.fail_count)` | `f64::NAN` when the denominator is 0 (LightGBM treats NaN as missing) |
 | 20 | `failed_within_2_minutes` | B | | `1.0` if `e.last_fail_at > 0 && now - e.last_fail_at < CMD_FAIL_RECENT_SECS && e.last_fail_at <= now` | `0.0` |
 | 21 | `last_exit_nonzero` | B | | `1.0` if `e.last_exit_code` is `Some(n)` with `n != 0` | `0.0` |
-| 22 | `command_length` | N | | `e.chars` | - |
-| 23 | `argument_count` | N | | `e.words.saturating_sub(1)` | `0.0` |
+| 22 | `command_length` | N | | `e.text.chars().count()` | - |
+| 23 | `argument_count` | N | | `template::word_count(&e.text).saturating_sub(1)` (no allocation: `raw_words`' visitor form) | `0.0` |
 | 24 | `fzf_score` | N | + | `inputs.fzf_score`: fzf's score of the text for the query under `--scheme=history` ([02 section 7.1](02-browse.md#71-fzfs-score-srccmdfzfrs)); serving takes it from the candidate, which the filter scored, and training from the same match (`fuzzy::Query::matches`); pick rows use `rank::fzf_score` | `0.0` for the empty query; `-1.0` (`NO_FZF_MATCH`) when fzf does not match |
 | 25 | `recency_rank` | N | | `inputs.recency_rank`: how many commands matching the query in any scope have a newer `(last_run_at, db_id)`, at most `CMD_RECENCY_RANK_CAP`. Serving takes the `CMD_RECENCY_RANK_CAP` newest candidates in the heuristic's pass (`rank::newest_of`, one pass over the sort keys, no allocation per candidate) in scope `All`; in the Directory, Repository and Session scopes the worker passes `rank::newest_of` the `All` matches instead (`rank_scoped`, [02 section 6.3](02-browse.md#63-filter)), so the count is the one training saw (fixed 2026-11-17; before, a scope's candidates were counted). Training walks the replay's recency order until it has that many matches (`train::newest_matching`); IT-N-02 checks both give the same list, TC-B-26 the scoped case | - |
 

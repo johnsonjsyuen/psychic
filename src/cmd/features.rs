@@ -11,6 +11,7 @@
 //! makes every model trained before it fail the name check of `CmdModel::load`.
 
 use super::index::{CommandEntry, CommandIndex, RankContext};
+use super::template;
 use super::tuning::{CMD_EVENT_WINDOW_SECS, CMD_FAIL_RECENT_SECS, CMD_NEVER_SECS_LOG};
 use crate::feature_defs::Monotonicity;
 use crate::feature_defs::schema::FeatureType;
@@ -93,6 +94,33 @@ fn runs_within(i: &CommandFeatureInputs, secs: i64) -> f64 {
     f64::from(i.index.runs_in_window(i.idx, i.ctx.now, secs))
 }
 
+/// `text.to_lowercase().starts_with(query_lower)`, without lower-casing an
+/// ASCII text: its lower case is ASCII, and an ASCII byte equals a byte of
+/// `query_lower` (lower case already) exactly when they are equal ignoring
+/// ASCII case. The model reads this for its rows on every keystroke; the
+/// index keeps no lower-case copy of every text.
+fn lower_starts_with(text: &str, query_lower: &str) -> bool {
+    if text.is_ascii() {
+        let (text, query) = (text.as_bytes(), query_lower.as_bytes());
+        text.len() >= query.len() && text[..query.len()].eq_ignore_ascii_case(query)
+    } else {
+        text.to_lowercase().starts_with(query_lower)
+    }
+}
+
+/// Whether a whitespace-separated word of `text.to_lowercase()` starts with
+/// `query_lower` (lower-casing never makes or removes whitespace).
+fn a_word_starts_with(text: &str, query_lower: &str) -> bool {
+    if text.is_ascii() {
+        text.split_whitespace()
+            .any(|word| lower_starts_with(word, query_lower))
+    } else {
+        text.to_lowercase()
+            .split_whitespace()
+            .any(|word| word.starts_with(query_lower))
+    }
+}
+
 // --- Query ---------------------------------------------------------------------
 
 command_feature!(FuzzyScore, "fuzzy_score", Numeric, INCREASING, |i| {
@@ -108,7 +136,7 @@ command_feature!(
     "command_starts_with_query",
     Binary,
     NONE,
-    |i| flag(!i.query.is_empty() && i.entry.text_lower.starts_with(i.query_lower))
+    |i| flag(!i.query.is_empty() && lower_starts_with(&i.entry.text, i.query_lower))
 );
 
 command_feature!(
@@ -116,13 +144,7 @@ command_feature!(
     "word_starts_with_query",
     Binary,
     NONE,
-    |i| flag(
-        !i.query.is_empty()
-            && i.entry
-                .text_lower
-                .split_whitespace()
-                .any(|word| word.starts_with(i.query_lower))
-    )
+    |i| flag(!i.query.is_empty() && a_word_starts_with(&i.entry.text, i.query_lower))
 );
 
 command_feature!(
@@ -297,11 +319,11 @@ command_feature!(LastExitNonzero, "last_exit_nonzero", Binary, NONE, |i| {
 // --- Shape -----------------------------------------------------------------------
 
 command_feature!(CommandLength, "command_length", Numeric, NONE, |i| {
-    f64::from(i.entry.chars)
+    i.entry.text.chars().count() as f64
 });
 
 command_feature!(ArgumentCount, "argument_count", Numeric, NONE, |i| {
-    f64::from(i.entry.words.saturating_sub(1))
+    template::word_count(&i.entry.text).saturating_sub(1) as f64
 });
 
 // --- Added after the first release (append-only) --------------------------------
@@ -399,6 +421,41 @@ mod tests {
     use crate::cmd::index::test_support::{context, index_of};
 
     const NOW: i64 = 1_000_000;
+
+    #[test]
+    fn query_flags_equal_lower_casing_the_whole_text() {
+        use rand::{Rng, SeedableRng};
+        const PIECES: &[&str] = &[
+            "Git", "gi", "a", "A", " ", "\t", "\u{0B}", "É", "é", "İ", "K", "k", "-x",
+        ];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let mut word_hits = 0;
+        for _ in 0..50_000 {
+            let mut pick = |max: usize| -> String {
+                (0..rng.gen_range(0..=max))
+                    .map(|_| PIECES[rng.gen_range(0..PIECES.len())])
+                    .collect()
+            };
+            let text = pick(6);
+            let query_lower = pick(2).to_lowercase();
+            let lower = text.to_lowercase();
+            assert_eq!(
+                lower_starts_with(&text, &query_lower),
+                lower.starts_with(&query_lower),
+                "{text:?} {query_lower:?}"
+            );
+            let words = lower
+                .split_whitespace()
+                .any(|w| w.starts_with(&query_lower));
+            assert_eq!(
+                a_word_starts_with(&text, &query_lower),
+                words,
+                "{text:?} {query_lower:?}"
+            );
+            word_hits += usize::from(words);
+        }
+        assert!(word_hits > 5_000, "{word_hits}");
+    }
 
     fn features(
         index: &CommandIndex,
