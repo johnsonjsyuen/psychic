@@ -954,7 +954,7 @@ pty tests wait for fish's first prompt mark before typing.
 
 ## 12. Latency design
 
-Targets B1-B3, B5. The decisions that make them reachable:
+Targets B1-B3, B5, B10. The decisions that make them reachable:
 
 | Decision | Detail |
 |---|---|
@@ -1036,6 +1036,31 @@ about 2.5 ms at p95 rather than 3.5 ms. The same code measured
 in-process with the pool hot takes about half these times. Before the
 start-up reads were split (one connection, R1-R8 in order) B3 was 55 / 61 ms;
 before the partial sort and the reuse rules B1 was 4.9 / 11.7 ms.
+
+**Measured 2026-11-17, after the merge with the speed work** (the Phase D
+harness, `bench/history.py`; interactive 50,000 / 500,000 perf DB, 40 x 120
+pty, release, each build with the model its own `setup` trained, load below 2;
+before = 4cc43bf, after = this section's design; full tables in
+[results.md](results.md)):
+
+| Metric | before p50 / p95 | after p50 / p95 | Target |
+|---|---|---|---|
+| B3 first results on screen (`startup 200`, 3 rounds each) | 37.5-37.9 / 45.2-46.1 ms | 29.6-30.5 / 35.7-36.5 ms | <= 50 ms |
+| B1 worker per keystroke (`keystroke 200`, 2 rounds) | 5.3-5.5 / 10.5-11.5 ms | 3.1-3.2 / 5.8-6.4 ms | <= 8 ms |
+| B1 with a 0.3 s pause before each key | 5.3-5.4 / 10.7-11.3 ms | 3.4-3.5 / 5.8-6.0 ms | <= 8 ms |
+| B2 keystroke -> first byte (the echo) | 1.7 / 4.0 ms | 1.6 / 2.3-2.5 ms | <= 16 ms |
+| B10 keystroke -> results drawn | 10.5-10.6 / 17.4-18.6 ms | 4.1-4.2 / 6.8-7.3 ms | <= 16 ms |
+| B10 with a 0.3 s pause | 10.6-10.7 / 18.2-19.2 ms | 4.4-4.5 / 9.5-9.7 ms | <= 16 ms |
+| the draw itself | (not logged) | 0.8 / 1.1-1.2 ms | - |
+
+Start-up stages after (p50): R1 read with entries built 15.2-15.8 ms,
+entries moved into the index +4 ms, R2-R8 applied +0.5 ms (index load
+22-23 ms from the worker's start), first query 4.6-4.8 ms, first paint
+3.6-3.7 ms. Per keystroke in the picker (not reused, p50): filter 1.5 ms,
+heuristic 0.1 ms, features 0.8 ms, predict 0.5 ms, blend 0.4 ms. The
+allowances above stand; the filter now fits its 3 ms at p95 (3.6 ms max of
+a 200-key series), the heuristic + sort its 1.5 ms at p50 but not at p95
+(2.3 ms: selecting the head among 37,000 candidates of a first letter).
 
 ## 13. Anti-patterns (DO NOT)
 

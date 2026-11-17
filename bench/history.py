@@ -58,6 +58,7 @@ TARGETS = {
     "B7_db_mb": 300.0,
     "B8_overlap": 0.98,
     "B8_top1": 0.995,
+    "B10_key_to_results_ms_p95": 16.0,
 }
 # File search's own figures (00 section 2, reference points, not targets).
 FILE_REFERENCE = "file search reference: round trip 1.16 ms, keystroke -> redraw 2.45 ms, first full render 11.55 ms"
@@ -444,7 +445,9 @@ def keystroke(b, n, pause=0.0):
         "B2": {"p50": percentile(redraw, .5), "p95": percentile(redraw, .95), "n": len(redraw), "misses": misses,
                "pause_s": pause,
                "verdict": verdict(percentile(redraw, .95), TARGETS["B2_redraw_ms_p95"], unreliable=unreliable)},
-        "key_to_results": {"p50": percentile(results, .5), "p95": percentile(results, .95), "n": len(results)},
+        "key_to_results": {"p50": percentile(results, .5), "p95": percentile(results, .95), "n": len(results),
+                           "verdict": verdict(percentile(results, .95), TARGETS["B10_key_to_results_ms_p95"],
+                                              unreliable=unreliable)},
         "B1": {"p50": percentile(total, .5), "p95": percentile(total, .95), "n": len(total),
                "p95_not_reused": percentile([q["total_ms"] for q in fresh], .95),
                "p95_first_letter": percentile(first_letter, .95),
@@ -537,9 +540,10 @@ def print_table(r):
     print(row("keystroke -> redraw, first byte = echo (B2)", r["B2"]["p50"], r["B2"]["p95"], "16 ms", r["B2"]["verdict"]))
     print(row("  same, 0.3 s pause before each key", r["B2_paused"]["p50"], r["B2_paused"]["p95"], "16 ms",
               r["B2_paused"]["verdict"]))
-    print(row("keystroke -> results drawn (info)", r["key_to_results"]["p50"], r["key_to_results"]["p95"], "-", ""))
+    print(row("keystroke -> results drawn (B10)", r["key_to_results"]["p50"], r["key_to_results"]["p95"], "16 ms",
+              r["key_to_results"]["verdict"]))
     print(row("  same, 0.3 s pause before each key", r["key_to_results_paused"]["p50"],
-              r["key_to_results_paused"]["p95"], "-", ""))
+              r["key_to_results_paused"]["p95"], "16 ms", r["key_to_results_paused"]["verdict"]))
     print(row("worker per keystroke (B1)", r["B1"]["p50"], r["B1"]["p95"], "8 ms", r["B1"]["verdict"]))
     print(row("track-command wall (B4)", r["B4"]["p50"], r["B4"]["p95"], "10 ms", r["B4"]["verdict"]))
     print(f"{'retrain (B6)':<52}{r['B6']['median']:>8.1f}s  max{r['B6']['max']:>5.1f}s {'60 s':>9}  {r['B6']['verdict']}")

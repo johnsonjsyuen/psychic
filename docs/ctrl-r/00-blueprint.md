@@ -51,15 +51,16 @@ Scale for every B metric: a database with **50,000 distinct commands and
 | B7 | `events.db` size of the perf DB after `VACUUM` | <= 300 MB |
 | B8 | Two-stage rank versus full scoring: mean top-10 overlap / top-1 agreement over 400 queries | >= 0.98 / >= 0.995 |
 | B9 | File-mode `first results` median after Phase A, versus the parent commit (`./bench/run.py startup 6`) | <= +3% |
+| B10 | Keystroke to its results drawn (`cmd_key_to_results`: the query sent to the end of the draw that shows its answer), p95; also with a 0.3 s pause before each key | <= 16 ms (adopted 2026-11-17: one frame; B2 alone is met by the query's echo) |
 
 Reference points for "same performance and relevance characteristics as file
 search" (reported beside every result, not targets):
 
 | Reference | Value | Source |
 |---|---|---|
-| File search steady-state query round trip | 1.16 ms | [how-it-works.md:2834](../how-it-works.md) |
-| File search keystroke to redraw | 2.45 ms | [how-it-works.md:2825](../how-it-works.md) |
-| File search first full render | 11.55 ms | [how-it-works.md:2826](../how-it-works.md) |
+| File search steady-state query round trip | 1.16 ms | [how-it-works.md:3142](../how-it-works.md) |
+| File search keystroke to redraw | 2.45 ms | [how-it-works.md:3133](../how-it-works.md) |
+| File search first full render | 11.55 ms | [how-it-works.md:3134](../how-it-works.md) |
 | File search top-1 / MRR on its own benchmark | 0.7960 / 0.8656 | [how-it-works.md:1669](../how-it-works.md) |
 | Seed noise of file top-1 (8 seeds) | spread 0.027, sd 0.010 | [llm.md:112-113](../../llm.md) |
 
@@ -71,7 +72,7 @@ file numbers and are never compared with them as a pass/fail test.
 
 **Implementation Implication:** Phase D is not optional polish. No phase is
 "done" for the owner until [results.md](04-bench.md#8-results-log-format) holds
-a row that passes R1-R3 and B1-B9; the file candidates sit at a few hundred
+a row that passes R1-R3 and B1-B10; the file candidates sit at a few hundred
 rows, so B1-B3 force a design (bulk load, parallel filter, two-stage rank) that
 file mode never needed.
 
@@ -256,7 +257,7 @@ edits this table first, in the same commit as the code.
 |---|---|
 | Discussion notes that preceded this plan | [docs/ctrl-r-notes.md:1-66](../ctrl-r-notes.md) |
 | Project rules: benchmark every commit, seeds, tests, no `eprintln!` | [llm.md:44-62](../../llm.md), [llm.md:109-125](../../llm.md), [llm.md:206-212](../../llm.md) |
-| File-mode performance table | [docs/how-it-works.md:2823-2835](../how-it-works.md) |
+| File-mode performance table | [docs/how-it-works.md:3131-3143](../how-it-works.md) |
 | "No lazily initialised global in a parallel loop" | [docs/how-it-works.md:1205-1207](../how-it-works.md) |
 | Blend formula | [src/ranker.rs:465-474](../../src/ranker.rs) |
 | LightGBM parameters | [src/training/mod.rs:177-199](../../src/training/mod.rs) |

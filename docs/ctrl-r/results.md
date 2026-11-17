@@ -5,6 +5,142 @@ entry first; one entry per benchmark run used for a decision. Targets are
 defined in [00-blueprint.md section 2](00-blueprint.md#2-success-metrics).
 Every figure below is an aggregate; no command or query text.
 
+## 2026-11-17 - 6ad4868..6c7f51f - merge with the speed work, then a fast picker (kept)
+
+Before = a saved build of 4cc43bf (the previous entry's code), after = a
+build of b4f6e68 (6c7f51f changes comments and docs only). Each side ran
+`bench/history.py setup --from` its own copy of the corpus, so each ranks
+with the model its own training produced (before: 200 trees; after: 58
+trees, below the new cap of 100; why they differ is under "Findings").
+Runs alternate before/after, one at a time, each started at load < 2
+(i9-12950HX, 24 threads, `powersave` governor, 40 x 120 pty, release).
+Synthetic corpora only; no command or query text below.
+
+### What changed (one commit each, measured one at a time)
+
+| Commit | Change | Kept because |
+|---|---|---|
+| 6ad4868 | Merge `ctrl-r-perf`: byte-class prefilter, first-letter seeds, R1 rows built in place, bench `--pause-ms/--now/--dump`, `PSYCHIC_BENCH_BINARY` | The prefilter is exact for the filter's matcher (Skim, ASCII case folding only); `--dump` digests of the merge and of a build with seeding switched off were byte-equal on three perf DBs with and without a model; relevance equal to the previous entry to 3 decimals |
+| b496b07 | Match once: the filter decides the match (Skim's rule, an in-order byte scan on ASCII texts) and attaches fzf's score; `rank.rs` no longer rescores; Skim's score only for the model's rows; fzf's port reads ASCII as bytes and has a one-character path. Matching in scope All, then the scope: the model's `recency_rank` counts among every match in every scope (the open item of the previous entry). Seeds a slice of 8,192 commands at a time | `latency 300`: filter mean 1.6-2.0 -> 0.45-0.55 ms, heuristic 0.8-0.9 -> 0.4-0.5 ms. Relevance unchanged (below) |
+| 452cfc4 | `CMD_MODEL_MAX_TREES` 100 (`training::fit_capped`) | Relevance within 0.002 of uncapped on every headline cell; predict is bounded at half of a 200-tree model |
+| ee612d2 | A `BufWriter` around `/dev/tty` | The draw after a key: 5.55 / 7.94 -> 0.81 / 1.12 ms (p50 / p95); render alone is 0.2 ms, the rest was one `write` per escape sequence |
+| b6ccab9 | Bench: `startup` records a command before each trial | Without it the pickers' impressions grew the WAL to 45 MB and every start rebuilt its index (13-20 ms) - a cost users do not have (track-command bounds the WAL at 2 MiB) |
+| b4f6e68 | `CommandEntry` without `text_lower`, `chars`, `words` (features compute them for their rows) | R1 read 18.5-19.2 -> 15.2-15.8 ms p50; B3 -2.5 ms p50 |
+
+Rejected (measured): fzf's own matching as the filter (terms in any order,
+trailing space ignored): model top-1 at 2 chars 0.623 +-0.018 vs 0.635
++-0.006, at 1 char 0.514 vs 0.533, seed spread tripled. A 60-tree cap:
+-0.003 to -0.005 top-1. `CMD_LOAD_READERS` 8: no faster R1 read (18.1 /
+24.5 ms), B3 44.2 / 54.4 ms. `CMD_STAGE2_K` 4000: not needed for B1, and
+does not fix B8 (below). Not tried: show-newest-first loading (B3 met
+without it).
+
+### Verdicts (interactive 50,000 / 500,000; p50 / p95)
+
+| Budget | Before | After | Target | Verdict after |
+|---|---|---|---|---|
+| B1 worker per keystroke (`keystroke 200`, 2 rounds) | 5.28-5.51 / 10.52-11.51 ms | 3.09-3.16 / 5.80-6.36 ms | <= 8 ms | PASS (was FAIL) |
+| B1, 0.3 s pause | 5.32-5.39 / 10.70-11.30 ms | 3.43-3.50 / 5.81-6.01 ms | (info) | under 8 ms |
+| B1, `all`'s run | 5.76 / 11.99 ms | 3.33 / 6.77 ms | <= 8 ms | PASS |
+| B2 key -> first byte, the echo | 1.69-1.71 / 3.97-4.00 ms | 1.59-1.63 / 2.25-2.45 ms | <= 16 ms | PASS |
+| B2, 0.3 s pause | 1.95-2.22 / 4.17-8.85 ms | 2.07-2.25 / 3.03-8.90 ms | <= 16 ms | PASS |
+| B3 first results on screen (`startup 200`, 3 rounds) | 37.47-37.86 / 45.22-46.12 ms | 29.63-30.51 / 35.68-36.47 ms | <= 50 ms (aim 40) | PASS, under the aim |
+| B4 track-command | 4.01 / 6.21 ms | 4.76 / 6.57 ms (`all`: 5.39 / 7.85 vs 3.23 / 6.35) | <= 10 ms | PASS (unchanged code; noise) |
+| B6 retrain | 7.2 s (`all`: 5.1 s) | 5.2 s (`all`: 6.1 s) | <= 60 s | PASS |
+| B7 events.db after VACUUM | 113.9 MB | 113.9 MB | <= 300 MB | PASS |
+| B8 top-10 overlap / top-1 | 0.9795 / 1.0000 | 0.9312-0.9355 / 0.9875-0.9925 | >= 0.98 / 0.995 | **FAIL** (was FAIL by 0.0005) - the model's, see Findings |
+| B10 key -> results drawn (new) | 10.48-10.58 / 17.36-18.64 ms | 4.06-4.15 / 6.76-7.32 ms | <= 16 ms | PASS (before FAIL) |
+| B10, 0.3 s pause | 10.65 / 18.18-19.21 ms | 4.42-4.48 / 9.55-9.70 ms | <= 16 ms | PASS |
+| the draw after a key | (not logged) | 0.80-0.84 / 1.06-1.22 ms | - | - |
+
+Repetitive 50,000 / 500,000 (stress, 2 rounds): B1 4.06-4.20 / 10.48-10.82 ms
+-> 3.12-3.60 / 6.47-6.48 ms (PASS, was FAIL); B10 8.85-8.97 / 17.02-17.62 ->
+4.14-4.66 / 7.36-7.67 ms; B8 0.9070 / 0.9675 -> 0.9112 / 0.9675 (FAIL both).
+
+`latency 300` (no pty, back to back; mean / p95), 2 rounds: total
+2.87-3.39 / 4.88-6.31 -> 2.04-2.17 / 4.08-4.48 ms; filter 1.24-1.55 /
+2.49-3.44 -> 0.57-0.63 / 1.27-1.35; heuristic 0.69-0.76 / 1.52-1.57 ->
+0.49-0.51 / 1.49-1.54; features 0.16-0.17 / 0.29-0.33 -> 0.40-0.42 /
+0.76-0.90 (Skim's score moved here, for 2,000 rows); predict 0.64-0.74 /
+1.04-1.44 -> 0.32 / 0.60-0.67. With `--pause-ms 300` (after only; the
+before build lacks the flag): total 3.83 / 6.64 ms, every stage about 2x:
+a cold core after a typing pause, which only less work per key helps.
+
+Start-up stages after (p50): R1 read with entries built 15.2-15.8 ms;
+entries in the index 19-20 ms; R2-R8 applied 19.8-20 ms (from the load's
+start); first query 4.6-4.8 ms (before 5.6-5.7); first paint 3.5-3.7 ms
+(before 6.9-7.2: the buffered terminal).
+
+What is still over: nothing among B1-B4, B6, B7, B10. B8 fails. At p95
+the heuristic stage (2.3 ms in the picker: selecting the head among the
+~37,000 candidates of one letter) is over its 1.5 ms allowance in 02
+section 12, inside B1's budget. B2 with a pause has a long tail (8.9 ms
+p95 in one round, both builds): the echo waits on a cold core.
+
+### Relevance after the ranking changes (holdout, 5 seeds; model mean +-sd)
+
+| Corpus / cell | Previous entry (be20d21) = the merge here | b496b07 uncapped | 452cfc4 (cap 100) |
+|---|---|---|---|
+| interactive 50k, all len2 top-1 | 0.635 +-0.006 | 0.635 +-0.006 | 0.635 +-0.009 |
+| interactive 50k, all len0 top-10 | 0.592 | 0.592 | 0.592 |
+| interactive 50k, all len0 / len1 / len3 top-1 | 0.151 / 0.533 / 0.648 | 0.150 / 0.534 / 0.648 | 0.151 / 0.532 / 0.649 |
+| interactive 50k, gt10min len2 top-1 | 0.530 | 0.531 | 0.530 |
+| interactive 50k R1 / R2 / R3 | +0.295 / +0.085 / 0.000 PASS | +0.295 / +0.085 / 0.000 PASS | +0.294 / +0.086 / 0.000 PASS |
+| repetitive 50k, len 0/1/2/3 top-1 | 0.509 / 0.608 / 0.654 / 0.664 | - | 0.509 / 0.607 / 0.654 / 0.663 |
+| repetitive 50k R1 / R2 / R3 | +0.169 / -0.003 / 0.000 PASS | - | +0.169 / -0.003 / 0.000 PASS |
+| cold start (heuristic row) | pure fzf order | identical | identical |
+
+The merge build reproduced the previous entry exactly. Every move is
+under 0.002 (noise is ~0.01).
+
+### Side by side with file search at 243 commands (medians, `startup 200` and `keystroke 200`, 2 rounds each)
+
+The history picker on the 243-command perf DB (`perfwork-243`, retrained
+by each side's `setup`, 71 trees), against file search's figures of
+how-it-works.md (243 files, 10 start-ups / 50 keys, medians):
+
+| | File search (243 files) | History before (243) | History after (243) |
+|---|---|---|---|
+| query round trip, steady state | 1.16 ms | worker 0.16 ms; key -> results drawn 3.60-3.77 ms | worker 0.16-0.18 ms; key -> results drawn 1.45-1.46 ms, of which the draw 0.63, so key -> answer received ~0.82 ms |
+| keystroke -> redraw (first byte) | 2.45 ms | 1.07-1.20 ms (the echo) | 1.08-1.21 ms (the echo); results drawn 1.45 ms |
+| first full render | 11.55 ms | 17.70-17.96 ms | 10.29-10.59 ms (p95 12.7-13.3) |
+
+At equal size the history picker is now at or below file search on all
+three. What remains of its first full render: first paint (terminal set-up)
+4.0-4.1 ms, the worker's load and first query until first results at
+9.4-9.7 ms, the draw ~0.6 ms. At 50,000 commands the same figures are
+B3 29.6-30.5 ms and B10 4.1 ms: the difference is the size (R1 over 50,000
+rows is 15 ms; a first letter matches ~37,000 commands), not the design.
+
+### Findings
+
+- **Skim's score depends on call history.** `fuzzy-matcher` 0.3.7 keeps
+  per-thread cached matrices; one training set's `fuzzy_score` total was
+  3,828,450 (old: Skim on every candidate), 3,828,434 (new: Skim on
+  feature rows only) and 3,828,374 (a fresh matcher per call), every other
+  feature identical. That 16-point difference in 215,501 rows moved early
+  stopping from 200 trees to 58 on the perf DB. Relevance did not move,
+  but it shows the round count is chaotic, which the tree cap bounds.
+- **B8 is the model's.** On the same DB, with the same model, both builds
+  give the same B8: 0.977 / 1.000 with the 200-tree model, 0.932 / 0.985
+  with the 58-tree one; K = 4000 gives 0.990 and 0.957. The shipped
+  model's choices lie outside fzf's first 2,000 more often; the lever is a
+  second stage-1 source, not K. Pre-existing on the repetitive corpus.
+- **The previous entry's open item** (`recency_rank` in narrower scopes
+  counted among the scope's candidates) is fixed (TC-B-26).
+- The independent review of 4cc43bf..b4f6e68 found no bug; its doc
+  findings are fixed in 6c7f51f (Skim-only matches that fzf rejects also
+  include title-case letters and a TAB; they rank last, as designed).
+
+### How to re-run
+
+`PSYCHIC_BENCH_BINARY=<saved build> HOME=<scratch> ./bench/history.py
+--work <dir> setup --from <corpus copy>`, then the modes above; the series
+script used here is `notes/final/run.sh` in the scratch area (not in the
+repository). Relevance: `psychic --data-dir <copy> internal bench-history
+relevance --seeds 5 --json r.json --md r.md` (about 6 minutes at 50k with
+four runs side by side).
+
 ## 2026-11-17 - be20d21 - fzf's order as the cold start; model sampler, features and query mix (kept)
 
 The changes, each measured on its own first (variants below), then together:

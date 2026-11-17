@@ -12,7 +12,7 @@ Numbers for the targets themselves are in 00 only; here they are cited by ID.
 |---|---|
 | Builds | `psychic internal bench-history` (Rust), `bench/history.py` (Python, pty), `docs/ctrl-r/results.md` |
 | Inputs (must exist) | D0 needs Phase A only. D needs Phases A, B, C |
-| Output | A results-log row per corpus showing R1-R3 and B1-B9 with PASS/FAIL, then the tuning loop of section 7 |
+| Output | A results-log row per corpus showing R1-R3 and B1-B10 with PASS/FAIL, then the tuning loop of section 7 |
 
 Done when all of these pass (D0: the first three lines and `generate`,
 `extract-agent`, `stats`; D: everything):
@@ -591,7 +591,7 @@ verdict is the worse of the two runs.
 | Reported (p50, p95, n, misses) | From |
 |---|---|
 | **keystroke -> first byte, the echo (B2)** | the measured intervals |
-| keystroke -> results drawn | `cmd_key_to_results` lines except the first |
+| **keystroke -> results drawn (B10)** | `cmd_key_to_results` lines except the first |
 | of which the draw | their `draw_ms` |
 | **worker time per keystroke (B1)** | `total_ms` of every `cmd_query` TIMING line of this run except the first (the Backspaces are answered by the worker's reuse rules, [02 section 6.3](02-browse.md#63-filter), as a user's are; `reused` says which) |
 | worker per keystroke, not reused | the lines with `reused: false` (each did a filter and a ranking) |
@@ -662,6 +662,7 @@ compare two builds interleaved.
 perf DB: 50,000 commands / 500,000 runs, 40x120 pty      p50      p95   target  verdict
 first results on screen (B3)                            ..ms     ..ms    50 ms   PASS
 keystroke -> redraw (B2)                                ..ms     ..ms    16 ms   PASS
+keystroke -> results drawn (B10)                        ..ms     ..ms    16 ms   PASS
 worker per keystroke (B1)                               ..ms     ..ms     8 ms   PASS
 track-command wall (B4)                                 ..ms     ..ms    10 ms   PASS
 retrain (B6)                                            ..s   max ..s    60 s    PASS
@@ -746,7 +747,7 @@ Work top to bottom; within a row try the listed values one at a time.
 | # | Candidate | Constant(s) | Values to try | Target |
 |---|---|---|---|---|
 | 1 | Cold start (done 2026-11-17) | The heuristic is fzf's order ([02 section 7](02-browse.md#7-heuristic-ranking)); the weights of this row are gone. A psychic signal (frequency, runs in 30 days, directory share, directory recency, a shorter recency scale) may be added only as a tie-break inside equal fzf scores, and only if it is not below pure fzf on any cell of `all`/`gt10min`/`other_dir` x lengths x 4 metrics, both query styles, on every corpus. Measured: every one was below somewhere (results.md) | - | R3, and pure fzf on every cell |
-| 2 | Stage-2 size | `CMD_STAGE2_K` | 500, 1000, 2000, 4000 | B1, B8, R1 |
+| 2 | Stage-2 size | `CMD_STAGE2_K` | 500, 1000, 2000, 4000 (4000 measured 2026-11-17 for B8: 0.957 on the shipped model, still FAIL; B1 does not need a smaller K) | B1, B8, R1 |
 | 3 | Negative sampler mix (done 2026-11-17: 0/30) | `CMD_TRAIN_RECENT_NEGATIVES` / `CMD_TRAIN_RANDOM_NEGATIVES` | 15/15, 0/30; also "hard" (8 of the 15 recent by best fzf score), rejected | R1, R2, `all` length 0 top-10 |
 | 4 | Query style mix (done 2026-11-17) | `CMD_TRAIN_FRAGMENT_SHARE` | 0, 25, 50 | Prefix lengths 1-3 against the fragment style |
 | 4 | Synthetic-query mix | `CMD_TRAIN_QLEN_MIX` | [40,20,20,20], [25,25,25,25], [10,30,30,30], [70,10,10,10] | R1 at length 2 against R2 at length 0 |
@@ -846,7 +847,7 @@ the self-consistency rule of E-N-08.
 
 | Topic | Location |
 |---|---|
-| Every target (R1-R3, B1-B9) and the reference numbers | [00-blueprint.md section 2](00-blueprint.md#2-success-metrics) |
+| Every target (R1-R3, B1-B10) and the reference numbers | [00-blueprint.md section 2](00-blueprint.md#2-success-metrics) |
 | ADR-16, ADR-17, ADR-19 | [00-blueprint.md section 8](00-blueprint.md#8-architecture-decision-records) |
 | `record_run`, T1-T4 | [01-record.md section 6](01-record.md#6-sql-statements) |
 | Production importer used for corpus 1 | [01-record.md section 12](01-record.md#12-backfill) |
