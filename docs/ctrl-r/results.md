@@ -5,6 +5,275 @@ entry first; one entry per benchmark run used for a decision. Targets are
 defined in [00-blueprint.md section 2](00-blueprint.md#2-success-metrics).
 Every figure below is an aggregate; no command or query text.
 
+## 2026-11-18 - 76169ff..a802f56 - B8, short fragment queries, a deterministic training (kept)
+
+Three problems of the previous entry, each taken apart and fixed where
+it could be: B8 failed (0.93), a model made short fragment queries worse
+than no model, and training was not a pure function of its input.
+Synthetic corpora only; no command or query text below. Relevance runs
+shared the machine with each other (load 20-60; it changes run time, not
+results: the benchmark is deterministic per seed); the performance series
+ran one at a time at load < 2 (i9-12950HX, 24 threads, `powersave`, 40 x 120
+pty, release). Before = the parent's code (0ba45c8; its relevance JSON
+`rel/merge/*-m3t100`, its saved build `perfbin/final-b4f6e68`), after = a
+build of a802f56 (`perfbin/final-c1`).
+
+### What changed
+
+| Commit | Change | Why |
+|---|---|---|
+| 76169ff | Stage 2 scores fzf's top 2,000 **and the 100 other matches run most often in the picker's directory** (`CMD_STAGE2_DIR_ROWS`, `rank::dir_rows`, `CommandIndex::commands_in_dir`) | B8: the rows the full model ranks first and stage 2 missed were the directory's regulars (below) |
+| 76169ff | Training's 30 random negatives are drawn from **the rows serving's model scores** for that query (`rank::stage2_rows` over the production filter), not from every match | With the directory rows but the old sampler, prefix top-1 fell 0.02 (variant B): the model had never seen a directory regular as a negative |
+| 76169ff | Feature 1 (`fuzzy_score`, Skim's score) is a constant, renamed `retired_fuzzy_score` | Not a pure function of (query, text); zeroed, relevance equal or better (variant A). The new name makes a model of the previous build refused and retrained at once (TC-L-20) |
+| 76169ff | Features 6-11 (the command's own recency and frequency) have no monotone constraint | +0.01-0.03 prefix top-1 at lengths 1-3, +0.03 `other_dir`, length 0 equal (variant E against D) |
+| e039b7c | Bench: an `infix` query style (inside a word, never at its start: a rule training never uses), R4 (model minus the cold start on every fragment and infix cell of `all`/`gt10min`, >= -0.01), `stage1_recall` counts the rows really scored | The task's new requirement, measurable; a query rule the model is not trained on |
+| 2156d9b | `stage2_rows` without building a score for every match | Training calls it per group; same rows, byte-identical model |
+| a802f56 | Of the 30 negatives, 20 from the stage-2 rows and 10 from every match (`CMD_TRAIN_STAGE2_NEGATIVES`) | With all 30 from the stage-2 rows the model never saw any other match lose, and B8's full scoring put such rows first: B8 0.975 / 0.802 (interactive / repetitive) on this build's own models |
+
+### Verdicts
+
+Interactive 50,000 / 500,000 unless noted; p50 / p95; before = `final-b4f6e68`
+on its own perf DB and model, after = `final-c1` on a perf DB set up (and
+trained) by it. Relevance: holdout, 5 seeds, model mean.
+
+| Target | Before | After | Bar | Verdict after |
+|---|---|---|---|---|
+| B8 two-stage vs full, interactive | 0.9312-0.9355 / 0.9875-0.9925 | 0.9877 / 1.0000 | >= 0.98 / 0.995 | **PASS** (was FAIL) |
+| B8, repetitive | 0.9112 / 0.9675 | 0.9925 / 1.0000 | >= 0.98 / 0.995 | **PASS** (was FAIL) |
+| B8, the same build trained with seeds 1 / 2 / 3 (interactive; repetitive) | - | 0.9960 / 0.9812 / 0.9960, top-1 1.000 (0.9982 / 0.9980 / 0.9935, top-1 0.9975 / 1.000 / 0.9950) | >= 0.98 / 0.995 | PASS every one; seed 2 interactive and seed 3 repetitive top-1 are at the bar |
+| B1 worker per keystroke (`keystroke 200`, 2 rounds each) | 3.35-3.48 / 5.97-6.27 ms | 3.50-3.75 / 6.27-6.38 ms | <= 8 ms | PASS (+0.0-0.4 ms p95) |
+| B1, repetitive (2 rounds) | (previous entry: 3.12-3.60 / 6.47-6.48) | 3.56-3.65 / 6.46-6.53 ms | <= 8 ms | PASS |
+| B10 key -> results drawn | 4.52-4.58 / 6.93-7.48 ms | 4.48-4.77 / 7.40-7.45 ms | <= 16 ms | PASS |
+| B10, repetitive | (previous entry: 4.14-4.66 / 7.36-7.67) | 4.66-4.69 / 7.48-7.60 ms | <= 16 ms | PASS |
+| B2 key -> first byte | 1.68-1.72 / 2.54-2.55 ms | 1.59-1.71 / 2.18-2.28 ms | <= 16 ms | PASS |
+| B3 first results on screen (`startup 200`, 1 round) | 28.4 / 34.8 ms | 30.3 / 38.0 ms | <= 50 ms | PASS; +2-3 ms in one round each, all of it in the index load (R1 read 14.1 -> 16.3 ms p50), which this change does not touch beyond one list push per directory row of the cwd: not attributed |
+| B6 `--retrain` (`train 3`) | 5.5 s median | 18.1 s median (max 18.8) | <= 60 s | PASS; the stage-2 pool costs a filter pass and a selection per training group |
+| `latency 300`, total mean / p95 | 1.93 / 3.63 ms | 1.61 / 3.88 ms | (info) | features 0.38 -> 0.20 ms mean (no Skim), heuristic p95 1.21 -> 1.56 (the directory rows) |
+| R1 / R2 / R3 interactive | +0.294 / +0.086 / 0.000 | +0.313 / +0.072 / 0.000 | +0.10 / -0.01 / -0.001 | PASS |
+| R1 / R2 / R3 repetitive | +0.169 / -0.003 / 0.000 | +0.163 / -0.001 / 0.000 | | PASS |
+| R4 (new) interactive: worst fragment/infix cell, model minus fzf | -0.165 (fragment 1) | -0.148 (fragment 1); fragment 2 / 3 / 5: -0.033 / -0.019 / 0.000 | >= -0.01 | **FAIL** (see Findings) |
+| R4 repetitive | -0.018 (fragment 1) | -0.008 (fragment 1) | >= -0.01 | PASS |
+| Shuffled-label control (interactive 50k) | (previous entries) | model 0.004-0.010 top-1 on every prefix and fragment cell, far below the heuristic | below the heuristic | PASS |
+| Leakage tests (`training_at_a_cut_sees_nothing_after_it`, `a_lookup_is_ranked_before_its_own_run_is_applied`, IT-N-02) | pass | pass | | PASS |
+
+### Findings
+
+**B8: it was the directory.** On the interactive perf DB with the
+previous model (58 trees, B8 0.932 / 0.985), the full model's top-10 rows
+that fzf's top 2,000 missed were, by query length 0/1/2/3: within the 50
+matches run most often in the lookup's directory 100% / 89% / 95% / 96%,
+within the 50 run most often overall 0% / 53% / 86% / 80%, within fzf's
+first 5,000 almost never (their fzf rank, median 2,767-5,601). Second
+sources tried on that same model (no retraining), B8 overlap / top-1:
+
+| Stage 2 | interactive | repetitive |
+|---|---|---|
+| fzf's top 2,000 (before) | 0.9322 / 0.9850 | 0.9112 / 0.9675 |
+| + 100 most-run overall | 0.9870 / 0.9975 | - |
+| + 50 most-run in this directory | 0.9982 / 1.0000 | 0.9982 / 1.0000 |
+| + 100 most-run in this directory (shipped) | 0.9992 / 1.0000 | 0.9990 / 1.0000 |
+| + 100 + 100 | 0.9997 / 1.0000 | - |
+| K 4000 (previous entry) | 0.990 / 0.957 | - |
+
+Adding those rows alone made relevance worse (variant B: prefix length 2
+0.642 -> 0.614): the model ranked them first because training had drawn its
+negatives from every match, mostly commands fzf puts far below anything
+stage 2 sees, so it had learnt to tell good matches from bad ones and had
+never seen a directory regular lose. Drawing all 30 negatives from the
+rows serving scores (variant D) fixed it (0.641), but then the model had
+never seen any other match lose, and B8, whose full scoring ranks every
+match, fell on the models this build trains itself:
+
+| Negatives from the stage-2 rows + from every match | B8 interactive | B8 repetitive | interactive p2 / other_dir p2 top-1 | repetitive p1 / p2 / gt10min p2 |
+|---|---|---|---|---|
+| 30 + 0 (variant E) | 0.9750 / 1.0000 FAIL | 0.8022 / 0.9125 FAIL | 0.664 / 0.485 | 0.626 / 0.678 / 0.366 |
+| 20 + 10 (shipped) | 0.9877 / 1.0000 | 0.9925 / 1.0000 | 0.655 / 0.467 | 0.605 / 0.660 / 0.335 |
+| 10 + 20 | 0.9812 / 1.0000 | 0.9965 / 1.0000 | 0.650 / 0.453 | - |
+| 0 + 30 | 0.9955 / 1.0000 | 0.9987 / 1.0000 | (variant B: 0.614 / 0.397) | - |
+
+20 + 10 with training seeds 1, 2, 3 instead of 42: interactive 0.9960 /
+0.9812 / 0.9960 (top-1 1.000 each), repetitive 0.9982 / 0.9980 / 0.9935
+(top-1 0.9975 / 1.000 / 0.9950): every one passes, the closest at the bar.
+
+**Fragments: what the model got wrong.** Diagnostic (one seed, 800
+lookups, interactive 50k, the parent's features with Skim's score zeroed):
+of the fragment lookups fzf got right and the model did not, at length 1
+the model's first row started with the query letter in 83% (the target in
+4%) and had run 121 times in 30 days against 8; at length 2, 28% started
+with the query, and the model's choice had run 48 times in 30 days against
+the target's 10 while the target was the newest match (its
+`recency_rank` 0.35 against 5.2). Two causes, then:
+
+1. A one-letter query does not say whether it is a prefix or a word inside
+   the command. Under the training mix (75% prefixes) a command that starts
+   with the letter is the better bet, and on prefix lookups that bet is
+   worth +0.14 top-1 at length 1 over fzf. Even with every one-letter
+   training query a fragment, the model stays below fzf there (0.204 vs
+   0.261) and prefix length 1 falls 0.07 (variant "every 1-character query
+   a fragment"). Not fixable by the mix without giving prefix back.
+2. The monotone constraints on the recency and frequency features: removing
+   them moved fragment length 2 from 0.270 to 0.296 and length 3 from 0.294
+   to 0.313, with prefix up too (variant E).
+
+Skim's score was not a cause (variant A: fragments equal). Neither was the
+stage-1 cut (recall 0.93-0.98 on fragment cells now, misses there count for
+fzf too).
+
+**Infix queries, a rule the trainer never uses**: the model is far above
+fzf at every length on every corpus (interactive 50k: 0.249 / 0.363 / 0.460
+/ 0.565 against 0.136 / 0.140 / 0.215 / 0.351), so the fragment shortfall
+is not over-fitting to the training rule.
+
+**Determinism.** With feature 1 constant no feature depends on a
+matcher's history: two builds (2156d9b and its parent with the slower
+pool) wrote a byte-identical `cmd_model.txt` for the interactive 2k corpus,
+and IT-L-02 still checks a second training on the same data is identical.
+
+**Length 0 against the Bayes ceiling** (interactive 50k: top-1 0.207, MRR
+0.344): the model is at 0.146 / 0.285 (top-10 0.589; before 0.151 / 0.288 / 0.592). Stage-1 recall at
+length 0 rose from 0.867 to 0.936 with the directory rows and top-1 did not
+move, so the cut was not what held it. Not measured, inferred: the
+generator's chain branch (command i tends to be followed by command j) is
+seen by the model only through templates (`follows_prev_share` counts
+followers of the previous command's template), which merges every
+`git commit ...` into one; a command-level follower feature is the obvious
+untried lever. The repeat slice (the target is the session's previous
+command, 6.5% of lookups) is 0.166 top-1 for the model against 1.0 for
+newest-first, as before.
+
+### Variants (interactive 50k, holdout, 5 seeds, model top-1)
+
+Each row is one relevance run of a build with that change (experiment
+switches, not committed); "new bench" rows have the infix columns. Seed
+spread is 0.005-0.03 per cell (the `±` of the tables below), so moves under
+~0.01 are noise.
+
+| variant | p0 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f1 | f2 | f3 | f5 | i2 | i5 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| fzf (the cold start) | 0.065 | 0.395 | 0.599 | 0.621 | 0.435 | 0.345 | 0.261 | 0.324 | 0.329 | 0.417 | 0.136 | 0.351 |
+| before (the parent's code) | 0.151 | 0.532 | 0.635 | 0.649 | 0.530 | 0.445 | 0.096 | 0.263 | 0.273 | 0.378 | - | - |
+| A: Skim's score zeroed | 0.151 | 0.532 | 0.642 | 0.653 | 0.538 | 0.453 | 0.081 | 0.262 | 0.273 | 0.385 | - | - |
+| A': feature 1 = query length | 0.147 | 0.538 | 0.640 | 0.648 | 0.534 | 0.449 | 0.088 | 0.256 | 0.271 | 0.374 | - | - |
+| B: A + 100 directory rows, old sampler | 0.143 | 0.515 | 0.614 | 0.632 | 0.501 | 0.397 | 0.128 | 0.252 | 0.258 | 0.353 | - | - |
+| C: B + 10 of 30 negatives from the stage-2 rows | 0.143 | 0.543 | 0.646 | 0.661 | 0.540 | 0.453 | 0.110 | 0.268 | 0.288 | 0.396 | 0.239 | 0.551 |
+| D: B + all 30 negatives from the stage-2 rows | 0.147 | 0.538 | 0.641 | 0.658 | 0.537 | 0.451 | 0.108 | 0.270 | 0.294 | 0.408 | 0.253 | 0.569 |
+| D, 300-tree cap | 0.151 | 0.541 | 0.646 | 0.661 | 0.536 | 0.455 | 0.114 | 0.278 | 0.301 | 0.419 | 0.238 | 0.554 |
+| D + 50% fragments | 0.151 | 0.525 | 0.637 | 0.646 | 0.535 | 0.453 | 0.170 | 0.302 | 0.315 | 0.419 | 0.247 | 0.558 |
+| D, no monotone constraint at all | 0.134 | 0.563 | 0.663 | 0.673 | 0.559 | 0.489 | 0.122 | 0.294 | 0.305 | 0.422 | 0.256 | 0.535 |
+| D, none on fzf_score | 0.146 | 0.552 | 0.653 | 0.665 | 0.549 | 0.469 | 0.113 | 0.288 | 0.303 | 0.415 | 0.260 | 0.557 |
+| E: D, none on features 6-11 | 0.147 | 0.559 | 0.664 | 0.671 | 0.553 | 0.485 | 0.114 | 0.296 | 0.313 | 0.427 | 0.243 | 0.531 |
+| F: E with 20 + 10 negatives (shipped) | 0.146 | 0.557 | 0.655 | 0.664 | 0.548 | 0.467 | 0.113 | 0.291 | 0.310 | 0.417 | 0.249 | 0.565 |
+| E, recency_rank zeroed | 0.137 | 0.549 | 0.655 | 0.672 | 0.550 | 0.467 | 0.092 | 0.285 | 0.305 | 0.427 | 0.266 | 0.539 |
+| E + feature 1 = best fzf score minus this one (monotone +, unusable) | 0.145 | 0.558 | 0.660 | 0.670 | 0.553 | 0.475 | 0.114 | 0.293 | 0.311 | 0.419 | 0.252 | 0.539 |
+| E + feature 1 = rank in fzf's order, cap 15 | 0.129 | 0.515 | 0.642 | 0.658 | 0.525 | 0.445 | 0.169 | 0.299 | 0.315 | 0.433 | 0.146 | 0.552 |
+| E + feature 1 = query length | 0.136 | 0.557 | 0.656 | 0.667 | 0.552 | 0.475 | 0.118 | 0.293 | 0.305 | 0.425 | 0.235 | 0.548 |
+| E + 35% fragments | 0.147 | 0.548 | 0.651 | 0.662 | 0.546 | 0.470 | 0.141 | 0.302 | 0.318 | 0.422 | 0.246 | 0.539 |
+| E + 40% fragments | 0.150 | 0.547 | 0.656 | 0.663 | 0.548 | 0.476 | 0.159 | 0.303 | 0.316 | 0.431 | 0.237 | 0.531 |
+| D, no constraint at all, 50% fragments | 0.137 | 0.540 | 0.653 | 0.663 | 0.553 | 0.487 | 0.171 | 0.312 | 0.317 | 0.428 | 0.239 | 0.525 |
+| E + every 1-character query a fragment | 0.145 | 0.489 | 0.646 | 0.660 | 0.545 | 0.472 | 0.204 | 0.310 | 0.319 | 0.431 | 0.241 | 0.534 |
+
+B: the directory rows here were chosen by an experiment helper with the
+same rule but a different tie-break (position instead of `db_id`). The
+`gap` and first `fzf rank` runs had feature 1 under the old `+` monotone
+constraint, which a lower-is-better feature cannot use (the gap run was
+identical to E but for column sampling); the fzf-rank row is without it.
+
+### Relevance after (holdout, 5 seeds; model mean ±sd)
+
+#### interactive 50,000 / 500,000 (tuned on; `--folds`)
+
+| ranker | p0 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f1 | f2 | f3 | f5 | i2 | i3 | i4 | i5 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| recency | 0.065 | 0.220 | 0.415 | 0.507 | 0.236 | 0.157 | 0.182 | 0.251 | 0.299 | 0.361 | 0.317 | 0.365 | 0.424 | 0.470 |
+| fzf | 0.065 | 0.395 | 0.599 | 0.621 | 0.435 | 0.345 | 0.261 | 0.324 | 0.329 | 0.417 | 0.136 | 0.140 | 0.215 | 0.351 |
+| model before | 0.151 | 0.532 | 0.635 | 0.649 | 0.530 | 0.445 | 0.096 | 0.263 | 0.273 | 0.378 | - | - | - | - |
+| model after | 0.146 ±0.012 | 0.557 ±0.007 | 0.655 ±0.006 | 0.664 ±0.005 | 0.548 ±0.004 | 0.467 ±0.007 | 0.113 ±0.024 | 0.291 ±0.014 | 0.310 ±0.013 | 0.417 ±0.012 | 0.249 ±0.022 | 0.363 ±0.011 | 0.460 ±0.018 | 0.565 ±0.007 |
+| stage1_recall after | 0.936 | 0.973 | 0.999 | 0.999 | 0.998 | 0.999 | 0.930 | 0.958 | 0.965 | 0.983 | 0.919 | 0.984 | 0.992 | 0.998 |
+
+Before: R1 +0.294 PASS | R2 +0.086 PASS | R3 +0.000 PASS. After: R1 +0.313 PASS (gt10min/len2) | R2 +0.072 PASS (gt10min/len0) | R3 +0.000 PASS (all/len0/top1) | R4 -0.148 FAIL (all/fragment1).
+
+#### repetitive 50,000 / 500,000 (tuned on; `--folds`)
+
+| ranker | p0 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f1 | f2 | f3 | f5 | i2 | i3 | i4 | i5 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| recency | 0.512 | 0.546 | 0.572 | 0.595 | 0.173 | 0.158 | 0.526 | 0.539 | 0.551 | 0.559 | 0.563 | 0.577 | 0.598 | 0.637 |
+| fzf | 0.512 | 0.573 | 0.607 | 0.611 | 0.224 | 0.209 | 0.541 | 0.554 | 0.555 | 0.570 | 0.210 | 0.215 | 0.293 | 0.409 |
+| model before | 0.509 | 0.607 | 0.654 | 0.663 | 0.342 | 0.293 | 0.523 | 0.572 | 0.574 | 0.606 | - | - | - | - |
+| model after | 0.512 ±0.000 | 0.605 ±0.010 | 0.660 ±0.011 | 0.674 ±0.009 | 0.335 ±0.019 | 0.304 ±0.018 | 0.533 ±0.003 | 0.560 ±0.005 | 0.568 ±0.004 | 0.594 ±0.008 | 0.546 ±0.014 | 0.596 ±0.007 | 0.637 ±0.010 | 0.685 ±0.012 |
+| stage1_recall after | 0.822 | 0.915 | 0.989 | 0.999 | 0.978 | 0.972 | 0.860 | 0.912 | 0.922 | 0.972 | 0.886 | 0.962 | 0.983 | 0.989 |
+
+Before: R1 +0.169 PASS | R2 -0.003 PASS | R3 +0.000 PASS. After: R1 +0.163 PASS (gt10min/len2) | R2 -0.001 PASS (gt10min/len0) | R3 +0.000 PASS (all/len0/top1) | R4 -0.008 PASS (all/fragment1).
+
+#### interactive 50,000, generator seed 7 (held out)
+
+| ranker | p0 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f1 | f2 | f3 | f5 | i2 | i3 | i4 | i5 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| recency | 0.062 | 0.217 | 0.408 | 0.489 | 0.243 | 0.131 | 0.165 | 0.255 | 0.304 | 0.359 | 0.288 | 0.345 | 0.413 | 0.473 |
+| fzf | 0.062 | 0.389 | 0.581 | 0.608 | 0.431 | 0.307 | 0.250 | 0.329 | 0.334 | 0.397 | 0.117 | 0.139 | 0.250 | 0.368 |
+| model after | 0.155 ±0.011 | 0.558 ±0.007 | 0.662 ±0.004 | 0.673 ±0.005 | 0.566 ±0.007 | 0.479 ±0.009 | 0.131 ±0.026 | 0.309 ±0.019 | 0.323 ±0.016 | 0.392 ±0.025 | 0.236 ±0.020 | 0.351 ±0.021 | 0.442 ±0.028 | 0.545 ±0.020 |
+| stage1_recall after | 0.940 | 0.968 | 0.997 | 1.000 | 0.995 | 0.992 | 0.929 | 0.958 | 0.969 | 0.994 | 0.925 | 0.981 | 0.993 | 0.995 |
+
+R1 +0.323 PASS (gt10min/len2) | R2 +0.076 PASS (gt10min/len0) | R3 +0.000 PASS (all/len0/top1) | R4 -0.119 FAIL (all/fragment1).
+
+#### repetitive 50,000, generator seed 7 (held out)
+
+| ranker | p0 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f1 | f2 | f3 | f5 | i2 | i3 | i4 | i5 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| recency | 0.511 | 0.544 | 0.569 | 0.583 | 0.180 | 0.149 | 0.527 | 0.542 | 0.550 | 0.566 | 0.549 | 0.567 | 0.583 | 0.626 |
+| fzf | 0.511 | 0.568 | 0.589 | 0.596 | 0.211 | 0.180 | 0.537 | 0.551 | 0.552 | 0.577 | 0.199 | 0.225 | 0.296 | 0.395 |
+| model after | 0.510 ±0.001 | 0.598 ±0.008 | 0.644 ±0.010 | 0.662 ±0.010 | 0.325 ±0.017 | 0.279 ±0.019 | 0.526 ±0.003 | 0.559 ±0.006 | 0.568 ±0.006 | 0.616 ±0.011 | 0.537 ±0.009 | 0.597 ±0.008 | 0.624 ±0.012 | 0.676 ±0.015 |
+| stage1_recall after | 0.824 | 0.904 | 0.989 | 0.999 | 0.979 | 0.973 | 0.855 | 0.900 | 0.915 | 0.972 | 0.891 | 0.959 | 0.979 | 0.990 |
+
+R1 +0.144 PASS (gt10min/len2) | R2 -0.001 PASS (all/len0) | R3 +0.000 PASS (all/len0/top1) | R4 -0.011 FAIL (all/fragment1).
+
+#### interactive 2,000 / 20,000
+
+| ranker | p0 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f1 | f2 | f3 | f5 | i2 | i3 | i4 | i5 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| recency | 0.067 | 0.223 | 0.459 | 0.550 | 0.287 | 0.170 | 0.188 | 0.268 | 0.312 | 0.392 | 0.324 | 0.392 | 0.468 | 0.545 |
+| fzf | 0.067 | 0.424 | 0.644 | 0.675 | 0.496 | 0.355 | 0.268 | 0.349 | 0.353 | 0.450 | 0.119 | 0.209 | 0.397 | 0.560 |
+| model after | 0.159 ±0.005 | 0.601 ±0.008 | 0.728 ±0.011 | 0.749 ±0.008 | 0.640 ±0.012 | 0.502 ±0.018 | 0.161 ±0.019 | 0.333 ±0.027 | 0.360 ±0.019 | 0.475 ±0.011 | 0.297 ±0.015 | 0.420 ±0.012 | 0.523 ±0.013 | 0.613 ±0.009 |
+| stage1_recall after | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+
+R1 +0.353 PASS (gt10min/len2) | R2 +0.088 PASS (gt10min/len0) | R3 +0.000 PASS (all/len0/top1) | R4 -0.107 FAIL (all/fragment1).
+
+#### agent 5,000
+
+| ranker | p0 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f1 | f2 | f3 | f5 | i2 | i3 | i4 | i5 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| recency | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.002 | 0.004 | 0.003 | 0.015 | 0.009 | 0.013 | 0.029 | 0.051 |
+| fzf | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.008 | 0.029 | 0.020 | 0.046 | 0.016 | 0.027 | 0.053 | 0.089 |
+| model after | 0.084 ±0.002 | 0.084 ±0.005 | 0.083 ±0.002 | 0.085 ±0.003 | 0.051 ±0.004 | 0.003 ±0.001 | 0.086 ±0.004 | 0.094 ±0.007 | 0.094 ±0.007 | 0.099 ±0.008 | 0.086 ±0.003 | 0.098 ±0.006 | 0.109 ±0.008 | 0.123 ±0.002 |
+| stage1_recall after | 0.885 | 0.885 | 0.885 | 0.885 | 0.870 | 0.719 | 0.899 | 0.918 | 0.916 | 0.924 | 0.904 | 0.917 | 0.933 | 0.938 |
+
+R1 +0.051 FAIL (gt10min/len2) | R2 +0.051 PASS (gt10min/len2) | R3 +0.000 PASS (all/len0/top1) | R4 +0.016 PASS (gt10min/infix5).
+
+Per fold (model top-1 at prefix length 2, `all` / `gt10min`, mean ±sd):
+interactive fold60 0.640 / 0.525, fold70 0.669 / 0.571, fold80 0.644 /
+0.535 (fzf 0.568-0.602 / 0.412-0.452); repetitive fold60 0.663 / 0.346,
+fold70 0.653 / 0.325, fold80 0.644 / 0.296 (fzf 0.583-0.602 / 0.167-0.215).
+The previous entries have no folds for these corpora.
+
+Held-out seed 7 against the previous entry's held-out tables (model,
+top-1): interactive prefix 2 0.634 -> 0.662, gt10min 0.541 -> 0.566,
+other_dir 0.438 -> 0.479, fragment 1 / 2 / 3 / 5 0.125 / 0.285 / 0.281 /
+0.356 -> 0.131 / 0.309 / 0.323 / 0.392; repetitive prefix 1 / 2 0.595 /
+0.644 -> 0.598 / 0.644, gt10min 0.333 -> 0.325, other_dir 0.280 -> 0.279,
+fragment 1 0.522 -> 0.526. On the repetitive corpora the shipped mix of
+negatives gives back what the other changes gained (variant E had prefix
+2 0.678 there): it is about equal to before. Infix on the repetitive
+corpora: the model is above fzf everywhere but below newest-first at
+length 2 (0.546 vs 0.563), where an inner fragment of 2 characters matches
+almost everything and the newest command is the answer half the time.
+
+### How to re-run
+
+Relevance: `psychic --data-dir <copy> internal bench-history relevance
+--seeds 5 [--folds] --json r.json --md r.md` (now 10-35 min at 50k with
+three side by side: training is 3-4x slower, the infix style adds a third
+of the lookups). Performance: `notes/final2/run.sh` in the scratch area
+(`bench/history.py` with `PSYCHIC_BENCH_BINARY`, each step at load < 2).
+
 ## 2026-11-17 - 6ad4868..6c7f51f - merge with the speed work, then a fast picker (kept)
 
 Before = a saved build of 4cc43bf (the previous entry's code), after = a
