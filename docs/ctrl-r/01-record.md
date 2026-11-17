@@ -1519,8 +1519,10 @@ Conventions: inline `#[cfg(test)] mod tests` per file, sentence-style names,
 expected values written out ([llm.md:216-235](../../llm.md)); `CmdStore::in_memory()`
 or `std::env::temp_dir().join(format!("psychic-<tag>-{}", std::process::id()))`.
 No test writes `~/.local/share/psychic` or reads the real `$HOME` history
-(the only reads of the real data dir are the two guards TC-N-09 and IT-N-05 of
-[04 section 11](04-bench.md#11-test-case-specifications), which `stat` it).
+(the only read of the real data dir is the guard TC-N-09 of
+[04 section 11](04-bench.md#11-test-case-specifications), which compares its
+path and never its contents; no test's outcome depends on what is in it, since
+psychic may be installed and recording on the machine that runs the tests).
 Every test uses its own `<tag>` and never removes and recreates a data dir
 within one test: `Database`'s schema registry is keyed by path
 ([src/db.rs:154-155](../../src/db.rs)) and would not re-create the tables.
