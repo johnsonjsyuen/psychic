@@ -2884,9 +2884,13 @@ through a purge and a re-import),
 no deleted text stays in the database's files even while another psychic
 process has the database open; if one is in the middle of a read, the checkpoint cannot
 finish and purge fails telling the user to close it and purge again. It also
-removes the command model; the marker is left alone. Deleting one command leaves a
-tombstone so a later import does not restore it. Shell history files are
-never edited.
+removes the command model; the marker is left alone. Every connection to the
+command tables runs with `secure_delete` on, so whatever a write frees is
+zeroed. Deleting one command in the picker leaves a tombstone so a later import
+does not restore it, then checkpoints and truncates the write-ahead log without
+waiting, so its text is in neither `events.db` nor `events.db-wal`; if another
+process is in the log at that moment, the picker tries again at exit, and
+otherwise the next checkpoint clears it. Shell history files are never edited.
 
 **Import** (`--import`, and the first `--enable` unless `--no-import`):
 Atuin's `history.db` first (opened read-only; true cwd, exit codes and

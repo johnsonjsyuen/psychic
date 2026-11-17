@@ -6,7 +6,7 @@
 //! `command_events` on the UI thread's own connection. A failure is logged
 //! and otherwise ignored: it never stops the pick (E-B-06).
 
-use super::store::{CmdStore, EventAction, NewEvent};
+use super::store::{CmdStore, EventAction, LogBound, NewEvent};
 use super::tuning::CMD_IMPRESSION_AGE_MS;
 use anyhow::Result;
 use rustc_hash::FxHashSet;
@@ -89,6 +89,24 @@ impl CmdEvents {
         !current.logged
             && (force
                 || current.created_at.elapsed() >= Duration::from_millis(CMD_IMPRESSION_AGE_MS))
+    }
+
+    /// D6 once more, on this (the UI thread's) connection, at the exit of a
+    /// picker that deleted something: empty the write-ahead log without
+    /// waiting, in case the delete's own checkpoint found it busy
+    /// (01 section 10.5). A log still busy is only logged.
+    pub fn truncate_log(&self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        match store.truncate_log_now() {
+            Ok(LogBound::Truncated | LogBound::Within) => {}
+            Ok(LogBound::Busy) => log::warn!(
+                "another connection is using events.db-wal, so a deleted command's text \
+                 can stay in it until the next checkpoint"
+            ),
+            Err(error) => log::warn!("{}", error),
+        }
     }
 
     /// Log `shown` as impressions of the current query, in one transaction.

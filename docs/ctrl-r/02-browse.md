@@ -123,7 +123,12 @@ loads while the terminal is being set up):
    the worker only if it has already finished. The worker may be busy (a load,
    a `Delete` waiting on another process's lock for up to `busy_timeout`); the
    terminal and the shell must not wait for it, and the process exits next.
-   (The error paths of steps 4-5 still stop and join it.)
+   (The error paths of steps 4-5 still stop and join it.) If a `Delete` was
+   sent this session (`deleted_any`), `events.truncate_log()` then runs D6 once
+   more on the UI thread's connection, without waiting: the write-ahead log is
+   emptied of the deleted text if the worker's own D6 found it busy
+   ([01 section 10.5](01-record.md#105-delete-and-purge)); still busy is a
+   `log::warn!`.
 
 ## 5. `CommandIndex`
 
@@ -427,7 +432,7 @@ space is warmed on every rayon thread at start, section 6.2.)
 | `UpdateQuery` | Set `current_query`, `current_scope`, `current_query_id`; `filter`, then `rank::rank_commands` (section 7) with `head = CMD_PAGE_ROWS`; keep the `CommandRanking` as `current` | `QueryUpdated` (echoing `query`) with rows `0..CMD_PAGE_ROWS`; then the TIMING line (6.5) |
 | `GetRows` | Ignore unless `query_id == current_query_id`. If the page reaches past `current.sorted`, `current.sort_rest(index)` first (once per query, off the keystroke path; see the empty-query cache in 6.3) | `Rows` with rows `start..start + CMD_PAGE_ROWS` (clamped) |
 | `Details` | R9 and R10 | `Details` |
-| `Delete` | `store.delete_command(id, text, now)`; `index.remove(idx)`; clear the trail; re-run `current_query`/`current_scope` under the given `query_id`. On a database error: `DeleteFailed` first, the index untouched (E-B-07) | `QueryUpdated` |
+| `Delete` | `store.delete_command(id, text, now)` (D1-D6 of 01 section 6.4; a busy D6 is not a failure); `index.remove(idx)`; clear the trail; re-run `current_query`/`current_scope` under the given `query_id`. On a database error: `DeleteFailed` first, the index untouched (E-B-07) | `QueryUpdated` |
 | `Shutdown` | Return from the thread | - |
 
 Building a `CmdRow` from a `CommandScore` clones the `Arc<str>` (no text copy),
@@ -621,6 +626,7 @@ pub(super) struct CmdApp {
     pub next_query_id: u64,              // starts at 2 (1 is the initial query)
     pub rows_requested_to: usize,        // highest `start` already asked for with GetRows
     pub confirm_delete: Option<i64>,     // command_id awaiting the one-key confirm
+    pub deleted_any: bool,               // a Delete was sent: D6 again at exit (section 4 step 8)
     pub help_visible: bool, pub debug_visible: bool,
     pub details: FxHashMap<i64, CmdDetails>, pub details_requested: FxHashSet<i64>,
     pub list_clock: i64,                 // "now" for time-ago; steps once a minute on Tick
@@ -799,6 +805,7 @@ impl CmdEvents {
     pub fn wants_impressions(&mut self, force: bool) -> bool;
     pub fn log_impressions(&mut self, shown: &[Shown]) -> anyhow::Result<()>;   // Shown { command_id: i64, rank: usize }
     pub fn log_pick(&mut self, picked: Shown) -> anyhow::Result<()>;
+    pub fn truncate_log(&self);   // D6 at exit after a delete (section 4 step 8); busy or failure is logged only
 }
 // `store` is `Option<CmdStore>`: `None` when the UI thread could not open it (E-B-19); every method is then a no-op.
 ```
@@ -1105,7 +1112,7 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 | TC-B-09 | supersession | Queue `UpdateQuery(1)`, `UpdateQuery(2)`, `Details`, `UpdateQuery(3)`, `UpdateQuery(4)` drained in that order | Processed: `UpdateQuery(2)`, `Details`, `UpdateQuery(4)` | A single request passes through unchanged; `Details(1)`, `Details(2)`, `GetRows`, `Details(3)` -> `GetRows`, `Details(3)` |
 | TC-B-10 | stale responses | `shown_query_id = 5`; deliver `QueryUpdated(4)`, then `(6)`; `Rows(5, ..)` | 4 ignored, 6 applied (selection reset to 0), `Rows(5)` ignored | `Rows` with `start != rows.len()` ignored |
 | TC-B-11 | `CMD_KEYMAP` | Iterate `CmdAction` | Every action has exactly one row; no trigger appears in two rows; every description is non-empty | `lookup(Char('x'), CONTROL)` -> `DeleteSelected`; `lookup(Char('x'), NONE)` -> `AppendToQuery`; `lookup(Char('q'), CONTROL)` -> `None` |
-| TC-B-12 | modal keys | `confirm_delete = Some(7)`; press `n`, then set again and press `y` | First: no request, cleared. Second: one `Delete { command_id: 7, .. }` | `help_visible` + Esc -> help closed, picker still running; with a confirmation up, the wheel moves nothing and an accepted `QueryUpdated` clears it |
+| TC-B-12 | modal keys | `confirm_delete = Some(7)`; press `n`, then set again and press `y` | First: no request, cleared, `deleted_any` false. Second: one `Delete { command_id: 7, .. }`, `deleted_any` true | `help_visible` + Esc -> help closed, picker still running; with a confirmation up, the wheel moves nothing and an accepted `QueryUpdated` clears it |
 | TC-B-13 | row text | `"echo a\nb\tc\x1b[31m"`, width 40 | `echo a↵ b    c·[31m` | Width 6 -> `echo …`; a CJK command truncates on a character boundary |
 | TC-B-14 | impressions | New subsession; `wants_impressions(false)` at once, then after `created_at` is aged 200 ms, then again after logging | `false`, `true`, `false` | `force = true` at once -> `true`; `episode_queries` gains the query on the first call even when it returns `false` |
 | TC-B-15 | `CommandIndex` windows | `run_times = [now-4000, now-3000, now-10]` | `runs_in_window(.., 3600) = 2`, `(.., 60) = 1`, `(.., 5) = 0` | A run exactly at `now - secs` is excluded; at `now` included |
@@ -1151,7 +1158,7 @@ and `tests/picker.rs` ([01 section 15.3](01-record.md#153-shell-level-tests-test
 | E-B-04 | Worker thread panics | `event_rx`/`worker_tx` send fails, or `JoinHandle::join` is `Err` | UI sets status `History worker stopped`; list frozen; keys still work | Enter prints the selected row from `rows` | `log::error!` |
 | E-B-05 | Fuzzy match yields nothing | `total_matched == 0` | List shows `No match.` | Enter exits with nothing | None |
 | E-B-06 | Event logging fails (database busy/locked) | `Err` from `log_impressions`/`log_pick` | Ignored for the user: the pick is still printed | That episode is not logged | `log::error!("command event logging failed: <code>")` |
-| E-B-07 | `Delete` fails in the database | `Err` from `delete_command` | Worker does not call `index.remove`; sends `CmdResponse::DeleteFailed`, then answers with the unchanged list | UI status `Could not delete` | `log::error!` |
+| E-B-07 | `Delete` fails in the database | `Err` from `delete_command` (D1-D5; a busy D6 is E-R-25 of 01, not this) | Worker does not call `index.remove`; sends `CmdResponse::DeleteFailed`, then answers with the unchanged list | UI status `Could not delete` | `log::error!` |
 | E-B-08 | `Details` query fails | `Err` | `Details` with empty vectors | Preview shows no directory lines | `log::warn!` |
 | E-B-09 | Stale `QueryUpdated`/`Rows` | id tests of section 8.2 | Dropped | - | None |
 | E-B-10 | `--session` given but that session has no rows | R5 returns nothing | `prev_templates` all `None`; R6 skipped; `Session` scope shows `No match.` | Sequence terms are 0 | None |

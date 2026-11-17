@@ -91,6 +91,9 @@ pub(super) struct CmdApp {
     pub rows_requested_to: usize,
     /// Command awaiting the one-key confirmation of a delete.
     pub confirm_delete: Option<i64>,
+    /// A `Delete` was sent this session: at exit the write-ahead log is
+    /// emptied once more, in case the worker's own try found it busy.
+    pub deleted_any: bool,
     pub help_visible: bool,
     pub debug_visible: bool,
     pub details: FxHashMap<i64, CmdDetails>,
@@ -158,6 +161,7 @@ impl CmdApp {
             next_query_id: 2,
             rows_requested_to: 0,
             confirm_delete: None,
+            deleted_any: false,
             help_visible: false,
             debug_visible: false,
             details: FxHashMap::default(),
@@ -369,6 +373,7 @@ impl CmdApp {
                     command_id,
                     query_id,
                 });
+                self.deleted_any = true;
             }
             return Flow::Continue;
         }
@@ -637,6 +642,9 @@ pub(super) fn run(data_dir: &Path, args: &cli::HistoryArgs) -> Result<()> {
     if worker_handle.is_finished() && worker_handle.join().is_err() {
         log::error!("the history worker panicked");
     }
+    if app.deleted_any {
+        app.events.truncate_log();
+    }
     drop(app);
     printed
 }
@@ -884,11 +892,13 @@ mod tests {
         assert_eq!(app.confirm_delete, None);
         assert!(requests(&rx).is_empty());
         assert_eq!(app.query, "", "the key was consumed");
+        assert!(!app.deleted_any);
 
         app.confirm_delete = Some(7);
         app.on_key(plain('y'));
         assert_eq!(requests(&rx), ["Delete(7, 2)"]);
         assert_eq!(app.next_query_id, 3);
+        assert!(app.deleted_any, "the log is emptied again at exit");
 
         // A new answer moves the selection, so it cancels the question; so
         // does nothing a wheel does, which cannot move it meanwhile.
