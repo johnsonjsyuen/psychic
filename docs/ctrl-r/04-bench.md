@@ -530,9 +530,18 @@ the newest run; store both in `WORK/cmd-perf/bench-context.json`.
 
 ### 6.2 `startup [N=30]` - B3
 
-Per trial: note the size of `app.log`; `spawn(version, ("history", "--cwd", cwd,
+Per trial: one `track-command` as in 6.4 (`track_once`: session `bench`,
+one of 50 texts); note the size of `app.log`; `spawn(version, ("history", "--cwd", cwd,
 "--session", session), cwd="/tmp")`; `drain_for(fd, 1.5)`; `stop`; parse the
 appended `TIMING` lines. One extra warm-up trial first, discarded.
+
+The `track-command` is what a shell's hook runs before every prompt, so
+before every Ctrl-R, and it keeps the write-ahead log within
+`CMD_WAL_TRUNCATE_BYTES` ([01 section 9.1](01-record.md#91-the-write-ahead-log-of-track-command)).
+Without it (until 2026-11-17) the pickers' own impression rows grew the log
+without bound, 45 MB on the perf DB, and every start paid for rebuilding
+the log's index in its first connection (13-20 ms, measured): a cost no
+user sees, inside B3.
 
 | Reported (p50, p95) | From |
 |---|---|

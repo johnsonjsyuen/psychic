@@ -306,7 +306,14 @@ def startup(b, n):
     # cmd_index_stages: when each part of the index load ended, from its start.
     stages = {"read_ms": [], "context_ms": [], "pushed_ms": [], "applied_ms": []}
     dropped = 0
+    ctx = b.context()
     for trial in range(n + 1):
+        # A command is recorded before each Ctrl-R, as the shell's hook does
+        # before every prompt: it keeps the write-ahead log within
+        # CMD_WAL_TRUNCATE_BYTES, as in use. Without it the pickers' own
+        # impressions grow the log without bound, and every start rebuilds
+        # its index (13-20 ms at 45 MB).
+        track_once(b, ctx, trial)
         offset = b.log_size()
         pid, fd = b.spawn_picker()
         try:
@@ -446,15 +453,20 @@ def keystroke(b, n, pause=0.0):
     }
 
 
+def track_once(b, ctx, i):
+    """One `track-command` run, as a shell's hook records a command (one of 50 texts)."""
+    cmd = [str(BINARY), "--data-dir", str(b.data), "track-command", "--cwd", ctx["cwd"], "--exit-code", "0",
+           "--duration-ms", "5", "--session", "bench", "--", f"bench command {i % 50}"]
+    subprocess.run(cmd, env=b.env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd="/tmp")
+
+
 def track(b, n):
     """6.4 (B4): wall time of track-command against the perf DB."""
     ctx = b.context()
     times = []
     for i in range(n + 10):
-        cmd = [str(BINARY), "--data-dir", str(b.data), "track-command", "--cwd", ctx["cwd"], "--exit-code", "0",
-               "--duration-ms", "5", "--session", "bench", "--", f"bench command {i % 50}"]
         start = time.perf_counter()
-        subprocess.run(cmd, env=b.env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd="/tmp")
+        track_once(b, ctx, i)
         if i >= 10:
             times.append((time.perf_counter() - start) * 1000.0)
     print(f"track-command: {n} runs after 10 warm-up, load {load_average()}")
@@ -511,8 +523,10 @@ def twostage(b):
 def latency(b, n, pause=0.0):
     """6.6: filter + rank without a terminal (an iteration aid, not a bar)."""
     b.pin_model()
+    # --pause-ms only when asked for, so builds older than it can be measured.
+    pause_args = ("--pause-ms", str(round(pause * 1000))) if pause > 0 else ()
     print(b.psychic("internal", "bench-history", "latency", "--keystrokes", str(n),
-                    "--pause-ms", str(round(pause * 1000))).stdout.strip())
+                    *pause_args).stdout.strip())
     print(f"load {load_average()}")
 
 
