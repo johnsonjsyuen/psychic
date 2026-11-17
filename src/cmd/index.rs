@@ -190,6 +190,9 @@ pub(super) struct CommandIndex {
     pub templates: Interner,
     /// (idx, dir id).
     dir_stats: FxHashMap<(u32, u32), DirStat>,
+    /// dir id -> every idx with a `dir_stats` entry there, in no order: the
+    /// model stage's second source of rows (03-learn.md section 7.2).
+    dir_commands: FxHashMap<u32, Vec<u32>>,
     /// (idx, repo id) -> runs.
     repo_runs: FxHashMap<(u32, u32), u32>,
     /// (idx, template id of the previous command) -> runs.
@@ -284,9 +287,12 @@ impl CommandIndex {
         }
         insert_sorted(&mut entry.run_times, at);
         if let Some(dir) = dir {
-            let stat = self.dir_stats.entry((idx, dir)).or_insert(DirStat {
-                runs: 0,
-                last_run_at: at,
+            let stat = self.dir_stats.entry((idx, dir)).or_insert_with(|| {
+                self.dir_commands.entry(dir).or_default().push(idx);
+                DirStat {
+                    runs: 0,
+                    last_run_at: at,
+                }
             });
             stat.runs += 1;
             stat.last_run_at = stat.last_run_at.max(at);
@@ -440,7 +446,9 @@ impl CommandIndex {
                         runs: row.runs,
                         last_run_at: row.last_run_at,
                     };
-                    self.dir_stats.insert((idx, dir), stat);
+                    if self.dir_stats.insert((idx, dir), stat).is_none() {
+                        self.dir_commands.entry(dir).or_default().push(idx);
+                    }
                 }
             }
         }
@@ -506,6 +514,13 @@ impl CommandIndex {
     /// Runs of `idx` in `dir`; `None` when `dir` is `None` or it never ran there.
     pub(super) fn dir_stat(&self, idx: u32, dir: Option<u32>) -> Option<&DirStat> {
         self.dir_stats.get(&(idx, dir?))
+    }
+
+    /// Every command that ran in `dir` (deleted ones included), in no
+    /// particular order; empty when `dir` is `None` or nothing ran there.
+    pub(super) fn commands_in_dir(&self, dir: Option<u32>) -> &[u32] {
+        dir.and_then(|dir| self.dir_commands.get(&dir))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Runs of `idx` in `repo`; 0 when `repo` is `None` or it never ran there.

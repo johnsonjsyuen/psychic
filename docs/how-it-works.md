@@ -2919,7 +2919,8 @@ text is just an in-order byte scan, so Skim's matcher runs only on non-ASCII
 texts; and the same pass attaches fzf's `--scheme=history` score
 (`src/cmd/fzf.rs`, ASCII texts read as bytes). The cold-start order is that
 score, ties newest first (fzf's own Ctrl-R order); the model re-scores the
-first 2,000 of it. Only the first page is sorted (`select_nth` over 32-byte
+first 2,000 of it and up to 100 more matches, the ones run most often in this
+directory. Only the first page is sorted (`select_nth` over 32-byte
 keys, then a sort of 200); the rest is sorted if a page reaches it. Matching
 happens in scope All and a scope keeps its own commands afterwards, so
 typing a longer query re-matches only the matches of its longest prefix
@@ -2932,7 +2933,7 @@ One `cmd_query` TIMING line per query, after the answer, numbers only. The UI
 thread shows rank, a red `!` for a failed last run, `*` for "run here", the
 command (newlines as `↵`, control characters made safe) and its age; a preview
 with counts, last directories and what usually came before; Ctrl-O a debug
-pane with the heuristic's parts, the 23 features of a model-scored row and the
+pane with the heuristic's parts, the 25 features of a model-scored row and the
 model's trees, groups, weight and top features (`model: none` without one); Ctrl-G help
 generated from `CMD_KEYMAP`. Tab cycles the scope (all, this directory, this
 repo, this session), Delete/Ctrl-X deletes a command after a `y`. A query on
@@ -2956,8 +2957,9 @@ replaying everything recorded in time order into an empty `CommandIndex`
 through its mutators. Before each run is applied, a run of a command that ran
 before becomes a group: a synthetic query (the first 0, 1, 2 or 3 characters
 of its text, 40/20/20/20%, chosen by a seeded splitmix64 hash of the run id),
-the command as the positive, and up to 15 of the most recently run and 15
-random other commands that match the query as negatives, each row's 23
+the command as the positive, and 30 random negatives drawn from the rows
+serving's model would score for that query there (fzf's top 2,000 and the
+directory's 100 most-run matches, `rank::stage2_rows`), each row's 25
 features computed by the same `features::compute_all` serving uses (so
 train/serve skew would have to be in the index, and an integration test
 compares a replayed index with a loaded one feature by feature, bit for bit).
@@ -2965,8 +2967,10 @@ A run within 300 s of a Ctrl-R pick of the same command in the same shell is
 that pick being executed and makes no group; the pick itself is a group of its
 picker's impressions, the picked command positive, weight 4. Imported runs
 weigh 0.3, hook runs 1. Only the newest 8,000 eligible runs make groups; below
-50 groups nothing is trained. The features: the query's fuzzy score and
-whether the command or a word of it starts with it; picks for this query and
+50 groups nothing is trained. The features: fzf's score for the query (Skim's
+score was a feature until 2026-11-18; it depended on the thread's earlier
+calls, so its column is now a constant) and whether the command or a word of
+it starts with it; how many newer commands match; picks for this query and
 in episodes with it; time since the last run and runs in the last hour, day,
 week and 30 days, all runs, picks; the share of its runs made in this
 directory and repository, time since the last run here, runs here; the share
@@ -2978,7 +2982,8 @@ or in the model file differ from the registry's, in order. A training whose
 history was purged or shrunk while it ran writes nothing; the lock it holds
 carries a token and is kept fresh by a heartbeat, so a long fit is not taken
 over. Serving is two-stage: the heuristic orders
-every match, the model scores the first 2,000 of that order (features on the
+every match, the model scores the first 2,000 of that order plus the
+directory's 100 most-run other matches (features on the
 rayon pool; prediction on the rayon pool too, not by LightGBM: `model.rs`
 reads `cmd_model.txt` into a `Forest` and walks its trees as LightGBM's
 `PredictRaw` does, giving the same scores bit for bit - the LightGBM that

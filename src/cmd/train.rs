@@ -28,15 +28,16 @@ use super::features::{
 use super::fuzzy;
 use super::fzf::FzfQuery;
 use super::index::{CommandIndex, RankContext};
-use super::rank::{fzf_score, recency_rank};
+use super::rank::{fzf_score, recency_rank, stage2_rows};
 use super::store::{CmdStore, CommandRecord, EventRecord, RunRecord, Source};
 use super::tuning::{
     CMD_HOOK_WEIGHT, CMD_IMPORT_WEIGHT, CMD_MODEL_MAX_TREES, CMD_PICK_RUN_SECS, CMD_PICK_WEIGHT,
-    CMD_RECENCY_RANK_CAP, CMD_RETRAIN_MIN_INTERVAL_SECS, CMD_STAGE2_K, CMD_TRAIN_FRAGMENT_SHARE,
+    CMD_RECENCY_RANK_CAP, CMD_RETRAIN_MIN_INTERVAL_SECS, CMD_TRAIN_FRAGMENT_SHARE,
     CMD_TRAIN_LOCK_STALE_SECS, CMD_TRAIN_MAX_RUN_GROUPS, CMD_TRAIN_MIN_GROUPS, CMD_TRAIN_QLEN_MIX,
     CMD_TRAIN_RANDOM_NEGATIVES, CMD_TRAIN_RANDOM_TRIES, CMD_TRAIN_RECENT_NEGATIVES,
     CMD_TRAIN_RECENT_SCAN,
 };
+use super::worker::{Scope, filter_candidates};
 use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -442,8 +443,7 @@ pub(super) fn newest_matching(replayer: &Replayer, query: &str) -> Vec<(i64, i64
 
 /// The features of `idx` for `query` in `ctx`; `newest` is
 /// [`newest_matching`] for `query`, `fzf` fzf's score (`NO_FZF_MATCH` when
-/// it does not match). Skim's score is computed here, as serving computes it
-/// for the rows its model scores.
+/// it does not match).
 fn feature_row(
     index: &CommandIndex,
     ctx: &RankContext,
@@ -459,7 +459,6 @@ fn feature_row(
         query_lower: &query_lower,
         idx,
         entry,
-        fuzzy_score: fuzzy::skim_score(fuzzy::skim(), query, &entry.text),
         fzf_score: fzf,
         recency_rank: recency_rank(newest, (entry.last_run_at, entry.db_id)),
         index,
@@ -567,28 +566,24 @@ fn build_run_group(replayer: &Replayer, run: &RunRecord, query: &str, seed: u64)
         }
     }
 
-    // An empty query: serving's model sees only the CMD_STAGE2_K newest
-    // commands (stage 1 is newest first), so draw from those.
-    let pool: Option<Vec<u32>> = query
-        .is_empty()
-        .then(|| replayer.recent_distinct().take(CMD_STAGE2_K).collect());
-    let commands = pool.as_ref().map_or(index.entries.len(), Vec::len) as u64;
+    // The rows serving's model scores for this query (03 section 7.2:
+    // fzf's top CMD_STAGE2_K, then the directory's most-run matches), drawn
+    // uniformly: the model learns to order exactly the rows it will see.
+    let candidates = filter_candidates(index, &ctx, query, Scope::All, None);
+    let pool = stage2_rows(&candidates, index, &ctx);
     let mut state = splitmix64(seed ^ run.id as u64 ^ RANDOM_NEGATIVE_SALT);
     let mut random = 0;
     for _ in 0..CMD_TRAIN_RANDOM_TRIES {
-        if random == CMD_TRAIN_RANDOM_NEGATIVES {
+        if random == CMD_TRAIN_RANDOM_NEGATIVES || pool.is_empty() {
             break;
         }
         state = splitmix64(state);
-        let at = (state % commands) as usize;
-        let candidate = pool.as_ref().map_or(at as u32, |pool| pool[at]);
-        if !usable(candidate) || negatives.iter().any(|&(idx, _)| idx == candidate) {
+        let candidate = pool[(state % pool.len() as u64) as usize];
+        if !usable(candidate.idx) || negatives.iter().any(|&(idx, _)| idx == candidate.idx) {
             continue;
         }
-        if let Some(score) = fuzzy(candidate) {
-            negatives.push((candidate, score));
-            random += 1;
-        }
+        negatives.push((candidate.idx, candidate.fzf));
+        random += 1;
     }
     if negatives.is_empty() {
         return None;

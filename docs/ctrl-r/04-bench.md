@@ -622,7 +622,8 @@ the timeline; lookup `j` uses the context of run `j` (its cwd, repo, session,
 with `now` = the newest `started_at` + 1) and query length `j % 4` taken from
 that run's command text. For each: `full` = ranking with stage 2 over all
 matches (`rank_with` with `head = k = usize::MAX`, [03 section 7.2](03-learn.md#72-rank_commands-with-a-model)),
-`two` = ranking with `k = CMD_STAGE2_K`. Report the mean of
+`two` = ranking with `k = CMD_STAGE2_K` and the directory's
+`CMD_STAGE2_DIR_ROWS` (what the picker scores; [03 section 7.2](03-learn.md#72-rank_commands-with-a-model) step 3). Report the mean of
 `|top10(full) ∩ top10(two)| / min(10, matched)`, the share with equal row 1, the
 share of lookups with `matched > CMD_STAGE2_K`, and PASS/FAIL against B8.
 
@@ -747,8 +748,8 @@ Work top to bottom; within a row try the listed values one at a time.
 | # | Candidate | Constant(s) | Values to try | Target |
 |---|---|---|---|---|
 | 1 | Cold start (done 2026-11-17) | The heuristic is fzf's order ([02 section 7](02-browse.md#7-heuristic-ranking)); the weights of this row are gone. A psychic signal (frequency, runs in 30 days, directory share, directory recency, a shorter recency scale) may be added only as a tie-break inside equal fzf scores, and only if it is not below pure fzf on any cell of `all`/`gt10min`/`other_dir` x lengths x 4 metrics, both query styles, on every corpus. Measured: every one was below somewhere (results.md) | - | R3, and pure fzf on every cell |
-| 2 | Stage-2 size | `CMD_STAGE2_K` | 500, 1000, 2000, 4000 (4000 measured 2026-11-17 for B8: 0.957 on the shipped model, still FAIL; B1 does not need a smaller K) | B1, B8, R1 |
-| 3 | Negative sampler mix (done 2026-11-17: 0/30) | `CMD_TRAIN_RECENT_NEGATIVES` / `CMD_TRAIN_RANDOM_NEGATIVES` | 15/15, 0/30; also "hard" (8 of the 15 recent by best fzf score), rejected | R1, R2, `all` length 0 top-10 |
+| 2 | Stage-2 size and sources | `CMD_STAGE2_K`, `CMD_STAGE2_DIR_ROWS` | K 500, 1000, 2000, 4000 (4000 measured 2026-11-17 for B8: 0.957 on the shipped model, still FAIL; B1 does not need a smaller K). Directory rows 0, 50, 100 (2026-11-18: 100 adopted, B8 0.93 -> 0.999; 50 gave 0.998; the 100 most-run overall instead gave 0.987, both 0.9997) | B1, B8, R1 |
+| 3 | Negative sampler mix (done 2026-11-17: 0/30; pool 2026-11-18) | `CMD_TRAIN_RECENT_NEGATIVES` / `CMD_TRAIN_RANDOM_NEGATIVES` | 15/15, 0/30; also "hard" (8 of the 15 recent by best fzf score), rejected. Pool of the random ones: every match, or the rows serving scores (`stage2_rows`; 10 of 30 or all 30 from it): all 30 adopted with the directory rows | R1, R2, `all` length 0 top-10 |
 | 4 | Query style mix (done 2026-11-17) | `CMD_TRAIN_FRAGMENT_SHARE` | 0, 25, 50 | Prefix lengths 1-3 against the fragment style |
 | 4 | Synthetic-query mix | `CMD_TRAIN_QLEN_MIX` | [40,20,20,20], [25,25,25,25], [10,30,30,30], [70,10,10,10] | R1 at length 2 against R2 at length 0 |
 | 5 | Group weights and blend | `CMD_IMPORT_WEIGHT` | 0.1, 0.3, 1.0 | model minus recency top-1 on the `import` slice (reported; must stay >= -0.01) |

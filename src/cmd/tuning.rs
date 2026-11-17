@@ -73,6 +73,10 @@ pub(super) const CMD_RECENCY_RANK_CAP: usize = 15;
 /// Rows, from the top of the heuristic order, that the model scores.
 pub(super) const CMD_STAGE2_K: usize = 2000;
 
+/// More rows the model scores: of the matches outside those, the ones run
+/// most often in the picker's directory (fewer when fewer ran there).
+pub(super) const CMD_STAGE2_DIR_ROWS: usize = 100;
+
 /// Trees of the command model at most: early stopping picks the count below
 /// it. Prediction walks every tree for each stage-2 row on every keystroke.
 pub(super) const CMD_MODEL_MAX_TREES: usize = 100;
@@ -165,6 +169,7 @@ pub(super) fn snapshot() -> serde_json::Map<String, serde_json::Value> {
         CMD_STACK_BELOW_COLS,
         CMD_RECENCY_RANK_CAP,
         CMD_STAGE2_K,
+        CMD_STAGE2_DIR_ROWS,
         CMD_MODEL_MAX_TREES,
         CMD_BLEND_SCALE,
         CMD_PICK_WEIGHT,

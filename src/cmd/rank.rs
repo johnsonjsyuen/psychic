@@ -12,12 +12,12 @@
 //! below the model-scored ones.
 
 use super::features::{COMMAND_FEATURE_REGISTRY, CommandFeatureInputs, compute_all};
-use super::fuzzy;
 use super::fzf::FzfQuery;
 use super::index::{CommandIndex, RankContext};
 use super::model::CmdModel;
 use super::tuning::{
-    CMD_H_RECENCY_SCALE_SECS, CMD_PAR_FILTER_MIN, CMD_RECENCY_RANK_CAP, CMD_STAGE2_K,
+    CMD_H_RECENCY_SCALE_SECS, CMD_PAR_FILTER_MIN, CMD_RECENCY_RANK_CAP, CMD_STAGE2_DIR_ROWS,
+    CMD_STAGE2_K,
 };
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -60,9 +60,6 @@ pub(super) struct CommandScore {
     pub parts: HeuristicParts,
     pub ml_score: Option<f64>,
     pub ml_weight: f64,
-    /// Skim's score (the `fuzzy_score` feature), for the rows the model
-    /// scored; `None` for the others.
-    pub fuzzy_score: Option<i64>,
 }
 
 /// Time spent in each stage. The model stages are `None` (and `stage2` 0)
@@ -222,6 +219,9 @@ pub(super) type Predict<'a> = &'a dyn Fn(&[f64], usize) -> anyhow::Result<Vec<f6
 pub(super) struct Stage2<'a> {
     /// Rows, from the top of the heuristic order, that the model scores.
     pub k: usize,
+    /// More rows it scores: of the candidates outside those `k`, the ones run
+    /// most often in the context's directory ([`dir_rows`]).
+    pub dir_rows: usize,
     pub ml_weight: f64,
     pub predict: Predict<'a>,
 }
@@ -260,6 +260,7 @@ pub(super) fn rank_scoped(
             let predict = |flat: &[f64], num_features: usize| model.predict(flat, num_features);
             let stage2 = Stage2 {
                 k: CMD_STAGE2_K,
+                dir_rows: CMD_STAGE2_DIR_ROWS,
                 ml_weight: model.ml_weight,
                 predict: &predict,
             };
@@ -303,27 +304,50 @@ fn rank_stages(
     // The model's recency_rank counts among the candidates, unless they
     // are a scope's: then among every matching command (`all_newest`).
     let newest_here = stage2.is_some() && all_newest.is_none();
-    let (mut ranking, newest) = rank_heuristic(candidates, index, ctx, select, head, newest_here);
+    let stage = stage2.as_ref().map(|s| (s.k, s.dir_rows));
+    let (mut ranking, newest, scored) =
+        rank_heuristic(candidates, index, ctx, select, head, newest_here, stage);
     if let Some(stage2) = stage2 {
         let newest = all_newest.unwrap_or(&newest);
-        apply_model(query, index, ctx, &stage2, newest, &mut ranking);
+        apply_model(query, index, ctx, &stage2, scored, newest, &mut ranking);
     }
     ranking
 }
 
-/// Steps 3-8 of section 7.2: score the first `k` rows with the model, blend,
-/// and re-sort them. On a failed prediction the ranking is left as the
-/// heuristic made it, with `model_failed` set.
+/// The commands the model stage scores for these candidates (03-learn.md
+/// section 7.2: fzf's top `CMD_STAGE2_K`, then [`dir_rows`]), in no
+/// particular order: what training draws its negatives from.
+pub(super) fn stage2_rows(
+    candidates: &[CommandCandidate],
+    index: &CommandIndex,
+    ctx: &RankContext,
+) -> Vec<CommandCandidate> {
+    let stage = (CMD_STAGE2_K, CMD_STAGE2_DIR_ROWS);
+    let (ranking, _, scored) =
+        rank_heuristic(candidates, index, ctx, CMD_STAGE2_K, 0, false, Some(stage));
+    ranking.scores[..scored]
+        .iter()
+        .map(|s| CommandCandidate {
+            idx: s.idx,
+            fzf: s.parts.fzf,
+        })
+        .collect()
+}
+
+/// Steps 3-8 of section 7.2: score the first `k` rows (`rank_heuristic`
+/// put the stage-2 rows there) with the model, blend, and re-sort them. On a
+/// failed prediction the ranking is the heuristic's, with `model_failed`
+/// set: the directory's rows sit unordered after fzf's top `stage2.k`, so
+/// only the rows above them stay counted as sorted.
 fn apply_model(
     query: &str,
     index: &CommandIndex,
     ctx: &RankContext,
     stage2: &Stage2<'_>,
+    k: usize,
     newest: &[(i64, i64)],
     ranking: &mut CommandRanking,
 ) {
-    // `rank_heuristic` selected at least this many from the top.
-    let k = stage2.k.min(ranking.scores.len());
     if k == 0 {
         return;
     }
@@ -332,37 +356,28 @@ fn apply_model(
     let started = Instant::now();
     let query_lower = query.to_lowercase();
     let mut flat = vec![0.0; k * num_features];
-    // Skim's score is a feature only: computed for these rows alone.
-    let skim = fuzzy::skim();
-    let fill = |(row, score): (&mut [f64], &CommandScore)| -> i64 {
+    let fill = |(row, score): (&mut [f64], &CommandScore)| {
         let entry = &index.entries[score.idx as usize];
-        let fuzzy_score = fuzzy::skim_score(skim, query, &entry.text);
         let inputs = CommandFeatureInputs {
             query,
             query_lower: &query_lower,
             idx: score.idx,
             entry,
-            fuzzy_score,
             fzf_score: score.parts.fzf,
-            recency_rank: {
-                let entry = &index.entries[score.idx as usize];
-                recency_rank(newest, (entry.last_run_at, entry.db_id))
-            },
+            recency_rank: recency_rank(newest, (entry.last_run_at, entry.db_id)),
             index,
             ctx,
         };
         compute_all(&inputs, row);
-        fuzzy_score
     };
     let head = &ranking.scores[..k];
-    let skim: Vec<i64> = if k >= PAR_FEATURES_MIN {
+    if k >= PAR_FEATURES_MIN {
         flat.par_chunks_mut(num_features)
             .zip(head.par_iter())
-            .map(fill)
-            .collect()
+            .for_each(fill);
     } else {
-        flat.chunks_mut(num_features).zip(head).map(fill).collect()
-    };
+        flat.chunks_mut(num_features).zip(head).for_each(fill);
+    }
     let features_ms = ms_since(started);
 
     let started = Instant::now();
@@ -370,6 +385,7 @@ fn apply_model(
         Ok(raw) if raw.len() == k => raw,
         _ => {
             ranking.model_failed = true;
+            ranking.sorted = ranking.sorted.min(stage2.k);
             return;
         }
     };
@@ -379,12 +395,11 @@ fn apply_model(
     let w = stage2.ml_weight;
     let head = &mut ranking.scores[..k];
     let mut keys: Vec<SortKey> = Vec::with_capacity(k);
-    for (at, ((score, raw), fuzzy_score)) in head.iter_mut().zip(raw).zip(skim).enumerate() {
+    for (at, (score, raw)) in head.iter_mut().zip(raw).enumerate() {
         let ml = crate::ranker::logistic(raw);
         score.score = (1.0 - w) * score.heuristic + w * ml;
         score.ml_score = Some(ml);
         score.ml_weight = w;
-        score.fuzzy_score = Some(fuzzy_score);
         keys.push(sort_key(index, score.score, score.idx, at as u32));
     }
     let sort_started = Instant::now();
@@ -436,7 +451,9 @@ fn ms_since(started: Instant) -> f64 {
 /// candidate; the scores are built once, in that order, afterwards.
 ///
 /// `select` (at least `head`) is how many rows from the top are guaranteed
-/// to be `scores[..select]` as a set: the model stage takes them from there.
+/// to be `scores[..select]` as a set. With `stage2 = Some((k, dir_rows))`
+/// the model's rows come first: the top `k`, then up to `dir_rows` of the
+/// rest by [`dir_rows`]; the third value is how many that is (0 without).
 fn rank_heuristic(
     candidates: &[CommandCandidate],
     index: &CommandIndex,
@@ -444,7 +461,8 @@ fn rank_heuristic(
     select: usize,
     head: usize,
     with_newest: bool,
-) -> (CommandRanking, Vec<(i64, i64)>) {
+    stage2: Option<(usize, usize)>,
+) -> (CommandRanking, Vec<(i64, i64)>, usize) {
     assert!(select >= head, "the sorted head lies inside the selection");
     assert!(
         u32::try_from(candidates.len()).is_ok(),
@@ -499,6 +517,19 @@ fn rank_heuristic(
     } else {
         keys.sort_unstable_by(compare);
     }
+    let mut sorted = sorted;
+    let scored = match stage2 {
+        Some((k, rows)) if k < keys.len() => {
+            let (moved, from_sorted) = dir_rows(&mut keys, k, rows, sorted, candidates, index, ctx);
+            if sorted > k {
+                // The rows that stayed keep their order behind the moved ones.
+                sorted = k + moved + (sorted - k - from_sorted);
+            }
+            k + moved
+        }
+        Some(_) => keys.len(),
+        None => 0,
+    };
     let sort_ms = ms_since(sort_started);
     let build = |key: &SortKey| {
         let at = key.at as usize;
@@ -509,7 +540,6 @@ fn rank_heuristic(
             parts: parts[at],
             ml_score: None,
             ml_weight: 0.0,
-            fuzzy_score: None,
         }
     };
     let scores: Vec<CommandScore> = if parallel {
@@ -529,7 +559,79 @@ fn rank_heuristic(
         features: Vec::new(),
         feature_rows: Vec::new(),
     };
-    (ranking, newest)
+    (ranking, newest, scored)
+}
+
+/// Stage 2's second source of rows (03-learn.md section 7.2): of the
+/// candidates in `keys[k..]`, the `rows` run most often in the context's
+/// directory (then the newer run there, then the larger database id), moved
+/// to `keys[k..k + moved]`. fzf's order leaves a command that is run all the
+/// time in this directory, but matches the query less well than thousands of
+/// others, out of fzf's top `k`, and the model would often rank it first.
+///
+/// `keys[k..ordered]` (when `ordered > k`) are in rank order and the rows
+/// that stay keep that order; otherwise the rest is unordered and rows are
+/// swapped into place. Returns `(moved, how many of them came from
+/// keys[k..ordered])`.
+fn dir_rows(
+    keys: &mut [SortKey],
+    k: usize,
+    rows: usize,
+    ordered: usize,
+    candidates: &[CommandCandidate],
+    index: &CommandIndex,
+    ctx: &RankContext,
+) -> (usize, usize) {
+    let in_dir = index.commands_in_dir(ctx.dir);
+    if rows == 0 || in_dir.is_empty() {
+        return (0, 0);
+    }
+    let mut ran_here = vec![0u64; index.entries.len().div_ceil(64)];
+    for &idx in in_dir {
+        ran_here[idx as usize / 64] |= 1 << (idx % 64);
+    }
+    // (runs here, last run here, db_id, position) of each candidate that ran here.
+    let mut found: Vec<(u32, i64, i64, usize)> = Vec::new();
+    for (at, key) in keys.iter().enumerate().skip(k) {
+        let idx = candidates[key.at as usize].idx;
+        if ran_here[idx as usize / 64] & (1 << (idx % 64)) != 0
+            && let Some(stat) = index.dir_stat(idx, ctx.dir)
+        {
+            found.push((stat.runs, stat.last_run_at, key.db_id, at));
+        }
+    }
+    let most_runs_first = |a: &(u32, i64, i64, usize), b: &(u32, i64, i64, usize)| {
+        (b.0, b.1, b.2).cmp(&(a.0, a.1, a.2))
+    };
+    if found.len() > rows {
+        found.select_nth_unstable_by(rows - 1, most_runs_first);
+        found.truncate(rows);
+    }
+    let mut chosen: Vec<usize> = found.iter().map(|f| f.3).collect();
+    chosen.sort_unstable();
+    let from_sorted = chosen.iter().filter(|&&at| at < ordered).count();
+    if ordered > k {
+        // A stable partition of keys[k..]: chosen first, the rest in order.
+        let mut is_chosen = vec![false; keys.len() - k];
+        for &at in &chosen {
+            is_chosen[at - k] = true;
+        }
+        let rest: Vec<SortKey> = keys[k..].to_vec();
+        let chosen_first = rest
+            .iter()
+            .zip(&is_chosen)
+            .filter(|(_, chosen)| **chosen)
+            .chain(rest.iter().zip(&is_chosen).filter(|(_, chosen)| !**chosen));
+        for (slot, (key, _)) in keys[k..].iter_mut().zip(chosen_first) {
+            *slot = *key;
+        }
+    } else {
+        // Ascending positions: each is at or after its target slot.
+        for (i, &at) in chosen.iter().enumerate() {
+            keys.swap(k + i, at);
+        }
+    }
+    (chosen.len(), from_sorted)
 }
 
 #[cfg(test)]
@@ -665,7 +767,6 @@ mod tests {
             parts: HeuristicParts::default(),
             ml_score: None,
             ml_weight: 0.0,
-            fuzzy_score: None,
         };
         assert_eq!(rank_order(&index, &score(0), &score(1)), Ordering::Less);
     }
@@ -690,10 +791,12 @@ mod tests {
             .map(|s| (s.idx, s.parts.fzf))
             .collect();
         assert_eq!(fzf, [(1, 60), (0, 30)]);
-        assert!(ranking.scores.iter().all(|s| s.ml_score.is_none()
-            && s.ml_weight == 0.0
-            && s.score == s.heuristic
-            && s.fuzzy_score.is_none()));
+        assert!(
+            ranking
+                .scores
+                .iter()
+                .all(|s| s.ml_score.is_none() && s.ml_weight == 0.0 && s.score == s.heuristic)
+        );
         assert!(ranking.features.is_empty() && ranking.features_of(0).is_empty());
         assert_eq!(ranking.timings.stage2, 0);
         assert_eq!(ranking.timings.features_ms, None);
@@ -791,6 +894,7 @@ mod tests {
         assert_eq!(idxs(&heuristic), [0, 1, 2, 3, 4, 5]);
 
         let stage2 = Stage2 {
+            dir_rows: 0,
             k: 3,
             ml_weight: 1.0,
             predict: &reversing,
@@ -824,6 +928,7 @@ mod tests {
         assert!(!ranking.model_failed);
 
         let everything = Stage2 {
+            dir_rows: 0,
             k: usize::MAX,
             ml_weight: 1.0,
             predict: &reversing,
@@ -833,10 +938,109 @@ mod tests {
         assert!(ranking.scores.iter().all(|s| s.ml_score.is_some()));
     }
 
+    /// Ten commands whose heuristic order is idx 0..10; in directory `/d`
+    /// idx 8 ran three times, idx 1 twice, idx 6 once.
+    fn ten_with_a_dir() -> (CommandIndex, RankContext, Vec<CommandCandidate>) {
+        let texts: Vec<String> = (0..10).map(|i| format!("a{i}")).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut index = index_of(&refs);
+        let dir = index.dirs.intern("/d");
+        for i in 0..10u32 {
+            index.record_run(i, NOW - i64::from(i + 1) * 1000, None, None, Some(0), None);
+        }
+        for (idx, runs) in [(8, 3), (1, 2), (6, 1)] {
+            for _ in 0..runs {
+                index.record_run(idx, NOW - 50_000, Some(dir), None, Some(0), None);
+            }
+        }
+        let mut ctx = context(NOW);
+        ctx.dir = Some(dir);
+        (index, ctx, (0..10).map(candidate).collect())
+    }
+
+    fn scored_set(ranking: &CommandRanking) -> Vec<u32> {
+        let mut set: Vec<u32> = ranking
+            .scores
+            .iter()
+            .filter(|s| s.ml_score.is_some())
+            .map(|s| s.idx)
+            .collect();
+        set.sort_unstable();
+        set
+    }
+
+    #[test]
+    fn stage_two_adds_the_directorys_most_run_matches_outside_the_top_k() {
+        let (index, ctx, all) = ten_with_a_dir();
+        let flat = |flat: &[f64], width: usize| -> anyhow::Result<Vec<f64>> {
+            Ok(vec![0.0; flat.len() / width])
+        };
+        let stage2 = |dir_rows| Stage2 {
+            k: 3,
+            dir_rows,
+            ml_weight: 0.0,
+            predict: &flat,
+        };
+        // idx 1 ran there too but is already in the top 3.
+        let ranking = rank_with("", &all, &index, &ctx, usize::MAX, Some(stage2(1)));
+        assert_eq!(scored_set(&ranking), [0, 1, 2, 8]);
+        assert_eq!(ranking.timings.stage2, 4);
+        // With ml weight 0 the order is the heuristic's; the rest keeps it.
+        assert_eq!(idxs(&ranking), [0, 1, 2, 8, 3, 4, 5, 6, 7, 9]);
+        let ranking = rank_with("", &all, &index, &ctx, usize::MAX, Some(stage2(5)));
+        assert_eq!(scored_set(&ranking), [0, 1, 2, 6, 8], "fewer ran there");
+        assert_eq!(idxs(&ranking), [0, 1, 2, 6, 8, 3, 4, 5, 7, 9]);
+        assert_eq!(ranking.sorted, 10);
+
+        // The picker's path: a short sorted head, the rest unordered.
+        let mut ranking = rank_with("", &all, &index, &ctx, 2, Some(stage2(1)));
+        assert_eq!(scored_set(&ranking), [0, 1, 2, 8]);
+        assert_eq!(ranking.sorted, 4);
+        ranking.sort_rest(&index);
+        assert_eq!(idxs(&ranking), [0, 1, 2, 8, 3, 4, 5, 6, 7, 9]);
+
+        // No directory, or none asked for: fzf's top k alone.
+        let nowhere = context(NOW);
+        let ranking = rank_with("", &all, &index, &nowhere, usize::MAX, Some(stage2(1)));
+        assert_eq!(scored_set(&ranking), [0, 1, 2]);
+        let ranking = rank_with("", &all, &index, &ctx, usize::MAX, Some(stage2(0)));
+        assert_eq!(scored_set(&ranking), [0, 1, 2]);
+        // What training draws its negatives from is this set.
+        let mut rows: Vec<u32> = stage2_rows(&all, &index, &ctx)
+            .iter()
+            .map(|c| c.idx)
+            .collect();
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            (0..10).collect::<Vec<u32>>(),
+            "k = CMD_STAGE2_K covers all ten"
+        );
+    }
+
+    #[test]
+    fn a_failed_stage_two_with_directory_rows_sorts_the_rest_later() {
+        let (index, ctx, all) = ten_with_a_dir();
+        let failing =
+            |_: &[f64], _: usize| -> anyhow::Result<Vec<f64>> { Err(anyhow::anyhow!("no")) };
+        let stage2 = Stage2 {
+            k: 3,
+            dir_rows: 2,
+            ml_weight: 1.0,
+            predict: &failing,
+        };
+        let mut ranking = rank_with("", &all, &index, &ctx, usize::MAX, Some(stage2));
+        assert!(ranking.model_failed);
+        assert_eq!(ranking.sorted, 3, "only fzf's top k is still in order");
+        ranking.sort_rest(&index);
+        assert_eq!(idxs(&ranking), (0..10).collect::<Vec<u32>>());
+    }
+
     #[test]
     fn stage_two_takes_its_rows_from_a_sorted_head_and_keeps_the_head_size() {
         let (index, ctx, all) = six();
         let stage2 = Stage2 {
+            dir_rows: 0,
             k: 4,
             ml_weight: 0.5,
             predict: &reversing,
@@ -857,6 +1061,7 @@ mod tests {
         let failing =
             |_: &[f64], _: usize| -> anyhow::Result<Vec<f64>> { Err(anyhow::anyhow!("no")) };
         let stage2 = Stage2 {
+            dir_rows: 0,
             k: 4,
             ml_weight: 1.0,
             predict: &failing,
@@ -878,6 +1083,7 @@ mod tests {
         let short = |_: &[f64], _: usize| -> anyhow::Result<Vec<f64>> { Ok(vec![1.0]) };
         for predict in [&failing as Predict, &short] {
             let stage2 = Stage2 {
+                dir_rows: 0,
                 k: 3,
                 ml_weight: 1.0,
                 predict,

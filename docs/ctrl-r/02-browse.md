@@ -268,7 +268,7 @@ pub(super) struct CmdRow {
     pub command_id: i64, pub text: Arc<str>, pub last_run_at: i64,
     pub run_count: u32, pub pick_count: u32, pub runs_here: u32, pub last_exit_code: Option<i32>,
     pub score: f64, pub heuristic: f64, pub heuristic_parts: HeuristicParts,
-    pub ml_score: Option<f64>, pub ml_weight: f64, pub fuzzy_score: Option<i64>,   // Skim's score: only for model-scored rows
+    pub ml_score: Option<f64>, pub ml_weight: f64, pub fuzzy_score: Option<i64>,   // Skim's score, for the debug pane only (not a feature since 2026-11-18): only for model-scored rows, computed when the row is built
     pub features: Vec<f64>,                              // registry order; empty when no model scored the row
 }
 pub(super) struct CmdDetails { pub command_id: i64, pub dirs: Vec<DirUse>, pub preceded_by: Vec<PrecededBy> }
@@ -416,7 +416,7 @@ covers the slices.
 The closure captures `&CommandIndex`, `&RankContext` and the prepared
 `Pattern`: nothing lazily initialised, no lock, no allocation other than the
 output ([docs/how-it-works.md:1205-1207](../how-it-works.md)). (Skim's
-matcher, needed only for non-ASCII texts and for the model's
+matcher, needed only for non-ASCII texts and for the debug pane's
 `fuzzy_score`, is one `static` resolved before the loop; its scratch
 space is warmed on every rayon thread at start, section 6.2.)
 
@@ -533,7 +533,6 @@ pub(super) const NO_FZF_MATCH: i32 = -1;
 pub(super) struct CommandScore {
     pub idx: u32, pub score: f64, pub heuristic: f64, pub parts: HeuristicParts,
     pub ml_score: Option<f64>, pub ml_weight: f64,
-    pub fuzzy_score: Option<i64>,    // Skim's score, computed in the model stage for its rows only
 }
 pub(super) struct CmdRankTimings { pub heuristic_ms: f64, pub features_ms: Option<f64>, pub predict_ms: Option<f64>, pub blend_ms: Option<f64>, pub stage2: usize }
 pub(super) struct CommandRanking {
@@ -1098,7 +1097,7 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 | TC-B-02 | `rank_commands` fzf order | `git status` (7,200 s ago), `tig git` (60 s), `grep -i x` (1 s); query `gi` | `tig git`, `git status`, `grep -i x` (equal scores newest first, then the scattered match); empty query: newest first | - |
 | TC-B-03 | `combine` | parts (recency 1.0, fzf 10) and (1e-9, 11) with `lo = 10`, `hi = 11` | the second is higher; (0.5, 11) gives 0.75; never above 1 | - |
 | TC-B-04 | `rank_commands` tie-break | Two commands, identical stats, `db_id` 5 and 9 | 9 before 5 | Same `score`, different `last_run_at` -> newer first |
-| TC-B-05 | `rank_commands` takes the filter's score | `zz top` (1 s ago, `fzf` 30) and `abc zz` (100 s ago, `fzf` 60) passed as candidates of `zz` | `abc zz` first: the order follows the given scores, nothing is scored again; no model fields set, `fuzzy_score` `None` | - |
+| TC-B-05 | `rank_commands` takes the filter's score | `zz top` (1 s ago, `fzf` 30) and `abc zz` (100 s ago, `fzf` 60) passed as candidates of `zz` | `abc zz` first: the order follows the given scores, nothing is scored again; no model fields set | - |
 | TC-B-06 | `filter` | Texts `git status`, `cargo build`, `ls`; query `gs` (not `cargo test`: its `g`...`s` is a fuzzy match) | Only `git status` | Empty query keeps all 3 with `fzf = 0`; a `deleted` entry is never returned |
 | TC-B-07 | `filter` narrowing | Queries `g` then `gi` then `x` on 3 texts | Second call's base-set size equals the first call's match count; the third call's base set is all entries | A scope change keeps the trail (matching is in scope `All`): `gi` in Session after `g` narrows and equals a fresh Session filter; result of narrowed `gi` equals un-narrowed `gi` |
 | TC-B-08 | `filter` scopes | A run here only, B in repo only, C in session only, D none | `Directory` -> [A]; `Repo` -> [B]; `Session` -> [C]; `All` -> 4 | `ctx.dir = None` with `Directory` -> empty |

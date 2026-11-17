@@ -143,8 +143,9 @@ pub(super) struct CmdRow {
     pub heuristic_parts: HeuristicParts,
     pub ml_score: Option<f64>,
     pub ml_weight: f64,
-    /// Skim's score: the `fuzzy_score` feature, `None` unless the model
-    /// scored the row.
+    /// Skim's score of the text for the query, shown in the debug pane
+    /// beside fzf's (not a model feature since 2026-11-18); `None` unless
+    /// the model scored the row.
     pub fuzzy_score: Option<i64>,
     /// Registry order; empty when no model scored the row.
     pub features: Vec<f64>,
@@ -667,7 +668,9 @@ impl Worker {
             heuristic_parts: score.parts,
             ml_score: score.ml_score,
             ml_weight: score.ml_weight,
-            fuzzy_score: score.fuzzy_score,
+            fuzzy_score: score
+                .ml_score
+                .map(|_| fuzzy::skim_score(fuzzy::skim(), &self.current_query, &entry.text)),
             features: self.current.features_of(rank).to_vec(),
         }
     }
@@ -1643,7 +1646,7 @@ mod tests {
         let stats_file = dir.0.join("cmd_model_stats.json");
         let model = std::fs::read(&model_file).unwrap();
         let stats = std::fs::read_to_string(&stats_file).unwrap();
-        let renamed = stats.replacen("\"fuzzy_score\"", "\"fuzzy_score_v0\"", 1);
+        let renamed = stats.replacen("\"retired_fuzzy_score\"", "\"fuzzy_score\"", 1);
         assert_ne!(renamed, stats);
         // A renamed feature; no stats; a truncated model.
         let cases: [(&[u8], Option<&str>); 3] = [
@@ -2133,6 +2136,7 @@ mod tests {
         };
         let stage2 = model.then_some(rank::Stage2 {
             k: 300,
+            dir_rows: 20,
             ml_weight: 0.7,
             predict: &predict,
         });

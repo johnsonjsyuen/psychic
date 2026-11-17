@@ -12,7 +12,7 @@ use super::super::rank::{
 use super::super::repo;
 use super::super::store::CmdStore;
 use super::super::train::{ReplayInput, replay};
-use super::super::tuning::{CMD_PAGE_ROWS, CMD_STAGE2_K};
+use super::super::tuning::{CMD_PAGE_ROWS, CMD_STAGE2_DIR_ROWS, CMD_STAGE2_K};
 use super::super::worker::{Scope, filter_candidates, narrowing_applies, replay_filter};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -128,8 +128,14 @@ pub(super) fn twostage(data_dir: &Path, queries: usize, out: &mut dyn Write) -> 
             skipped += 1;
             continue;
         }
+        // Full scoring: every row. Two-stage: what the picker scores.
         let stage2 = |k: usize| Stage2 {
             k,
+            dir_rows: if k == usize::MAX {
+                0
+            } else {
+                CMD_STAGE2_DIR_ROWS
+            },
             ml_weight: model.ml_weight,
             predict: &predict,
         };
@@ -276,7 +282,6 @@ fn dump_line(
             s.score.to_bits(),
             s.heuristic.to_bits(),
             s.ml_score.map(f64::to_bits),
-            s.fuzzy_score,
         )
             .hash(&mut ranked);
     }

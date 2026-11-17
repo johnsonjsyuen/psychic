@@ -23,8 +23,6 @@ pub(super) struct CommandFeatureInputs<'a> {
     pub query_lower: &'a str,
     pub idx: u32,
     pub entry: &'a CommandEntry,
-    /// The candidate's fuzzy score for `query`; 0 for the empty query.
-    pub fuzzy_score: i64,
     /// fzf's score for `query` (02 section 7): 0 for the empty query,
     /// `rank::NO_FZF_MATCH` when fzf does not match.
     pub fzf_score: i32,
@@ -123,13 +121,19 @@ fn a_word_starts_with(text: &str, query_lower: &str) -> bool {
 
 // --- Query ---------------------------------------------------------------------
 
-command_feature!(FuzzyScore, "fuzzy_score", Numeric, INCREASING, |i| {
-    if i.query.is_empty() {
-        0.0
-    } else {
-        i.fuzzy_score as f64
-    }
-});
+// Column 1 was Skim's score (`fuzzy_score`) until 2026-11-18. It depended on
+// what the same thread had matched before (`fuzzy-matcher` keeps cached
+// matrices per thread), so training was not a pure function of its input, and
+// fzf's score (feature 24) carries the same information: with it zeroed the
+// model did as well or better (results.md). The column stays, constant, so
+// that no other feature moves; LightGBM never splits on it.
+command_feature!(
+    RetiredFuzzyScore,
+    "retired_fuzzy_score",
+    Numeric,
+    NONE,
+    |_i| 0.0
+);
 
 command_feature!(
     CommandStartsWithQuery,
@@ -177,7 +181,7 @@ command_feature!(
     LogSecondsSinceLastRun,
     "log_seconds_since_last_run",
     Numeric,
-    DECREASING,
+    NONE,
     |i| if i.entry.run_count == 0 {
         CMD_NEVER_SECS_LOG
     } else {
@@ -185,31 +189,23 @@ command_feature!(
     }
 );
 
-command_feature!(RunsLastHour, "runs_last_hour", Numeric, INCREASING, |i| {
+command_feature!(RunsLastHour, "runs_last_hour", Numeric, NONE, |i| {
     runs_within(i, 3600)
 });
 
-command_feature!(RunsLastDay, "runs_last_day", Numeric, INCREASING, |i| {
+command_feature!(RunsLastDay, "runs_last_day", Numeric, NONE, |i| {
     runs_within(i, 86_400)
 });
 
-command_feature!(
-    RunsLast7Days,
-    "runs_last_7_days",
-    Numeric,
-    INCREASING,
-    |i| runs_within(i, 604_800)
-);
+command_feature!(RunsLast7Days, "runs_last_7_days", Numeric, NONE, |i| {
+    runs_within(i, 604_800)
+});
 
-command_feature!(
-    RunsLast30Days,
-    "runs_last_30_days",
-    Numeric,
-    INCREASING,
-    |i| runs_within(i, 2_592_000)
-);
+command_feature!(RunsLast30Days, "runs_last_30_days", Numeric, NONE, |i| {
+    runs_within(i, 2_592_000)
+});
 
-command_feature!(LogTotalRuns, "log_total_runs", Numeric, INCREASING, |i| {
+command_feature!(LogTotalRuns, "log_total_runs", Numeric, NONE, |i| {
     f64::from(i.entry.run_count).ln_1p()
 });
 
@@ -339,7 +335,7 @@ command_feature!(RecencyRank, "recency_rank", Numeric, NONE, |i| {
 /// Append-only. The position is the column in the model. A `static` slice,
 /// not a `Lazy`: it is read inside a rayon loop.
 pub(super) static COMMAND_FEATURE_REGISTRY: &[&dyn CommandFeature] = &[
-    &FuzzyScore,
+    &RetiredFuzzyScore,
     &CommandStartsWithQuery,
     &WordStartsWithQuery,
     &PicksForThisQuery,
@@ -457,13 +453,7 @@ mod tests {
         assert!(word_hits > 5_000, "{word_hits}");
     }
 
-    fn features(
-        index: &CommandIndex,
-        ctx: &RankContext,
-        idx: u32,
-        query: &str,
-        fuzzy_score: i64,
-    ) -> Vec<f64> {
+    fn features(index: &CommandIndex, ctx: &RankContext, idx: u32, query: &str) -> Vec<f64> {
         let query_lower = query.to_lowercase();
         let entry = &index.entries[idx as usize];
         let inputs = CommandFeatureInputs {
@@ -471,7 +461,6 @@ mod tests {
             query_lower: &query_lower,
             idx,
             entry,
-            fuzzy_score,
             fzf_score: crate::cmd::rank::fzf_score(
                 &crate::cmd::fzf::FzfQuery::new(query),
                 &entry.text,
@@ -516,24 +505,25 @@ mod tests {
     fn tc_l_01_every_feature_on_f1() {
         let (index, ctx) = f1();
         let expected = [
-            57.0, 0.0, 0.0, 0.0, 0.0, 2.3979, 1.0, 2.0, 3.0, 4.0, 1.6094, 0.0, 0.5, 0.0, 2.3979,
-            2.0, 0.5, 0.5, 0.6667, 0.0, 0.0, 10.0, 1.0,
+            // retired_fuzzy_score: always 0.
+            0.0, 0.0, 0.0, 0.0, 0.0, 2.3979, 1.0, 2.0, 3.0, 4.0, 1.6094, 0.0, 0.5, 0.0, 2.3979, 2.0,
+            0.5, 0.5, 0.6667, 0.0, 0.0, 10.0, 1.0,
             // fzf_score: "g" at the start (16 + 2 * 8), a 3-character gap
             // (-3 - 1 - 1), "s" at a word start (16 + 8).
             51.0, // recency_rank, as the fixture passes it.
             3.0,
         ];
-        assert_close(&features(&index, &ctx, 0, "gs", 57), &expected);
+        assert_close(&features(&index, &ctx, 0, "gs"), &expected);
     }
 
     #[test]
     fn tc_l_02_query_features() {
         let (index, ctx) = f1();
-        let first_three = |query: &str| features(&index, &ctx, 0, query, 9)[..3].to_vec();
+        let first_three = |query: &str| features(&index, &ctx, 0, query)[..3].to_vec();
         assert_eq!(first_three(""), [0.0, 0.0, 0.0]);
-        assert_eq!(first_three("git"), [9.0, 1.0, 1.0]);
-        assert_eq!(first_three("st"), [9.0, 0.0, 1.0]);
-        assert_eq!(first_three("GIT"), [9.0, 1.0, 1.0]);
+        assert_eq!(first_three("git"), [0.0, 1.0, 1.0]);
+        assert_eq!(first_three("st"), [0.0, 0.0, 1.0]);
+        assert_eq!(first_three("GIT"), [0.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -541,7 +531,7 @@ mod tests {
         let mut index = index_of(&["make"]);
         index.record_run(0, NOW - 50, None, None, None, None);
         let ctx = context(NOW);
-        let values = features(&index, &ctx, 0, "", 0);
+        let values = features(&index, &ctx, 0, "");
         assert!(values[18].is_nan(), "success_rate is missing");
         assert_close(&values[12..18], &[0.0, 0.0, 19.57, 0.0, 0.0, 0.0]);
     }
@@ -552,7 +542,7 @@ mod tests {
             let mut index = index_of(&["make"]);
             index.record_run(0, NOW - 1000, None, None, Some(0), None);
             index.entries[0].last_fail_at = last_fail_at;
-            features(&index, &context(NOW), 0, "", 0)[19]
+            features(&index, &context(NOW), 0, "")[19]
         };
         assert_eq!(failed(NOW - 119), 1.0);
         assert_eq!(failed(NOW - 120), 0.0);
@@ -569,7 +559,7 @@ mod tests {
         }
         let mut ctx = context(NOW);
         ctx.prev_templates = [Some(x), Some(y), Some(x)];
-        assert_eq!(features(&index, &ctx, 0, "", 0)[17], 0.5);
+        assert_eq!(features(&index, &ctx, 0, "")[17], 0.5);
     }
 
     #[test]
@@ -578,7 +568,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                "fuzzy_score",
+                "retired_fuzzy_score",
                 "command_starts_with_query",
                 "word_starts_with_query",
                 "picks_for_this_query",
@@ -613,7 +603,7 @@ mod tests {
         assert_eq!(
             monotone,
             [
-                1, 0, 0, 1, 1, -1, 1, 1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0
+                0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, -1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0
             ]
         );
         let binary: Vec<&str> = COMMAND_FEATURE_REGISTRY
@@ -637,9 +627,9 @@ mod tests {
         let mut index = index_of(&["git status"]);
         index.record_run(0, NOW - 100, None, None, Some(0), None);
         index.record_pick(0, NOW - 50, "gs", &["g".to_string(), "gs".to_string()]);
-        let values = features(&index, &context(NOW), 0, "gs", 1);
+        let values = features(&index, &context(NOW), 0, "gs");
         assert_eq!([values[3], values[4], values[11]], [1.0, 1.0, 1.0]);
-        let values = features(&index, &context(NOW), 0, "g", 1);
+        let values = features(&index, &context(NOW), 0, "g");
         assert_eq!([values[3], values[4], values[11]], [0.0, 1.0, 1.0]);
     }
 
@@ -651,13 +641,13 @@ mod tests {
         index.record_run(0, NOW - 90, None, None, Some(0), None);
         let mut ctx = context(NOW);
         ctx.repo = Some(repo);
-        assert_eq!(features(&index, &ctx, 0, "", 0)[13], 0.5);
+        assert_eq!(features(&index, &ctx, 0, "")[13], 0.5);
     }
 
     #[test]
     fn a_command_that_never_ran_is_never_on_both_time_axes() {
         let index = index_of(&["make"]);
-        let values = features(&index, &context(NOW), 0, "", 0);
+        let values = features(&index, &context(NOW), 0, "");
         assert_eq!(values[5], CMD_NEVER_SECS_LOG);
         assert_eq!(values[10], 0.0);
         assert_eq!(values[16], 0.0);
@@ -670,7 +660,7 @@ mod tests {
         index.record_run(0, NOW + 30, Some(dir), None, Some(0), None);
         let mut ctx = context(NOW);
         ctx.dir = Some(dir);
-        let values = features(&index, &ctx, 0, "", 0);
+        let values = features(&index, &ctx, 0, "");
         assert_eq!(values[5], 0.0, "log_seconds_since_last_run");
         assert_eq!(values[14], 0.0, "log_seconds_since_last_run_in_cwd");
         assert_eq!(values[6..10], [0.0, 0.0, 0.0, 0.0], "windows end at now");

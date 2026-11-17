@@ -658,34 +658,29 @@ fn it_n_02_replay_state_equals_a_fresh_load() {
         let features = |index: &CommandIndex, ctx: &RankContext| -> Vec<(i64, Vec<f64>)> {
             let query_lower = query.to_lowercase();
             let newest = newest(index, ctx);
-            let mut rows: Vec<(i64, Vec<f64>)> =
-                filter_candidates(index, ctx, query, Scope::All, None)
-                    .iter()
-                    .map(|c| {
-                        let entry = &index.entries[c.idx as usize];
-                        let inputs = CommandFeatureInputs {
-                            query,
-                            query_lower: &query_lower,
-                            idx: c.idx,
-                            entry,
-                            fuzzy_score: crate::cmd::fuzzy::skim_score(
-                                crate::cmd::fuzzy::skim(),
-                                query,
-                                &entry.text,
-                            ),
-                            fzf_score: c.fzf,
-                            recency_rank: crate::cmd::rank::recency_rank(
-                                &newest,
-                                (entry.last_run_at, entry.db_id),
-                            ),
-                            index,
-                            ctx,
-                        };
-                        let mut row = vec![0.0; COMMAND_FEATURE_REGISTRY.len()];
-                        compute_all(&inputs, &mut row);
-                        (entry.db_id, row)
-                    })
-                    .collect();
+            let candidates = filter_candidates(index, ctx, query, Scope::All, None);
+            let mut rows: Vec<(i64, Vec<f64>)> = candidates
+                .iter()
+                .map(|c| {
+                    let entry = &index.entries[c.idx as usize];
+                    let inputs = CommandFeatureInputs {
+                        query,
+                        query_lower: &query_lower,
+                        idx: c.idx,
+                        entry,
+                        fzf_score: c.fzf,
+                        recency_rank: crate::cmd::rank::recency_rank(
+                            &newest,
+                            (entry.last_run_at, entry.db_id),
+                        ),
+                        index,
+                        ctx,
+                    };
+                    let mut row = vec![0.0; COMMAND_FEATURE_REGISTRY.len()];
+                    compute_all(&inputs, &mut row);
+                    (entry.db_id, row)
+                })
+                .collect();
             rows.sort_by_key(|(id, _)| *id);
             rows
         };
