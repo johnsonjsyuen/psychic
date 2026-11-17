@@ -2789,6 +2789,7 @@ New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
 | `cmd/features.rs` | The 23 command features: `COMMAND_FEATURE_REGISTRY`, `compute_all` (serving and training share it) |
 | `cmd/train.rs` | The replay that builds the training set, the fit, `cmd_model.txt`/`cmd_model_stats.json`, the lock, the detached retrain |
 | `cmd/app.rs` | The picker's UI thread: start-up, event loop, keys, pick output |
+| `cmd/terminal.rs` | The picker's terminal, given back on every way out: a drop guard, a panic hook that restores before the message prints, and SIGTERM/SIGHUP/SIGINT turned into an event that leaves, restores and dies of the signal |
 | `cmd/render.rs` | List, preview, debug pane, help overlay (pure: no I/O, no clock) |
 | `cmd/keys.rs` | `CmdAction`, `CMD_KEYMAP` (its own table, not `keymap::KEYMAP`) |
 | `cmd/events.rs` | Impression and pick logging into `command_events` |
@@ -2877,14 +2878,20 @@ of log (+0.4-0.6 ms `db_open`). Details and the rejected options:
 its `-wal`/`-shm`, the marker and the command model files `0600` (only when
 they differ; file-only users who never enable history keep their modes).
 Errors from the command code name the operation and SQLite error code, never
-a bound value. `--purge` turns on `secure_delete`, empties the five tables,
+a bound value. `--purge` turns on `secure_delete`, empties the command tables
+except the tombstones (hashes, no text, so a deleted command stays deleted
+through a purge and a re-import),
 `VACUUM`s, and truncates the write-ahead log with a `TRUNCATE` checkpoint, so
 no deleted text stays in the database's files even while another psychic
 process has the database open; if one is in the middle of a read, the checkpoint cannot
 finish and purge fails telling the user to close it and purge again. It also
-removes the command model; the marker is left alone. Deleting one command leaves a
-tombstone so a later import does not restore it. Shell history files are
-never edited.
+removes the command model; the marker is left alone. Every connection to the
+command tables runs with `secure_delete` on, so whatever a write frees is
+zeroed. Deleting one command in the picker leaves a tombstone so a later import
+does not restore it, then checkpoints and truncates the write-ahead log without
+waiting, so its text is in neither `events.db` nor `events.db-wal`; if another
+process is in the log at that moment, the picker tries again at exit, and
+otherwise the next checkpoint clears it. Shell history files are never edited.
 
 **Import** (`--import`, and the first `--enable` unless `--no-import`):
 Atuin's `history.db` first (opened read-only; true cwd, exit codes and

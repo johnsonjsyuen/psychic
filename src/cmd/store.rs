@@ -15,6 +15,7 @@ use anyhow::{Context, Result, anyhow};
 use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -141,23 +142,34 @@ const R10: &str = "SELECT p.template, COUNT(*) FROM command_runs r JOIN commands
 const E1: &str = "INSERT INTO command_events (timestamp, action, command_id, query, rank, session_id, subsession_id, episode_queries, cwd, repo_root, shell_session) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
 const E2: &str = "UPDATE commands SET pick_count = pick_count + 1 WHERE id = ?1";
 
+/// On every connection to the command tables, from open: whatever a write
+/// frees (a deleted row, the old copy of a moved or rewritten one, a page) is
+/// overwritten with zeros, so a deleted command leaves no copy in free space.
+const D0: &str = "PRAGMA secure_delete = ON";
 const D1: &str = "INSERT OR REPLACE INTO deleted_commands (text_hash, deleted_at) VALUES (?1, ?2)";
 const D2: &str = "DELETE FROM command_events WHERE command_id = ?1";
 const D3: &str = "DELETE FROM command_runs WHERE command_id = ?1";
 const D4: &str = "UPDATE command_runs SET prev_command_id = NULL WHERE prev_command_id = ?1";
 const D5: &str = "DELETE FROM commands WHERE id = ?1";
 
-const P1: &str = "DELETE FROM command_events; DELETE FROM command_runs; DELETE FROM commands; DELETE FROM command_imports; DELETE FROM deleted_commands;";
-/// Before P1: the pages the deletes free are overwritten with zeros.
-const P1_SECURE: &str = "PRAGMA secure_delete = ON";
+/// Everything but `deleted_commands`: the tombstones hold no text (section
+/// 10.5), and without them a later import would bring the deleted commands
+/// back from the shell's history file.
+const P1: &str = "DELETE FROM command_events; DELETE FROM command_runs; DELETE FROM commands; DELETE FROM command_imports;";
+/// Before P1: the pages the deletes free are overwritten with zeros. Already
+/// on from open (D0); repeated so purge does not depend on it.
+const P1_SECURE: &str = D0;
 /// After P1 and `VACUUM`: copy the log into the database and cut it to zero
 /// bytes, so the old pages it still holds leave the disk. Column 0 is 1 when
 /// another connection kept it from finishing.
 const P1_CHECKPOINT: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 
-/// W1, after a `track-command` run once the log is over its bound: the same
-/// checkpoint as P1's, but on a connection that does not wait for others.
+/// W1, after a `track-command` run once the log is over its bound, and D6,
+/// after a delete: the same checkpoint as P1's, but on a connection that does
+/// not wait for others ([`CmdStore::truncate_log_now`]).
 const W1_CHECKPOINT: &str = P1_CHECKPOINT;
+/// Reads the connection's `busy_timeout`, to put it back after W1.
+const BUSY_TIMEOUT: &str = "PRAGMA busy_timeout";
 
 const I1: &str = "SELECT MIN(started_at) FROM command_runs WHERE source = 'hook'";
 const I2_SELECT: &str = "SELECT 1 FROM command_imports WHERE source_key = ?1";
@@ -368,15 +380,16 @@ pub(super) struct PurgeCounts {
     pub log_cleared: bool,
 }
 
-/// What [`CmdStore::close_recording`] did with the write-ahead log.
+/// What [`CmdStore::close_recording`], [`CmdStore::delete_command`] or
+/// [`CmdStore::truncate_log_now`] did with the write-ahead log.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum LogBound {
     /// The log was within its bound and was left as it is.
     Within,
-    /// The log was over its bound; it was checkpointed and cut to zero bytes.
+    /// The log was checkpointed into the database and cut to zero bytes.
     Truncated,
-    /// The log was over its bound, but another connection was writing,
-    /// checkpointing or reading from it; a later run tries again.
+    /// Another connection was writing, checkpointing or reading from the
+    /// log, so it was left as it is; a later checkpoint empties it.
     Busy,
 }
 
@@ -454,10 +467,15 @@ impl CmdStore {
         let file = Database::get_db_path(data_dir);
         let db = Database::new(&file)?;
         privacy::tighten_permissions(data_dir)?;
-        Ok(CmdStore {
-            db,
-            file: Some(file),
-        })
+        Self::with_connection(db, Some(file))
+    }
+
+    /// The settings every connection to the command tables gets (D0).
+    fn with_connection(db: Database, file: Option<PathBuf>) -> Result<Self> {
+        db.connection()
+            .execute_batch(D0)
+            .op("turning on secure delete")?;
+        Ok(CmdStore { db, file })
     }
 
     /// [`CmdStore::open`] for one `track-command` run: closing this connection
@@ -509,17 +527,24 @@ impl CmdStore {
         if length <= limit {
             return Ok(LogBound::Within);
         }
-        self.conn()
-            .busy_timeout(std::time::Duration::ZERO)
-            .op("configuring the connection")?;
-        let busy: i64 = self
-            .conn()
-            .query_row(W1_CHECKPOINT, [], |row| row.get(0))
-            .op("emptying the write-ahead log")?;
-        Ok(if busy == 0 {
-            LogBound::Truncated
-        } else {
-            LogBound::Busy
+        self.truncate_log_now()
+    }
+
+    /// W1: checkpoint the write-ahead log into the database and cut it to
+    /// zero bytes, without waiting. When another connection is writing,
+    /// checkpointing or inside a read, SQLite copies what it can and this
+    /// returns [`LogBound::Busy`] at once; an idle open connection does not
+    /// stop it. The connection's `busy_timeout` is put back afterwards.
+    pub(super) fn truncate_log_now(&self) -> Result<LogBound> {
+        const OP: &str = "configuring the connection";
+        let conn = self.conn();
+        let wait_ms: u64 = conn.query_row(BUSY_TIMEOUT, [], |row| row.get(0)).op(OP)?;
+        conn.busy_timeout(Duration::ZERO).op(OP)?;
+        let busy = conn.query_row(W1_CHECKPOINT, [], |row| row.get::<_, i64>(0));
+        conn.busy_timeout(Duration::from_millis(wait_ms)).op(OP)?;
+        Ok(match busy.op("emptying the write-ahead log")? {
+            0 => LogBound::Truncated,
+            _ => LogBound::Busy,
         })
     }
 
@@ -542,18 +567,13 @@ impl CmdStore {
 
     /// Another connection to a database [`CmdStore::open`] has set up.
     pub(super) fn open_file(path: &Path) -> Result<Self> {
-        Ok(CmdStore {
-            db: Database::new(path)?,
-            file: Some(path.to_path_buf()),
-        })
+        Self::with_connection(Database::new(path)?, Some(path.to_path_buf()))
     }
 
     #[cfg(test)]
     pub(super) fn in_memory() -> Self {
-        CmdStore {
-            db: Database::new(Path::new(":memory:")).expect("an in-memory database opens"),
-            file: None,
-        }
+        let db = Database::new(Path::new(":memory:")).expect("an in-memory database opens");
+        Self::with_connection(db, None).expect("an in-memory database is configured")
     }
 
     fn conn(&self) -> &Connection {
@@ -837,46 +857,75 @@ impl CmdStore {
 
     // --- Events, delete, purge ---------------------------------------------
 
-    /// Write `events`, all stamped `now`, in one transaction.
+    /// Write `events`, all stamped `now`, in one transaction (E1).
     pub(super) fn log_events(&self, now: i64, events: &[NewEvent]) -> Result<()> {
-        const OP: &str = "logging command events";
+        self.transaction(|tx| Self::insert_events(tx, now, events))
+    }
+
+    /// A pick: `events` (the impressions due and the pick itself) and the
+    /// pick count of `picked_id`, in one transaction (E1, E2), so Enter waits
+    /// for the write lock at most once.
+    pub(super) fn log_pick_events(
+        &self,
+        now: i64,
+        events: &[NewEvent],
+        picked_id: i64,
+    ) -> Result<()> {
         self.transaction(|tx| {
-            let mut statement = tx.prepare_cached(E1).op(OP)?;
-            for event in events {
-                let episode = event
-                    .episode_queries
-                    .map(|queries| serde_json::to_string(queries).expect("strings serialize"));
-                statement
-                    .execute(params![
-                        now,
-                        event.action.as_sql(),
-                        event.command_id,
-                        event.query,
-                        event.rank,
-                        event.session_id,
-                        event.subsession_id as i64,
-                        episode,
-                        event.cwd,
-                        event.repo_root,
-                        event.shell_session,
-                    ])
-                    .op(OP)?;
-            }
+            Self::insert_events(tx, now, events)?;
+            tx.prepare_cached(E2)
+                .and_then(|mut s| s.execute(params![picked_id]))
+                .op("counting a pick")?;
             Ok(())
         })
     }
 
-    pub(super) fn count_pick(&self, command_id: i64) -> Result<()> {
-        self.conn()
-            .prepare_cached(E2)
-            .and_then(|mut s| s.execute(params![command_id]))
-            .op("counting a pick")?;
+    fn insert_events(tx: &Transaction, now: i64, events: &[NewEvent]) -> Result<()> {
+        const OP: &str = "logging command events";
+        let mut statement = tx.prepare_cached(E1).op(OP)?;
+        for event in events {
+            let episode = event
+                .episode_queries
+                .map(|queries| serde_json::to_string(queries).expect("strings serialize"));
+            statement
+                .execute(params![
+                    now,
+                    event.action.as_sql(),
+                    event.command_id,
+                    event.query,
+                    event.rank,
+                    event.session_id,
+                    event.subsession_id as i64,
+                    episode,
+                    event.cwd,
+                    event.repo_root,
+                    event.shell_session,
+                ])
+                .op(OP)?;
+        }
         Ok(())
     }
 
+    /// How long this connection waits for another's write lock before a
+    /// statement fails with "database busy" (`busy_timeout`).
+    pub(super) fn set_busy_timeout(&self, wait: Duration) -> Result<()> {
+        self.conn()
+            .busy_timeout(wait)
+            .op("configuring the connection")
+    }
+
     /// Forget one command: a tombstone of its text's hash (so an import does
-    /// not restore it), then its events, runs, links and row (D1-D5).
-    pub(super) fn delete_command(&self, command_id: i64, text: &str, now: i64) -> Result<()> {
+    /// not restore it), then its events, runs, links and row (D1-D5), all
+    /// zeroed where they lay (D0). Then D6: the write-ahead log, which can
+    /// still hold older copies of the pages they were on, is checkpointed and
+    /// cut to zero bytes without waiting (section 10.5).
+    ///
+    /// `Err` only when the rows could not be deleted. A checkpoint that finds
+    /// another connection in the way, or fails, is [`LogBound::Busy`]: the
+    /// command is deleted, but its text can stay in `events.db-wal` (and in
+    /// the pages of `events.db` the log has not been copied over) until the
+    /// next checkpoint that empties it.
+    pub(super) fn delete_command(&self, command_id: i64, text: &str, now: i64) -> Result<LogBound> {
         const OP: &str = "deleting a command";
         self.transaction(|tx| {
             tx.prepare_cached(D1)
@@ -888,11 +937,15 @@ impl CmdStore {
                     .op(OP)?;
             }
             Ok(())
-        })
+        })?;
+        Ok(self.truncate_log_now().unwrap_or_else(|error| {
+            log::warn!("{}", error); // names the operation and code only
+            LogBound::Busy
+        }))
     }
 
-    /// Delete everything in the command tables (P1), then `VACUUM` so the
-    /// text is gone from the file too. Returns what there was.
+    /// Delete everything in the command tables but the tombstones (P1), then
+    /// `VACUUM` so the text is gone from the file too. Returns what there was.
     pub(super) fn purge(&self) -> Result<PurgeCounts> {
         let before = self.counts()?;
         self.conn()
@@ -1347,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_empties_every_command_table_and_reports_what_there_was() {
+    fn purge_empties_every_command_table_but_the_tombstones_and_reports_what_there_was() {
         let store = CmdStore::in_memory();
         record(&store, &hook_run("A", "s", 100, Some(0)));
         record(&store, &hook_run("A", "s", 101, Some(0)));
@@ -1365,10 +1418,12 @@ mod tests {
             "command_runs",
             "command_events",
             "command_imports",
-            "deleted_commands",
         ] {
             assert_eq!(table_rows(&store, table), 0, "{table} is empty");
         }
+        // The tombstone stays, so an import cannot bring B back.
+        assert!(store.is_tombstoned(privacy::fnv1a64("B")).unwrap());
+        assert_eq!(table_rows(&store, "deleted_commands"), 1);
     }
 
     const SENTINEL: &[u8] = b"SENTINEL_purge_5ca1ab1e";
@@ -1395,14 +1450,17 @@ mod tests {
     /// The files of the database (`events.db` and its `-wal`) that still hold
     /// the sentinel's bytes.
     fn files_holding_sentinel(dir: &Path) -> Vec<String> {
+        files_holding(dir, SENTINEL)
+    }
+
+    /// The files of the database (`events.db` and its `-wal`) whose raw bytes
+    /// contain `needle`.
+    fn files_holding(dir: &Path, needle: &[u8]) -> Vec<String> {
         ["events.db", "events.db-wal"]
             .into_iter()
             .filter(|name| {
-                std::fs::read(dir.join(name)).is_ok_and(|bytes| {
-                    bytes
-                        .windows(SENTINEL.len())
-                        .any(|window| window == SENTINEL)
-                })
+                std::fs::read(dir.join(name))
+                    .is_ok_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
             })
             .map(str::to_string)
             .collect()
@@ -1609,6 +1667,74 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    const MARKER: &str = "MARKER_delete_d31e7e";
+
+    /// A history recorded the way the hook records it, one connection per
+    /// run: a marked command run every fourth time among filler commands,
+    /// with a truncating close every tenth run, so copies of its pages are
+    /// in `events.db` as well as in `events.db-wal`. Returns the marked text.
+    fn marked_history(dir: &Path) -> String {
+        let marked = format!("echo {} --token", MARKER);
+        for i in 0..125 {
+            let text = match i % 4 {
+                0 => marked.clone(),
+                _ => format!("echo filler {i}"),
+            };
+            let limit = if i % 10 == 9 { 16 * 1024 } else { u64::MAX };
+            record_alone(dir, &text, 100 + i, Some(limit));
+        }
+        assert_eq!(
+            files_holding(dir, MARKER.as_bytes()),
+            ["events.db", "events.db-wal"],
+            "the text is in both files"
+        );
+        marked
+    }
+
+    #[test]
+    fn delete_command_leaves_no_command_text_on_disk() {
+        let dir = disk_dir("delete-disk");
+        let marked = marked_history(&dir);
+        let store = CmdStore::open(&dir).unwrap();
+        let id = command_id(&store, &marked).unwrap();
+
+        let log = store.delete_command(id, &marked, 500).unwrap();
+
+        assert_eq!(log, LogBound::Truncated);
+        assert_eq!(files_holding(&dir, MARKER.as_bytes()), Vec::<String>::new());
+        assert_eq!(table_rows(&store, "commands"), 93, "only it was deleted");
+        drop(store);
+        assert_eq!(files_holding(&dir, MARKER.as_bytes()), Vec::<String>::new());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_command_does_not_wait_for_a_reader_and_the_next_checkpoint_clears_the_text() {
+        let dir = disk_dir("delete-busy");
+        let marked = marked_history(&dir);
+        // Another process in the middle of a read holds the log's pages.
+        let other = Connection::open(Database::get_db_path(&dir)).unwrap();
+        other.execute_batch("BEGIN").unwrap();
+        let _: i64 = other
+            .query_row("SELECT COUNT(*) FROM command_runs", [], |row| row.get(0))
+            .unwrap();
+        let store = CmdStore::open(&dir).unwrap();
+        let id = command_id(&store, &marked).unwrap();
+
+        let started = std::time::Instant::now();
+        let log = store.delete_command(id, &marked, 500).unwrap();
+
+        assert_eq!(log, LogBound::Busy);
+        assert!(started.elapsed() < Duration::from_secs(1), "no wait");
+        assert_eq!(command_id(&store, &marked), None, "the rows are gone");
+        other.execute_batch("COMMIT").unwrap();
+        assert_eq!(store.truncate_log_now().unwrap(), LogBound::Truncated);
+        assert_eq!(files_holding(&dir, MARKER.as_bytes()), Vec::<String>::new());
+        drop(other);
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn the_log_a_recording_connection_keeps_is_private() {
         use std::os::unix::fs::PermissionsExt;
@@ -1705,7 +1831,7 @@ mod tests {
         let make = command_id(&store, "make").unwrap();
         let episode = vec!["m".to_string(), "ma".to_string()];
         store
-            .log_events(
+            .log_pick_events(
                 200,
                 &[NewEvent {
                     action: EventAction::Pick,
@@ -1719,9 +1845,9 @@ mod tests {
                     repo_root: None,
                     shell_session: Some("s"),
                 }],
+                make,
             )
             .unwrap();
-        store.count_pick(make).unwrap();
 
         let picks: Vec<(i64, String, i64, Vec<String>)> = store
             .picks_since(150)

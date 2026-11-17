@@ -555,27 +555,13 @@ fn shuffled_labels_change_which_rows_are_positive_but_not_how_many() {
     assert_ne!(real.model, shuffled.model);
 }
 
-// --- IT-N-01, IT-N-05, IT-N-06: end to end -----------------------------------------
+// --- IT-N-01, IT-N-06: end to end ---------------------------------------------------
 
-/// Size and mtime of every file under `dir`.
-fn snapshot(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
-    let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let meta = entry.metadata().unwrap();
-            files.push((entry.path(), meta.len(), meta.modified().unwrap()));
-        }
-    }
-    files.sort();
-    files
-}
+// IT-N-05 (the real data directory is never written) runs the built binary
+// with a scratch HOME: `tests/bench_data_dir.rs`.
 
 #[test]
-fn it_n_01_and_05_relevance_end_to_end_leaves_the_real_data_dir_alone() {
-    let real = crate::cli::get_default_data_dir().ok();
-    let real_existed = real.as_ref().map(|r| r.exists());
-    let before = real.as_deref().map(snapshot);
-
+fn it_n_01_relevance_end_to_end() {
     let dir = TempDir::new("bench-it-n-01");
     generate(&dir.0);
     let json_path = dir.0.join("out.json");
@@ -634,12 +620,6 @@ fn it_n_01_and_05_relevance_end_to_end_leaves_the_real_data_dir_alone() {
         strip_date(std::fs::read_to_string(&json_path).unwrap()),
         strip_date(std::fs::read_to_string(&second_path).unwrap())
     );
-
-    // IT-N-05: the real data directory is untouched.
-    if let Some(real) = real {
-        assert_eq!(Some(real.exists()), real_existed);
-        assert_eq!(Some(snapshot(&real)), before);
-    }
 }
 
 #[test]

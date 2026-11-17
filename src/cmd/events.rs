@@ -6,7 +6,7 @@
 //! `command_events` on the UI thread's own connection. A failure is logged
 //! and otherwise ignored: it never stops the pick (E-B-06).
 
-use super::store::{CmdStore, EventAction, NewEvent};
+use super::store::{CmdStore, EventAction, LogBound, NewEvent};
 use super::tuning::CMD_IMPRESSION_AGE_MS;
 use anyhow::Result;
 use rustc_hash::FxHashSet;
@@ -45,6 +45,14 @@ pub(super) struct CmdEvents {
     /// Every distinct query of this episode, in the order first seen.
     episode_queries: Vec<String>,
 }
+
+/// How long, in milliseconds, the UI thread's connection waits for another
+/// process's write lock before an event write fails (E-B-06). Enter writes
+/// once (`log_accept`), so the pick reaches stdout at most this much later
+/// than it would on an idle database (02 section 10). An `--import` or a
+/// purge's `VACUUM` can hold the lock for seconds; the default 5 s wait of
+/// `Database` would hold the shell's prompt that long, twice.
+pub(super) const CMD_EVENT_WAIT_MS: u64 = 100;
 
 fn now() -> i64 {
     jiff::Timestamp::now().as_second()
@@ -91,19 +99,30 @@ impl CmdEvents {
                 || current.created_at.elapsed() >= Duration::from_millis(CMD_IMPRESSION_AGE_MS))
     }
 
+    /// D6 once more, on this (the UI thread's) connection, at the exit of a
+    /// picker that deleted something: empty the write-ahead log without
+    /// waiting, in case the delete's own checkpoint found it busy
+    /// (01 section 10.5). A log still busy is only logged.
+    pub fn truncate_log(&self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        match store.truncate_log_now() {
+            Ok(LogBound::Truncated | LogBound::Within) => {}
+            Ok(LogBound::Busy) => log::warn!(
+                "another connection is using events.db-wal, so a deleted command's text \
+                 can stay in it until the next checkpoint"
+            ),
+            Err(error) => log::warn!("{}", error),
+        }
+    }
+
     /// Log `shown` as impressions of the current query, in one transaction.
     pub fn log_impressions(&mut self, shown: &[Shown]) -> Result<()> {
-        let Some(current) = self.current.as_mut() else {
-            return Ok(());
-        };
-        if shown.is_empty() {
+        if shown.is_empty() || !self.mark_shown(shown) {
             return Ok(());
         }
-        current.logged = true;
-        current
-            .logged_ids
-            .extend(shown.iter().map(|s| s.command_id));
-        let Some(store) = &self.store else {
+        let (Some(store), Some(current)) = (&self.store, &self.current) else {
             return Ok(());
         };
         let events: Vec<NewEvent> = shown
@@ -113,20 +132,36 @@ impl CmdEvents {
         store.log_events(now(), &events)
     }
 
-    /// Log the pick of `picked`: an impression first if it was never logged
-    /// under this query (the user scrolled to it afterwards), then the pick
-    /// with the episode's queries and the place, then the command's pick
-    /// count. Call `wants_impressions(true)` and `log_impressions` first.
+    /// Log the pick of `picked`, as [`CmdEvents::log_accept`] with no
+    /// impressions due. Call `wants_impressions(true)` and `log_impressions`
+    /// first. Tests only: the picker calls `log_accept`.
+    #[cfg(test)]
     pub fn log_pick(&mut self, picked: Shown) -> Result<()> {
+        self.log_accept(&[], picked)
+    }
+
+    /// Enter on `picked`: `shown` as impressions (empty when none are due;
+    /// see `wants_impressions(true)`), an impression of `picked` if it was
+    /// never logged under this query (the user scrolled to it afterwards),
+    /// the pick with the episode's queries and the place, and the command's
+    /// pick count, all in one transaction. The UI thread's connection waits
+    /// at most [`CMD_EVENT_WAIT_MS`] for another process's write lock, once.
+    pub fn log_accept(&mut self, shown: &[Shown], picked: Shown) -> Result<()> {
+        if !self.mark_shown(shown) {
+            return Ok(());
+        }
         let Some(current) = self.current.as_mut() else {
             return Ok(());
         };
         let unseen = current.logged_ids.insert(picked.command_id);
         let episode = std::mem::take(&mut self.episode_queries);
-        let Some(store) = &self.store else {
+        let (Some(store), Some(current)) = (&self.store, &self.current) else {
             return Ok(());
         };
-        let mut events = Vec::with_capacity(2);
+        let mut events: Vec<NewEvent> = shown
+            .iter()
+            .map(|s| impression(&self.session_id, current, *s))
+            .collect();
         if unseen {
             events.push(impression(&self.session_id, current, picked));
         }
@@ -142,8 +177,22 @@ impl CmdEvents {
             repo_root: self.place.repo_root.as_deref(),
             shell_session: self.place.shell_session.as_deref(),
         });
-        store.log_events(now(), &events)?;
-        store.count_pick(picked.command_id)
+        store.log_pick_events(now(), &events, picked.command_id)
+    }
+
+    /// Note `shown` as logged under the current query; `false` when there
+    /// is no current query (nothing can be logged).
+    fn mark_shown(&mut self, shown: &[Shown]) -> bool {
+        let Some(current) = self.current.as_mut() else {
+            return false;
+        };
+        if !shown.is_empty() {
+            current.logged = true;
+            current
+                .logged_ids
+                .extend(shown.iter().map(|s| s.command_id));
+        }
+        true
     }
 }
 
@@ -242,9 +291,9 @@ mod tests {
         events.log_impressions(&shown).unwrap();
         events.new_subsession(3, "gi".to_string());
         assert!(events.wants_impressions(true));
-        events.log_impressions(&shown).unwrap();
-        // The pick of rank 2 was seen under "gi": no extra impression.
-        events.log_pick(shown[1]).unwrap();
+        // Enter: the forced impressions and the pick in one transaction. The
+        // pick of rank 2 is among them: no extra impression.
+        events.log_accept(&shown, shown[1]).unwrap();
         assert!(
             events.episode_queries.is_empty(),
             "the episode ends with the pick"
@@ -276,6 +325,48 @@ mod tests {
             ["1"]
         );
         assert_eq!(table_rows(store, "command_events"), 7);
+    }
+
+    #[test]
+    fn e_b_06_a_pick_waits_for_a_held_write_lock_only_briefly() {
+        let dir =
+            std::env::temp_dir().join(format!("psychic-cmd-events-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = CmdStore::open(&dir).unwrap();
+        store
+            .set_busy_timeout(Duration::from_millis(CMD_EVENT_WAIT_MS))
+            .unwrap();
+        let mut events = CmdEvents::new("tui".to_string(), place(), Some(store));
+        events.new_subsession(2, "g".to_string());
+        // Another process (an import, a purge's VACUUM) holds the write lock.
+        let other = rusqlite::Connection::open(crate::db::Database::get_db_path(&dir)).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = Instant::now();
+        let shown = [Shown {
+            command_id: 1,
+            rank: 1,
+        }];
+        let result = events.log_accept(&shown, shown[0]);
+
+        let waited = started.elapsed();
+        assert!(result.is_err(), "busy");
+        assert!(
+            waited >= Duration::from_millis(CMD_EVENT_WAIT_MS / 2),
+            "{waited:?}"
+        );
+        assert!(
+            waited < Duration::from_millis(3 * CMD_EVENT_WAIT_MS),
+            "{waited:?}"
+        );
+        other.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            table_rows(events.store.as_ref().unwrap(), "command_events"),
+            0
+        );
+        drop(other);
+        drop(events);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

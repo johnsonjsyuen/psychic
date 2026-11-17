@@ -33,13 +33,13 @@ this phase is built to the design in section 12 so that they pass there.
 
 ## 2. Files touched
 
-New files: `src/cmd/{index,rank,worker,fuzzy,events,keys,app,render}.rs`,
+New files: `src/cmd/{index,rank,worker,fuzzy,events,keys,app,render,terminal}.rs`,
 `tests/picker.rs`. Extended: `src/cmd/mod.rs` (the no-action branch of
 `run_history`), `src/cmd/tuning.rs` (section 3), `src/cmd/store.rs` (R1 split
 by id and the start-up reader methods, [01 section 6.5](01-record.md#65-cmdstore-methods-and-row-types)),
 `tests/support/mod.rs` (the scratch home and shell set-up that
 `tests/shell_hooks.rs` had, so `tests/picker.rs` drives the same shells;
-`Pty::spawn_with_stdout`, `wait_quiet`, `wait_for`).
+`Pty::spawn_with_stdout`, `wait_quiet`, `wait_for`, `pid`, `is_cooked`).
 
 | Upstream file | Exact edit |
 |---|---|
@@ -108,7 +108,8 @@ loads while the terminal is being set up):
 2. `worker::spawn(data_dir, LoadParams { now, cwd, repo_root, shell_session }, event_tx.clone())`.
 3. Send `CmdRequest::UpdateQuery { query: args.query, query_id: 1, scope: Scope::All }`.
 4. `tty_input::attach_stdin_to_terminal()`; `tty_input::spawn(event_tx.clone())`.
-5. Open `/dev/tty` read+write, `enable_raw_mode`, `EnterAlternateScreen`,
+5. `terminal::restore_on_panic()` and `TerminationSignals::watch` (both
+   below), then `PickerTerminal::enter()`: open `/dev/tty` read+write, `enable_raw_mode`, `EnterAlternateScreen`,
    `EnableMouseCapture`, `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`,
    `Terminal::new(CrosstermBackend::new(BufWriter::with_capacity(64 KiB, tty)))` - the sequence of
    [src/main.rs:765-781](../../src/main.rs), so `input::leave_tui` undoes it exactly.
@@ -116,14 +117,32 @@ loads while the terminal is being set up):
    `draw`, so a frame is one `write` instead of one per escape sequence.
    Unbuffered, a redraw of the list took 5.6 ms p50 of syscalls on a pty
    (the render itself 0.2 ms); buffered 0.8 ms.
-6. Open the UI thread's own `CmdStore` for event logging; spawn the tick thread.
+   From here every way out gives the terminal back exactly once (a
+   process-wide flag says whether it is still set up; restoring twice would
+   pop the terminal's keyboard-flag stack twice):
+
+   | Way out | Restored by |
+   |---|---|
+   | Enter, Esc, an `Err` from the loop | `PickerTerminal::leave` (step 8) |
+   | An early `?`, or a panic unwinding through `run` | `Drop` of `PickerTerminal` (`input::leave_tui`) |
+   | A panic on the UI thread | The panic hook of `restore_on_panic`, installed once per process: on the UI thread only (a worker panic is E-B-04), it writes `input::leave_tui`'s sequence to a fresh `/dev/tty` handle and leaves raw mode, then calls the previous hook, so the message prints on the main screen in cooked mode (E-B-20) |
+   | SIGTERM, SIGHUP, SIGINT | `TerminationSignals` (signal-hook's `flag` and `low_level::pipe`, already a dependency): the handler sets a flag and writes a byte; a thread sends `CmdEvent::Terminate(signal)`; the loop returns, step 8 restores, prints nothing and re-raises the signal with its default action (`emulate_default_handler`), so the shell sees it killed. A second signal of the same kind, or any after `TerminationSignals` is dropped, takes the default action at once (E-B-21) |
+
+   `PSYCHIC_HISTORY_TEST_PANIC` set in the environment makes the picker
+   panic in its first draw; it exists for E-B-20's test.
+6. Open the UI thread's own `CmdStore` for event logging, with `busy_timeout = CMD_EVENT_WAIT_MS` (section 10); spawn the tick thread.
 7. Event loop (section 8.2).
-8. On exit: `input.shutdown()`, `input::leave_tui(&mut terminal)`, print the
-   pick if there is one (and flush); then send `CmdRequest::Shutdown` and join
+8. On exit: `input.shutdown()`, `PickerTerminal::leave()`; on `Ended::Signal`, die of
+   the signal (above); else print the pick if there is one (and flush); then send `CmdRequest::Shutdown` and join
    the worker only if it has already finished. The worker may be busy (a load,
    a `Delete` waiting on another process's lock for up to `busy_timeout`); the
    terminal and the shell must not wait for it, and the process exits next.
-   (The error paths of steps 4-5 still stop and join it.)
+   (The error paths of steps 4-5 still stop and join it.) If a `Delete` was
+   sent this session (`deleted_any`), `events.truncate_log()` then runs D6 once
+   more on the UI thread's connection, without waiting: the write-ahead log is
+   emptied of the deleted text if the worker's own D6 found it busy
+   ([01 section 10.5](01-record.md#105-delete-and-purge)); still busy is a
+   `log::warn!`.
 
 ## 5. `CommandIndex`
 
@@ -427,7 +446,7 @@ space is warmed on every rayon thread at start, section 6.2.)
 | `UpdateQuery` | Set `current_query`, `current_scope`, `current_query_id`; `filter`, then `rank::rank_commands` (section 7) with `head = CMD_PAGE_ROWS`; keep the `CommandRanking` as `current` | `QueryUpdated` (echoing `query`) with rows `0..CMD_PAGE_ROWS`; then the TIMING line (6.5) |
 | `GetRows` | Ignore unless `query_id == current_query_id`. If the page reaches past `current.sorted`, `current.sort_rest(index)` first (once per query, off the keystroke path; see the empty-query cache in 6.3) | `Rows` with rows `start..start + CMD_PAGE_ROWS` (clamped) |
 | `Details` | R9 and R10 | `Details` |
-| `Delete` | `store.delete_command(id, text, now)`; `index.remove(idx)`; clear the trail; re-run `current_query`/`current_scope` under the given `query_id`. On a database error: `DeleteFailed` first, the index untouched (E-B-07) | `QueryUpdated` |
+| `Delete` | `store.delete_command(id, text, now)` (D1-D6 of 01 section 6.4; a busy D6 is not a failure); `index.remove(idx)`; clear the trail; re-run `current_query`/`current_scope` under the given `query_id`. On a database error: `DeleteFailed` first, the index untouched (E-B-07) | `QueryUpdated` |
 | `Shutdown` | Return from the thread | - |
 
 Building a `CmdRow` from a `CommandScore` clones the `Arc<str>` (no text copy),
@@ -620,6 +639,7 @@ pub(super) struct CmdApp {
     pub next_query_id: u64,              // starts at 2 (1 is the initial query)
     pub rows_requested_to: usize,        // highest `start` already asked for with GetRows
     pub confirm_delete: Option<i64>,     // command_id awaiting the one-key confirm
+    pub deleted_any: bool,               // a Delete was sent: D6 again at exit (section 4 step 8)
     pub help_visible: bool, pub debug_visible: bool,
     pub details: FxHashMap<i64, CmdDetails>, pub details_requested: FxHashSet<i64>,
     pub list_clock: i64,                 // "now" for time-ago; steps once a minute on Tick
@@ -797,7 +817,9 @@ impl CmdEvents {
     pub fn new_subsession(&mut self, query_id: u64, query: String);
     pub fn wants_impressions(&mut self, force: bool) -> bool;
     pub fn log_impressions(&mut self, shown: &[Shown]) -> anyhow::Result<()>;   // Shown { command_id: i64, rank: usize }
-    pub fn log_pick(&mut self, picked: Shown) -> anyhow::Result<()>;
+    pub fn log_accept(&mut self, shown: &[Shown], picked: Shown) -> anyhow::Result<()>;  // Enter: forced impressions + pick + E2, one transaction
+    #[cfg(test)] pub fn log_pick(&mut self, picked: Shown) -> anyhow::Result<()>;      // log_accept(&[], picked)
+    pub fn truncate_log(&self);   // D6 at exit after a delete (section 4 step 8); busy or failure is logged only
 }
 // `store` is `Option<CmdStore>`: `None` when the UI thread could not open it (E-B-19); every method is then a no-op.
 ```
@@ -808,7 +830,8 @@ impl CmdEvents {
 | `wants_impressions(force)` | Push the subsession's query into `episode_queries` if absent (always). Return `!logged && (force \|\| created_at.elapsed() >= CMD_IMPRESSION_AGE_MS)` - the logic of [src/analytics.rs:94-111](../../src/analytics.rs) |
 | Impressions | The rows on screen: ranks `scroll + 1 ..= scroll + visible_rows` that exist. One transaction, one E1 per row with `action = 'impression'`, `rank`, `query`, `session_id`, `subsession_id`; `episode_queries`, `cwd`, `repo_root`, `shell_session` NULL. Then `logged = true`. Nothing is logged before the first draw (`visible_rows == 0`) |
 | When checked | Top of every loop iteration with `force = false` (so within one tick, `CMD_TICK_MS`, of the query settling); with `force = true` immediately before a pick |
-| Pick | After the forced impressions: if the picked `command_id` is not in the current subsession's `logged_ids` (the user scrolled after the impressions were logged), first one more E1 `impression` for it (same query, its rank), so every pick has a label-1 impression. Then one E1 with `action = 'pick'`, the row's `rank`, the query, `episode_queries` = JSON array of `episode_queries`, and `cwd`, `repo_root`, `shell_session`; then E2. Then `episode_queries.clear()` |
+| Pick | `log_accept(shown, picked)`, one transaction (`CmdStore::log_pick_events`): the forced impressions (`shown`, empty when `wants_impressions(true)` says none are due); if the picked `command_id` is not in the current subsession's `logged_ids` (the user scrolled after the impressions were logged), one more E1 `impression` for it (same query, its rank), so every pick has a label-1 impression. Then one E1 with `action = 'pick'`, the row's `rank`, the query, `episode_queries` = JSON array of `episode_queries`, and `cwd`, `repo_root`, `shell_session`; then E2. Then `episode_queries.clear()` |
+| Waiting for the lock | The UI thread's connection has `busy_timeout = CMD_EVENT_WAIT_MS` (100 ms, `pub(super) const` in `events.rs`), not `Database`'s 5 s. Another process can hold the write lock for seconds (an `--import`'s per-file transaction, a purge's `VACUUM`). Enter writes once, so after Enter the pick reaches stdout at most about 100 ms later than on an idle database; under contention the episode's rows are lost and logged (E-B-06), never shown. An impression check mid-session can hold the UI for up to the same 100 ms |
 | Cancel | Nothing more is written; the impressions already logged stay and train nothing (no positive) |
 | Failure | Section 15, E-B-06: logged, never shown, never blocks the pick |
 
@@ -957,7 +980,7 @@ Targets B1-B3, B5, B10. The decisions that make them reachable:
 
 | Decision | Detail |
 |---|---|
-| No SQL per keystroke | Everything a query needs is in `CommandIndex`; the only SQL after start-up is `Details` (off the query path), event logging (UI thread, not in `draw`) and `Delete` |
+| No SQL per keystroke | Everything a query needs is in `CommandIndex`; the only SQL after start-up is `Details` (off the query path), event logging (UI thread, not in `draw`, waiting at most `CMD_EVENT_WAIT_MS` for a lock, section 10) and `Delete` |
 | Bounded start-up SQL | Exactly R1-R8, one full read (R1), the rest index-covered and proportional to one directory, one repo, 30 days or one session |
 | Start-up reads side by side | R1 split by id over `CMD_LOAD_READERS` connections that also build the entries, R2-R8 on one more, each memory-mapped (section 5.2); the rayon pool starts and warms meanwhile (section 6.2) |
 | Work in parallel with terminal set-up | The worker is spawned before the terminal is touched (section 4, steps 2-5) |
@@ -1069,6 +1092,9 @@ a 200-key series), the heuristic + sort its 1.5 ms at p50 but not at p95
 | Add rows to `keymap::KEYMAP` or variants to `keymap::Action` | `CMD_KEYMAP` (ADR-3) | `test_every_action_is_bound` and the file help screen |
 | Run SQL, `stat`, `Timestamp::now()` or `std::env::var` inside `render::draw` | Read from `&CmdApp`; fetch on the worker; step `list_clock` on Tick | B5 |
 | Query SQLite per keystroke | `CommandIndex` | B1 |
+| Restore the terminal only on the normal return, or in more than one place without the shared flag | `PickerTerminal` (guard), `restore_on_panic`, `TerminationSignals` (section 4 step 5) | A panic or SIGTERM left the shell in raw mode on the alternate screen with mouse capture on; a second restore pops a keyboard-flag entry that is not the picker's |
+| Unregister the signal handlers when done, or do work in them | Arm the flags (the next signal takes the default action); handlers only set a flag and write a byte | signal-hook cannot put the default disposition back: an unregistered SIGTERM would be ignored |
+| Write events on the UI thread with `Database`'s 5 s `busy_timeout`, or in several transactions on Enter | `busy_timeout = CMD_EVENT_WAIT_MS` on the UI connection; `log_accept`, one transaction | Another process's long write (an import, a `VACUUM`) held Enter for up to 5 s per write before the pick reached the shell |
 | Sort every candidate to show one page, or move 112-byte scores while sorting | `rank_commands(.., head)`: select and sort 32-byte keys; `sort_rest` when a page needs it | Most of an empty query's cost at 50,000 commands |
 | Share one `CmdStore` between threads | One connection per thread (`CmdStore::open_file`) | A rusqlite `Connection` is `Send`, not `Sync` |
 | Create a `SkimMatcherV2` per query or per candidate | One on the worker, shared by reference | Allocation per call; cold scratch space on every rayon thread |
@@ -1104,7 +1130,7 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 | TC-B-09 | supersession | Queue `UpdateQuery(1)`, `UpdateQuery(2)`, `Details`, `UpdateQuery(3)`, `UpdateQuery(4)` drained in that order | Processed: `UpdateQuery(2)`, `Details`, `UpdateQuery(4)` | A single request passes through unchanged; `Details(1)`, `Details(2)`, `GetRows`, `Details(3)` -> `GetRows`, `Details(3)` |
 | TC-B-10 | stale responses | `shown_query_id = 5`; deliver `QueryUpdated(4)`, then `(6)`; `Rows(5, ..)` | 4 ignored, 6 applied (selection reset to 0), `Rows(5)` ignored | `Rows` with `start != rows.len()` ignored |
 | TC-B-11 | `CMD_KEYMAP` | Iterate `CmdAction` | Every action has exactly one row; no trigger appears in two rows; every description is non-empty | `lookup(Char('x'), CONTROL)` -> `DeleteSelected`; `lookup(Char('x'), NONE)` -> `AppendToQuery`; `lookup(Char('q'), CONTROL)` -> `None` |
-| TC-B-12 | modal keys | `confirm_delete = Some(7)`; press `n`, then set again and press `y` | First: no request, cleared. Second: one `Delete { command_id: 7, .. }` | `help_visible` + Esc -> help closed, picker still running; with a confirmation up, the wheel moves nothing and an accepted `QueryUpdated` clears it |
+| TC-B-12 | modal keys | `confirm_delete = Some(7)`; press `n`, then set again and press `y` | First: no request, cleared, `deleted_any` false. Second: one `Delete { command_id: 7, .. }`, `deleted_any` true | `help_visible` + Esc -> help closed, picker still running; with a confirmation up, the wheel moves nothing and an accepted `QueryUpdated` clears it |
 | TC-B-13 | row text | `"echo a\nb\tc\x1b[31m"`, width 40 | `echo a↵ b    c·[31m` | Width 6 -> `echo …`; a CJK command truncates on a character boundary |
 | TC-B-14 | impressions | New subsession; `wants_impressions(false)` at once, then after `created_at` is aged 200 ms, then again after logging | `false`, `true`, `false` | `force = true` at once -> `true`; `episode_queries` gains the query on the first call even when it returns `false` |
 | TC-B-15 | `CommandIndex` windows | `run_times = [now-4000, now-3000, now-10]` | `runs_in_window(.., 3600) = 2`, `(.., 60) = 1`, `(.., 5) = 0` | A run exactly at `now - secs` is excluded; at `now` included |
@@ -1120,6 +1146,7 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 | TC-B-25 | seeds in slices | `2 * SEED_SLICE + 100` commands | One idle step tests one slice; a query between slices is answered in full and leaves the seed where it was; three steps finish it, equal to a fresh filter; a delete drops the seed in progress | - |
 | TC-B-26 | a scope's `recency_rank` | Trained fixture, scope Directory, queries `""`, `g`, `m`, `c`, `ls` | Every model-scored row's `recency_rank` counts newer commands among the `All` matches; at least one differs from a count among the scope's | - |
 | TC-B-27 | seeded and unseeded rankings | 2,005 random commands; queries `g` ... `a b`, with and without a stub model | Candidates and every score bit-equal | - |
+| TC-B-28 | event writes under a held lock | `CmdEvents` on a file store with `busy_timeout = CMD_EVENT_WAIT_MS`; another connection in `BEGIN IMMEDIATE`; `log_accept` | `Err` after between 50 and 300 ms; nothing written | - |
 
 ### 14.2 Integration tests
 
@@ -1127,10 +1154,13 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 |---|---|---|---|---|
 | IT-B-01 | `CommandIndex::load` | Temp data dir; `record_run` 6 runs over 3 commands, 2 dirs, 1 repo, 2 sessions; 1 pick event | `entries.len() == 3`; `dir_stat`, `runs_in_repo`, `follower_runs`, `session_commands`, `picks_in_window` equal hand-written expected values; `ctx.prev_templates` lists the session's last 3 templates newest first | `remove_dir_all` |
 | IT-B-02 | Worker round trip | As IT-B-01; `worker::spawn`; send `UpdateQuery("", 1, All)`, `UpdateQuery("g", 2, All)`, `Details`, `Delete`, `Shutdown` | `Loaded`, then `QueryUpdated` per accepted query with the expected texts in order; `Details` has the expected dirs; after `Delete` the command is absent from the rows and from the three tables; the thread joins | `remove_dir_all` |
-| IT-B-03 | Pick logging | `CmdEvents` on a temp store; subsessions `g`, `gi`; impressions for 3 rows; `log_pick` rank 2 | `command_events`: 3 impressions with ranks 1-3 and subsession ids, 1 pick with `episode_queries = ["g","gi"]`, `cwd`, `repo_root`, `shell_session` set; `commands.pick_count == 1` | `remove_dir_all` |
+| IT-B-03 | Pick logging | `CmdEvents` on a temp store; subsessions `g` (impressions for 3 rows), `gi` (`log_accept` of the same 3 rows and the pick of rank 2) | `command_events`: 3 impressions with ranks 1-3 and subsession ids, 1 pick with `episode_queries = ["g","gi"]`, `cwd`, `repo_root`, `shell_session` set; `commands.pick_count == 1` | `remove_dir_all` |
 | IT-B-04 | Render | `ratatui::backend::TestBackend` 140x30 and 100x30 with a `CmdApp` holding 3 rows (one failed, one run here, one multi-line) | 140 wide: list and preview side by side; 100 wide: stacked; the failed row has `!`, the here row `*`, the multi-line row `↵`; the preview shows `Runs` and `Last exit` lines; debug on shows `model: none`; help overlay lists 12 key rows | none |
 | IT-B-05 | Picker end to end (`tests/picker.rs`, pty helper `tests/support/mod.rs`) | Temp data dir with `echo one`, `echo two` (newer); spawn `psychic --data-dir T history --cwd /tmp` on a pty with stdout redirected to a file | Environment includes `PSYCHIC_NO_RETRAIN=1`. Before every key, wait until the pty has been quiet for 300 ms (the list is drawn). Send Enter: exit 0, file is `echo two\n`. Second run, send `one`, wait for quiet again, then Enter: `echo one\n`. Third run, send Esc: exit 0, file empty. `app.log` in T contains `cmd_first_full_render` and no `echo` | `remove_dir_all` |
 | IT-B-06 | Widget blocks ship | Output of `psychic zsh`, `psychic bash`, `psychic fish` | Each contains `__psychic_history_widget`, `PSYCHIC_NO_CTRL_R`, `__psychic_history_enabled`, and `--query=`; none contains `--query "` | none |
+| IT-B-12 | Enter under another process's write lock (`tests/picker.rs`) | `echo locked-one` recorded; the test holds `BEGIN IMMEDIATE` on a second connection for the picker's whole run | Enter to exit under 1 s (before: `busy_timeout` 5 s per write); stdout `echo locked-one\n`, exit 0; no pick row; `app.log` has `command event logging failed: starting a transaction failed: database busy` | Scratch dropped |
+| IT-B-13 | A panic gives the terminal back (`tests/picker.rs`, E-B-20) | The picker on a pty with `PSYCHIC_HISTORY_TEST_PANIC=1` | Exit 101; after the last `\x1b[?1049h`, in order: `\x1b[<1u`, `\x1b[?1000l`, `\x1b[?1049l`, `\x1b[?25h`; the panic message after them; the pty's slave termios has `ICANON` and `ECHO`; stdout empty. Fails without the hook (the guard alone restores after the message) | Scratch dropped |
+| IT-B-14 | SIGTERM and SIGHUP give the terminal back (`tests/picker.rs`, E-B-21) | The picker on a pty, settled; `kill(pid, SIGTERM)`, then a fresh one with `SIGHUP` | Killed by that signal; the restore sequences and cooked termios as IT-B-13; stdout empty. Fails without `TerminationSignals` | Scratch dropped |
 | IT-B-07 | No query text in logs | IT-B-05's second run with the query `SENTINELq` | `app.log` does not contain `SENTINELq` | `remove_dir_all` |
 | IT-B-08 | Ctrl-R in each shell (`tests/picker.rs`) | zsh, bash and fish on a pty with the script, recording on by the marker; `echo alpha`, `echo beta` recorded in session `seed` | Type `beta`, Ctrl-R, Enter (picker), Enter (shell): `echo beta` runs, is recorded once in the shell's session, and the one pick event has `query = beta`, the shell's session and cwd, and a timestamp 0-300 s before that run (the link `follows_pick` of [03 section 5.1](03-learn.md#51-inputs-and-the-replayer) makes, `CMD_PICK_RUN_SECS`). Then `echo kept`, Ctrl-R, Esc, Enter: `echo kept` runs as typed and no second pick is logged | Scratch dropped |
 | IT-B-09 | Binding guards | Each shell: recording on; `PSYCHIC_NO_CTRL_R=1`; recording off; the user's own Ctrl-R bound before the script (bash: a readline function, and `bind -x` as fzf does; fish: both modes, and insert mode only) | The widget is bound in the first case only; fish with only insert mode taken binds the default mode and leaves insert alone | Scratch dropped |
@@ -1149,8 +1179,8 @@ and `tests/picker.rs` ([01 section 15.3](01-record.md#153-shell-level-tests-test
 | E-B-03 | Terminal set-up fails midway | `Err` after raw mode is on | `input::leave_tui` is called before returning the `Err` | As E-B-02 | stderr via `main` |
 | E-B-04 | Worker thread panics | `event_rx`/`worker_tx` send fails, or `JoinHandle::join` is `Err` | UI sets status `History worker stopped`; list frozen; keys still work | Enter prints the selected row from `rows` | `log::error!` |
 | E-B-05 | Fuzzy match yields nothing | `total_matched == 0` | List shows `No match.` | Enter exits with nothing | None |
-| E-B-06 | Event logging fails (database busy/locked) | `Err` from `log_impressions`/`log_pick` | Ignored for the user: the pick is still printed | That episode is not logged | `log::error!("command event logging failed: <code>")` |
-| E-B-07 | `Delete` fails in the database | `Err` from `delete_command` | Worker does not call `index.remove`; sends `CmdResponse::DeleteFailed`, then answers with the unchanged list | UI status `Could not delete` | `log::error!` |
+| E-B-06 | Event logging fails (database busy/locked: another process held the write lock for more than `CMD_EVENT_WAIT_MS`) | `Err` from `log_impressions`/`log_accept` | Ignored for the user: the pick is still printed, at most `CMD_EVENT_WAIT_MS` later | That episode (impressions, pick, pick count) is not logged | `log::error!("command event logging failed: <operation> failed: database busy")` |
+| E-B-07 | `Delete` fails in the database | `Err` from `delete_command` (D1-D5; a busy D6 is E-R-25 of 01, not this) | Worker does not call `index.remove`; sends `CmdResponse::DeleteFailed`, then answers with the unchanged list | UI status `Could not delete` | `log::error!` |
 | E-B-08 | `Details` query fails | `Err` | `Details` with empty vectors | Preview shows no directory lines | `log::warn!` |
 | E-B-09 | Stale `QueryUpdated`/`Rows` | id tests of section 8.2 | Dropped | - | None |
 | E-B-10 | `--session` given but that session has no rows | R5 returns nothing | `prev_templates` all `None`; R6 skipped; `Session` scope shows `No match.` | Sequence terms are 0 | None |
@@ -1158,7 +1188,9 @@ and `tests/picker.rs` ([01 section 15.3](01-record.md#153-shell-level-tests-test
 | E-B-12 | Terminal narrower than 20 columns or shorter than 5 rows | `f.area()` | Draw only the input box | - | None |
 | E-B-13 | Command text contains control or escape characters | - | `path_display::printable` in rows and preview | - | None |
 | E-B-14 | Query contains characters invalid for the matcher (any Unicode) | - | Passed through; the filter keeps or drops the command (section 6.3) | - | None |
-| E-B-15 | The picker binary fails or is killed under the widget | Non-zero exit / empty stdout | zsh, fish: buffer untouched, prompt repainted. bash: `\|\| return` leaves `READLINE_LINE` untouched | - | None |
+| E-B-15 | The picker binary fails or is killed under the widget | Non-zero exit / empty stdout | zsh, fish: buffer untouched, prompt repainted. bash: `\|\| return` leaves `READLINE_LINE` untouched. The terminal itself is given back by the picker (E-B-20, E-B-21), except on SIGKILL, which nothing can catch | - | None |
+| E-B-20 | The UI thread panics | Panic hook (UI thread only) | The hook restores the terminal (`leave_tui`'s sequence, raw mode off), then the default hook prints the message; unwinding drops `PickerTerminal`, which does nothing more | Exit 101, nothing on stdout; widget as E-B-15 | The panic message on stderr |
+| E-B-21 | SIGTERM, SIGHUP or SIGINT while the picker runs | `TerminationSignals` | `CmdEvent::Terminate`: the loop ends, the terminal is restored, nothing is printed, the process dies of the same signal | A second signal kills at once (the default action) | `log::info!` with the signal number |
 | E-B-16 | `psychic` not on PATH under the widget | zsh, bash: shell error "command not found" on the terminal. fish: `command -q` fails | Buffer untouched; fish prints nothing | - | None |
 | E-B-17 | Recording is off and nothing is recorded | `total_commands == 0 && !recording_on` | The two-line hint of section 8.3 | Esc/Enter exit 0 | None |
 | E-B-18 | `tty_input::spawn` fails | `Err` | As E-B-02 | - | stderr via `main` |

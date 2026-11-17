@@ -397,13 +397,15 @@ fixes the join order (SQLite never reorders a `CROSS JOIN`).
 | ID | Statement | Used by |
 |---|---|---|
 | E1 | `INSERT INTO command_events (timestamp, action, command_id, query, rank, session_id, subsession_id, episode_queries, cwd, repo_root, shell_session) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)` | [02 section 10](02-browse.md#10-event-logging) |
-| E2 | `UPDATE commands SET pick_count = pick_count + 1 WHERE id = ?1` | pick |
+| E2 | `UPDATE commands SET pick_count = pick_count + 1 WHERE id = ?1` | pick, in the same transaction as the pick's E1 rows |
+| D0 | `PRAGMA secure_delete = ON`, on every connection `CmdStore` opens (`open`, `open_file`, `in_memory`), before any other statement | every connection to the command tables (section 10.5) |
 | D1 | `INSERT OR REPLACE INTO deleted_commands (text_hash, deleted_at) VALUES (?1, ?2)` | delete one |
 | D2 | `DELETE FROM command_events WHERE command_id = ?1` (plan: `idx_command_events_command`) | delete one |
 | D3 | `DELETE FROM command_runs WHERE command_id = ?1` (plan: `idx_command_runs_command`) | delete one |
 | D4 | `UPDATE command_runs SET prev_command_id = NULL WHERE prev_command_id = ?1` (plan: `idx_command_runs_prev`) | delete one |
 | D5 | `DELETE FROM commands WHERE id = ?1` | delete one |
-| P1 | `PRAGMA secure_delete = ON`; then in one transaction `DELETE FROM command_events; DELETE FROM command_runs; DELETE FROM commands; DELETE FROM command_imports; DELETE FROM deleted_commands;`; then `VACUUM`; then `PRAGMA wal_checkpoint(TRUNCATE)`, whose first column (busy) must be 0 (section 10.5) | purge |
+| D6 | W1 (`busy_timeout` 0, `PRAGMA wal_checkpoint(TRUNCATE)`), then the connection's `busy_timeout` put back; busy (first column) 1 is not an error | delete one, after D1-D5 commit; again at the exit of a picker that deleted (section 10.5) |
+| P1 | `PRAGMA secure_delete = ON`; then in one transaction `DELETE FROM command_events; DELETE FROM command_runs; DELETE FROM commands; DELETE FROM command_imports;` (`deleted_commands` is kept, section 10.5); then `VACUUM`; then `PRAGMA wal_checkpoint(TRUNCATE)`, whose first column (busy) must be 0 (section 10.5) | purge |
 | W1 | `PRAGMA busy_timeout` set to 0 on this connection; then `PRAGMA wal_checkpoint(TRUNCATE)`; busy (first column) 1 is not an error (section 9.1) | `track-command`, once `events.db-wal` is over `CMD_WAL_TRUNCATE_BYTES` |
 | I1 | `SELECT MIN(started_at) FROM command_runs WHERE source = 'hook'` (plan: `idx_command_runs_hook`) | backfill |
 | I2 | `SELECT 1 FROM command_imports WHERE source_key = ?1` / `INSERT OR REPLACE INTO command_imports (source_key, imported_at, runs) VALUES (?1, ?2, ?3)` | backfill |
@@ -415,7 +417,7 @@ fixes the join order (SQLite never reorders a `CROSS JOIN`).
 | T3 | `SELECT id, command_id, started_at, cwd, repo_root, exit_code, shell_session, prev_command_id, source FROM command_runs ORDER BY started_at, id` | training, benchmark |
 | T4 | `SELECT id, timestamp, action, command_id, query, rank, session_id, subsession_id, episode_queries, cwd, repo_root, shell_session FROM command_events ORDER BY id` | training |
 
-D1-D5 run in one transaction, in that order (`CmdStore::delete_command(id, text, now)`).
+D1-D5 run in one transaction, in that order, then D6 (`CmdStore::delete_command(id, text, now)`).
 T2-T4 carry no plan requirement: they are full reads, off the interactive path.
 
 ### 6.5 `CmdStore` methods and row types
@@ -440,9 +442,11 @@ Row structs are plain `pub(super)` structs in `store.rs` with the listed fields.
 | `command_dirs(command_id: i64)` | R9 | `Vec<DirUse { dir: String, runs: u32, last_run_at: i64 }>` |
 | `command_predecessors(command_id: i64)` | R10 | `Vec<PrecededBy { template: String, runs: u32 }>` |
 | `log_events(now: i64, events: &[NewEvent])` (one transaction) | E1 | `()`; `NewEvent` has one field per E1 parameter except `timestamp`, which the method takes as `now: i64`; `action` is `enum EventAction { Impression, Pick }`, `episode_queries` is `Option<&[String]>` and is written as a JSON array |
-| `count_pick(command_id: i64)` | E2 | `()` |
-| `delete_command(command_id: i64, text: &str, now: i64)` | D1-D5 | `()` |
-| `open_for_recording(data_dir)`, `close_recording(self, limit: u64)` | W1 | `Self`; `LogBound` (section 6). The log's length is one `fs::metadata` of `events.db-wal` (missing = 0) |
+| `log_pick_events(now: i64, events: &[NewEvent], picked_id: i64)` (one transaction) | E1, E2 | `()`: the events, then E2 for `picked_id`, so a pick takes the write lock once |
+| `set_busy_timeout(wait: Duration)` | - | `()`: this connection's `busy_timeout` (the picker's UI thread sets `CMD_EVENT_WAIT_MS`, [02 section 10](02-browse.md#10-event-logging)) |
+| `delete_command(command_id: i64, text: &str, now: i64)` | D1-D6 | `LogBound`: `Truncated`, or `Busy` when D6 found another connection in the way or failed (the rows are deleted either way; `Err` only when D1-D5 failed) |
+| `truncate_log_now()` | W1/D6 | `LogBound` (`Truncated` or `Busy`); the connection's `busy_timeout` is restored |
+| `open_for_recording(data_dir)`, `close_recording(self, limit: u64)` | W1 | `Self`; `LogBound` (section 6), through `truncate_log_now` once the log is over `limit`. The log's length is one `fs::metadata` of `events.db-wal` (missing = 0) |
 | `purge()` | P1 | `PurgeCounts { commands: u64, runs: u64, log_cleared: bool }` (counts taken before deleting; `log_cleared` = the checkpoint's busy column was 0) |
 | `first_hook_run()` | I1 | `Option<i64>` |
 | `import_done(source_key: &str)`, `mark_import(source_key: &str, now: i64, runs: u64)` | I2 | `bool`, `()` |
@@ -578,6 +582,13 @@ It does not check the opt-in marker: being called is the hook's decision
 propagate through `main` as `Err`; no error message contains the command text
 (section 10.6). `log::` macros reached inside `Database::new` are no-ops because
 no logger is installed (section 2, M1).
+
+When another process holds the write lock (an `--import` mid-file, a purge's
+`VACUUM`, another `track-command` truncating the log), step 7 waits on
+`busy_timeout`, 5 s, and then fails (E-R-03, E-R-19). That wait is kept on
+purpose: the hook runs `track-command` in the background and never waits for
+it (section 11), so waiting costs the user nothing, while giving up sooner
+would lose the run. B4 is the uncontended time.
 
 Budget: B4. Cost model: process start + clap parse, one `Database::new`
 (first-open schema work is about 0.7 ms, [src/db.rs:151-153](../../src/db.rs)),
@@ -722,20 +733,63 @@ today's modes.
 
 | Operation | Trigger | Effect |
 |---|---|---|
-| Delete one command | Picker key ([02 section 9](02-browse.md#9-keys)) | `CmdStore::delete_command`: D1-D5 in one transaction. The tombstone `fnv1a64(text)` stops a later import restoring it. Running the command again records it again |
-| Purge | `psychic history --purge` | Without `--yes`: print `Delete all recorded commands (N commands, M runs)? [y/N] ` and read one line from stdin; anything but `y`/`Y` prints `Nothing deleted.` and returns. Then P1, remove `cmd_model.txt` and `cmd_model_stats.json` if present, print `Deleted N commands and M runs. Recording is still on|off.` If P1's checkpoint reported busy, then fail with E-R-23. The marker file is not touched |
+| Delete one command | Picker key ([02 section 9](02-browse.md#9-keys)) | `CmdStore::delete_command`: D1-D5 in one transaction, then D6 (the log emptied without waiting). The tombstone `fnv1a64(text)` stops a later import restoring it. Running the command again records it again. No text is left on disk, below |
+| Purge | `psychic history --purge` | Without `--yes`: print `Delete all recorded commands (N commands, M runs)? [y/N] ` and read one line from stdin; anything but `y`/`Y` prints `Nothing deleted.` and returns. Then P1, remove `cmd_model.txt` and `cmd_model_stats.json` if present, print `Deleted N commands and M runs. Recording is still on|off.` If P1's checkpoint reported busy, then fail with E-R-23. The marker file is not touched. The tombstones in `deleted_commands` are kept; `command_imports` is emptied, so the next import (`--import`, or the first `--enable` after it) reads every source again, minus the tombstoned texts |
 
 ```rust
 pub(super) fn fnv1a64(text: &str) -> i64  // offset 0xcbf29ce484222325, prime 0x100000001b3, over UTF-8 bytes, `as i64`
 ```
 
-Purge leaves no command text in the database's files. `DELETE` alone leaves the freed pages'
+A tombstone is that hash and the second of the delete; it holds no text. It
+outlives a purge: purge empties everything else, and a tombstone is the only
+thing that stops the shell's own history file (which psychic does not edit)
+from bringing a deleted command back on the next import, including the one a
+`--disable`, `--purge`, `--enable` sequence runs. `command_imports` is emptied
+by purge, because a source marked as imported would skip its untimestamped
+entries on the next import (section 12.3 step 4). The hash is unsalted FNV-1a
+of the raw text and not a cryptographic hash: someone holding `events.db` can
+confirm a guess (hash a candidate command and look it up), so a short or
+guessable secret is not hidden from a dictionary or brute-force search; a
+long random one is. What a tombstone does not reveal is any text nobody guessed.
+
+**Delete and purge leave no command text in the database's files.** For one
+deleted command that means its text, its template and its rows (events, runs)
+are in neither `events.db` nor `events.db-wal` once `delete_command` returns
+`Truncated`, which is the normal case. The mechanism:
+
+| Step | Why |
+|---|---|
+| D0 on every connection, from open | `secure_delete` zeroes what a write frees: the deleted cells (table and index, the text sits in both, through `commands.text UNIQUE`), the overflow pages of a long text, and the old copy of any row an update rewrites elsewhere or a page split moves. On for every writer, not only the deleting one: an `UPDATE` by S5 or a split by a later insert, made without it, leaves an older copy of the row in the page's free space, which the delete cannot know about. Measured: with `secure_delete` on the deleting connection only, TC-R-28 finds the text in `events.db` after the delete |
+| D6 after the delete | The deletes write new, zeroed page images into the log; older images of the same pages (from `track-command`, which lets the log grow to 2 MiB, section 9.1) stay in `events.db-wal`, and the main file keeps the old pages, until a checkpoint copies the log over them and truncates it |
+
+D6 never waits. When another connection is inside a read, writing or
+checkpointing (a `track-command` mid-flight, a second picker loading, an
+`--import`), it returns busy at once: the command is deleted, the list updates,
+but its text can stay in `events.db-wal`, and in the pages of `events.db` the
+log has not yet been copied over (E-R-25). It is then cleared by the first of:
+the same picker's exit (D6 again on the UI thread's connection, after the pick
+is printed, when anything was deleted in that session; still busy is logged),
+the next delete, the last connection to the database closing (SQLite
+checkpoints and deletes the log then), `track-command`'s W1 once the log
+passes `CMD_WAL_TRUNCATE_BYTES`, or `--purge`. Nothing tells the user in the
+picker; the only trace is the `log::warn!` in `app.log` (no text). An idle
+open connection does not stop D6.
+
+Limits: a database written before D0 was on for every connection (psychic
+builds before this rule) can hold older copies of a row in free space that a
+later delete does not reach; `--purge` (which `VACUUM`s) clears those. The
+picker's queries are kept in other commands' `command_events` rows (a query is
+what was typed, not the command). Blocks the file system frees, and copies in
+backups or snapshots, are below SQLite.
+
+Purge leaves no command text in the database's files either. `DELETE` alone leaves the freed pages'
 bytes in `events.db`, and in WAL mode the old pages also sit in
 `events.db-wal` until it is overwritten; when another connection is open (a
 running picker, a `track-command` mid-flight) SQLite does not delete the log
 when purge's connection closes, and the log `track-command` leaves behind
 (section 9.1) holds the runs of up to the last 2 MiB of recording. So P1 turns on `secure_delete` (freed pages
-are zeroed), `VACUUM`s (the file is rewritten), and runs
+are zeroed; already on from D0), `VACUUM`s (the file is rewritten, which also drops the older copies of
+rows in free space that a database from before D0 can hold), and runs
 `wal_checkpoint(TRUNCATE)`, which copies the log into the database and cuts it
 to zero bytes. It waits up to `busy_timeout` (5 s) for readers; an idle open
 connection does not stop it, one in the middle of a read does, and then the
@@ -1344,14 +1398,20 @@ and `previous = replace(&mut cwd, target)`; `Lost` sets `previous = cwd.take()`;
    imported once only).
 5. Otherwise `record_run_in` with `source = Import`, `exit_code = None`,
    `duration_ms = None`, `started_at = at[i]`, `cwd = cwds[i]`,
-   `repo_root = cwd.and_then(|c| find_repo_root(c, Some(home)))`, `shell_session =
+   `repo_root = cwd.and_then(|c| find_repo_root(c, Some(home)))` (looked up once per distinct `cwd`, before the transaction starts: step 5 then does no file system work while it holds the write lock), `shell_session =
    "import:<kind>:<h>"` for real timestamps and `"import-synth:<kind>:<h>"` for
    synthetic ones, where `<h>` is `format!("{:016x}", fnv1a64(path) as u64)[..8]`.
    A `RunOutcome::Duplicate` counts as skipped.
 6. After the file: I2-insert `(source_key, now, inserted)`.
 
 All entries of one file go in one `CmdStore::transaction`, in ascending
-`(at, file index)` order, so S3 finds each entry's predecessor.
+`(at, file index)` order, so S3 finds each entry's predecessor. That
+transaction holds the database's write lock until it commits: a
+`track-command` meanwhile waits on `busy_timeout` (E-R-19) and the picker's
+event writes give up after `CMD_EVENT_WAIT_MS` (02 E-B-06). Only database work
+happens inside it; parsing, the `cd` replay and the repository walks happen
+before. A source is not split into several transactions: E-R-14's rollback of
+a whole file (and its retry, synthetic entries included) depends on it.
 
 ### 12.4 Atuin
 
@@ -1438,6 +1498,8 @@ Prints, one per line: `recording: on|off` (marker exists; then
 | Set up fern or open `app.log` in `track-command` | Early dispatch M1 | B4, and section 10.6 |
 | Skip the close-time checkpoint without bounding the log, or rely on `wal_autocheckpoint`/`journal_size_limit` for it | `open_for_recording` + `close_recording` (section 9.1) | A lone process rebuilds the log index with nothing checkpointed, so SQLite never rewinds the log: it only grows |
 | `PRAGMA synchronous = OFF` (or `journal_mode = MEMORY/OFF`) to make `track-command` fast | Section 9.1 | A checkpoint without `fsync` followed by deleting the log can corrupt the database on power loss; only losing the last runs is acceptable |
+| Turn on `secure_delete` only on the connection that deletes, or delete without D6 | D0 on every `CmdStore` connection; D6 after the delete (section 10.5) | Earlier writers leave older copies of a row in free space, and the log and the main file keep the old pages: the deleted text stays readable with `strings events.db*` |
+| Let D6 wait, or VACUUM after a single delete | D6 with `busy_timeout = 0`; busy is retried at picker exit and by later checkpoints | The worker would hold the list for up to 5 s; a VACUUM rewrites the whole database and blocks every writer meanwhile |
 | Let W1 wait on `busy_timeout` | `busy_timeout = 0` before W1; a busy result is left for a later run | A picker mid-read would hold the shell's background process for up to 5 s |
 | `log::info!("recorded {}", text)` or `{:?}` of a `NewRun` anywhere | Log ids and counts; do not derive `Debug` on `NewRun` | Section 10.6 |
 | Write SQL on the command tables outside `src/cmd/store.rs` | Add a method to `CmdStore` and a row to section 6 | One place to test plans and to audit |
@@ -1457,8 +1519,10 @@ Conventions: inline `#[cfg(test)] mod tests` per file, sentence-style names,
 expected values written out ([llm.md:216-235](../../llm.md)); `CmdStore::in_memory()`
 or `std::env::temp_dir().join(format!("psychic-<tag>-{}", std::process::id()))`.
 No test writes `~/.local/share/psychic` or reads the real `$HOME` history
-(the only reads of the real data dir are the two guards TC-N-09 and IT-N-05 of
-[04 section 11](04-bench.md#11-test-case-specifications), which `stat` it).
+(the only read of the real data dir is the guard TC-N-09 of
+[04 section 11](04-bench.md#11-test-case-specifications), which compares its
+path and never its contents; no test's outcome depends on what is in it, since
+psychic may be installed and recording on the machine that runs the tests).
 Every test uses its own `<tag>` and never removes and recreates a data dir
 within one test: `Database`'s schema registry is keyed by path
 ([src/db.rs:154-155](../../src/db.rs)) and would not re-create the tables.
@@ -1493,6 +1557,8 @@ within one test: `Database`'s schema registry is keyed by path
 | TC-R-25 | recording log, unbounded vs bounded | a file data dir; 20 one-shot `open_for_recording` + record + drop; then a fresh dir with 60 one-shot runs closed by `close_recording(64 KiB)` | without the bound the log grows on every run (> 256 KiB after 20); with it the log never exceeds 128 KiB, `Truncated` at least 3 times, the log is 0 bytes after each, all 60 runs readable | a run closed with `close_recording(u64::MAX)` leaves the log non-empty and the run readable by a new connection |
 | TC-R-26 | recording log, busy | log over 64 KiB; another connection inside a read transaction | `close_recording` returns `Busy` in under 1 s and the log stays; after the reader commits (still open, idle) the next one returns `Truncated` and the log is 0 bytes | - |
 | TC-R-27 | purge after recording connections | 30 one-shot runs of a sentinel text closed with `close_recording(u64::MAX)` (text in `-wal`) | `purge` from a normal `open`: `log_cleared`; neither file holds the sentinel, before and after drop. `events.db`, `-wal`, `-shm` are `0600` after a recording run | - |
+| TC-R-28 | `delete_command` on disk | 125 one-shot recording runs (as `track-command`): `echo MARKER_delete_d31e7e --token` every 4th, filler otherwise, `close_recording(16 KiB)` every 10th so the text is in both `events.db` and `-wal` | `delete_command` returns `Truncated`; neither file holds the marker's bytes, before and after the store is dropped; the 93 other commands remain | Fails with D0 on the deleting connection only (text left in `events.db`) and with no D0 at all |
+| TC-R-29 | `delete_command`, log busy | As TC-R-28, another connection inside a read transaction | `Busy` in under 1 s, the rows are gone; after the reader commits, `truncate_log_now()` returns `Truncated` and neither file holds the marker | - |
 | TC-R-24 | `backfill::run`, bash | `.bash_history` `#1700000000`, `for f in *; do`, `  echo "$f"`, `done`, `#1700000005`, `ls` | 2 runs: the loop as one text with its newlines at 1700000000, `ls` at 1700000005 | - |
 
 ### 15.2 Integration tests
@@ -1504,7 +1570,8 @@ within one test: `Database`'s schema registry is keyed by path
 | IT-R-03 | Import stops at the first hook run | As IT-R-02 plus one `Source::Hook` run at t=1,700,000,050 before importing a zsh file with entries at ...000 and ...100 | Only the ...000 entry is imported | `remove_dir_all` |
 | IT-R-04 | Atuin import | Build a temp `history.db` with the A1-A4 schema and 4 rows with nanosecond timestamps: (exit 0, cwd `/x`), (exit 1, cwd `unknown`), (exit -1, cwd `/y`), and a fourth with `deleted_at` set | 3 rows imported; `started_at` in seconds; `exit_code` 0, 1, NULL; `cwd` `/x`, NULL, `/y`; `duration_ms` NULL where Atuin's is -1; the Atuin file's mtime and size are unchanged | `remove_dir_all` |
 | IT-R-05 | Tombstone blocks re-import | Import, `delete_command` one, import again | The deleted text is absent after the second import | `remove_dir_all` |
-| IT-R-06 | Enable, disable, purge | Temp data dir; `--enable --no-import`, record 2 runs, `--status`, `--purge --yes`, `--disable` | Marker exists then not; modes 700/600; status lines as section 13.3; after purge all five tables are empty and the marker is still present | `remove_dir_all` |
+| IT-R-08 | Tombstones outlive purge | `.zsh_history` (timestamped) and `.bash_history` (untimestamped), each with a synthetic secret and a kept command; import, `delete_command` both secrets, `purge`, import again | After purge: `commands` and `command_imports` empty, `deleted_commands` 2 rows; after the second import both kept commands are back (the bash one only because `command_imports` was emptied) and neither secret is. Purge's unit test checks a tombstone survives it | `remove_dir_all` |
+| IT-R-06 | Enable, disable, purge | Temp data dir; `--enable --no-import`, record 2 runs, `--status`, `--purge --yes`, `--disable` | Marker exists then not; modes 700/600; status lines as section 13.3; after purge all five tables are empty (nothing was tombstoned) and the marker is still present | `remove_dir_all` |
 | IT-R-07 | No command text leaks (`tests/no_text_leaks.rs`, the built binary, so its real logger writes the real `app.log`) | Temp `HOME` (cleared environment) with `.bash_history`, `.zsh_history` and a non-database Atuin `history.db`, all holding `SENTINEL_c0ffee`; `--data-dir` in the temp dir. Run `history --enable` (imports), `track-command` with the sentinel (succeeding, and failing on a data dir that is a file), `history --import`, `--status`, `--purge --yes` | No invocation's stdout or stderr contains the sentinel; it is in `events.db*` before the purge (so it went through every path); `app.log` exists and holds `atuin skipped (unreadable)` (so a leak would show); no file in the data dir other than `events.db*`, recursively, contains the bytes; nothing was written to `HOME/.local/share/psychic`. Checked to fail when a `log::debug!` of the text is added to the importer | `remove_dir_all` |
 | IT-S-zsh, IT-S-bash, IT-S-fish | Real shell, real hook (`tests/shell_hooks.rs`) | Section 15.3 | Section 15.3 | `remove_dir_all` |
 
@@ -1518,9 +1585,9 @@ scenario tests after the table. Binary: `env!("CARGO_BIN_EXE_psychic")`.
 | Step | Detail |
 |---|---|
 | Skip rule | If `Command::new(<shell>).arg("--version")` fails to spawn: `println!("skipped: <shell> not installed")` and return (pass) |
-| Scratch | `T = temp_dir()/psychic-shell-<shell>-<tag>-<pid>`; `T/home`, `T/data`, `T/work/sub`; `T/hook` = stdout of `psychic --data-dir T/data <shell>` run with `HOME=T/home` |
+| Scratch | `T = temp_dir()/psychic-shell-<shell>-<tag>-<pid>`; `T/home`, `T/data`, `T/work/sub`, `T/bin/psychic` (a symlink to the built binary); `T/hook` = stdout of `psychic --data-dir T/data <shell>` run with `HOME=T/home` |
 | Database | Created before the shell starts (`psychic --data-dir T/data history --status`, or the `--enable` of the marker variant): otherwise the session's first two background `track-command`s both create it, and one can lose the race to switch it to WAL mode (`database is locked`) and drop a run |
-| Environment (cleared, then) | `HOME=T/home`, `PATH` inherited, `TERM=dumb`, `PSYCHIC_BIN=<binary>`, `PSYCHIC_DATA_DIR=T/data`, `PSYCHIC_HISTORY=1`, `PSYCHIC_NO_RETRAIN=1`, `HISTFILE=T/home/hist`; bash also `HISTCONTROL=ignorespace`, `HISTIGNORE='secret*'`; zsh also `ZDOTDIR=T/home` |
+| Environment (cleared, then) | `HOME=T/home`, `PATH=T/bin:` + the inherited `PATH` (upstream's `track-visit` hook runs a bare `psychic` on every `cd`; it must be this build, never one installed on the machine, whose real data dir the scratch `HOME` keeps it out of anyway), `TERM=dumb`, `PSYCHIC_BIN=<binary>`, `PSYCHIC_DATA_DIR=T/data`, `PSYCHIC_HISTORY=1`, `PSYCHIC_NO_RETRAIN=1`, `HISTFILE=T/home/hist`; bash also `HISTCONTROL=ignorespace`, `HISTIGNORE='secret*'`; zsh also `ZDOTDIR=T/home` |
 | Launch | On a pty (`libc::openpty`; child via `std::process::Command` with the slave as stdin/stdout/stderr and `pre_exec` doing `setsid()` + `ioctl(0, TIOCSCTTY, 0)`; window 24x80). zsh: `zsh -f -i`; bash: `bash --norc --noprofile -i`; fish: `fish -i -C 'source T/hook'` with `XDG_CONFIG_HOME=T/home/.config` and `XDG_DATA_HOME=T/home/.local/share` (not `--no-config`: fish 4 sets `fish_private_mode` under `--no-config`, and the hook records nothing in private mode) (the hook is loaded before the first prompt, because `fish_postexec` would otherwise record the `source` line itself). cwd `T/work` |
 | Drive | A reader thread drains the master. Write each line + `\n`, sleeping 500 ms before the first line and 150 ms between lines |
 | Lines | (zsh only) `setopt histignorespace`, `HISTORY_IGNORE='secret*'`; then for all: (zsh, bash) `source T/hook`; then `true`, `false`, `cd sub`, `echo in-sub`, ` echo leading-space`, (zsh, bash) `secret-thing`, `echo 'multi` / `line'`; then the single byte `0x04` (Ctrl-D on an empty line ends all three shells without a command that could itself be recorded) |
@@ -1575,8 +1642,9 @@ same module. It is not shared with `src/`.
 | E-R-16 | zsh without `zsh/datetime` | `EPOCHREALTIME` empty | Hook omits `--started-at` and `--duration-ms` | `track.rs` uses `now`; duration NULL | None |
 | E-R-17 | bash older than 4.2 | `printf '%(%s)T'` fails | Hook omits `--duration-ms` | duration NULL | None |
 | E-R-18 | bash history disabled or command suppressed by `HISTCONTROL`/`HISTIGNORE` | `$HISTCMD` where the sync left it, newest entry stamped before the sync | Not recorded | By design | None |
-| E-R-19 | Two `track-command` processes at once | SQLite write lock | Second waits on `busy_timeout` | - | None |
+| E-R-19 | Two `track-command` processes at once, or one during an import's per-file transaction or a purge | SQLite write lock | Waits on `busy_timeout` (5 s) in the background; the prompt does not wait (section 9) | Past 5 s: E-R-03 | None |
 | E-R-24 | `track-command` finds the log over `CMD_WAL_TRUNCATE_BYTES` while another connection writes, checkpoints or reads | W1 returns busy = 1 (`busy_timeout` 0) | `LogBound::Busy`, `Ok(())`, exit 0: the run is recorded | The log stays over the bound until a later run (or the last connection closing) truncates it | None |
+| E-R-25 | D6 after a delete finds another connection reading, writing or checkpointing (or the checkpoint fails) | `wal_checkpoint(TRUNCATE)` busy = 1 with `busy_timeout` 0, or an `Err` from it | `LogBound::Busy`; the delete stands (rows and tombstone), the list updates, no wait | The text can stay in `events.db-wal` and unrewritten pages of `events.db` until the picker's exit (D6 again), the next delete, the last connection closing, W1, or `--purge` (section 10.5) | `log::warn!` at picker exit if still busy (no text); a failed checkpoint's error (operation and code) |
 | E-R-20 | Clock goes backwards between runs | `started_at` smaller than the session's last | S3 (`started_at <= ?2`) finds an older predecessor or none; S5 keeps `last_run_at` as the max | - | None |
 | E-R-22 | `--import`, or a first `--enable` that imports, with `HOME` unset | `env.home()` is `None` | `Err("HOME is not set, so psychic can't find your shell history")`, exit 1 | `--enable`: marker not written | stderr via `main` |
 | E-R-21 | A shell needed by a shell test is not installed | `--version` spawn fails | Test prints `skipped: ...` and passes | - | test stdout |
