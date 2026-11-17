@@ -256,9 +256,22 @@ impl Scratch {
         std::fs::create_dir_all(root.join("home")).unwrap();
         std::fs::create_dir_all(root.join("data")).unwrap();
         std::fs::create_dir_all(root.join("work/sub")).unwrap();
+        // The upstream hooks run a bare `psychic` (`track-visit` on every
+        // `cd`): it must be this build, never one installed on the machine.
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::os::unix::fs::symlink(BINARY, root.join("bin/psychic")).unwrap();
         // The shells report physical paths for a directory they start in.
         let root = root.canonicalize().unwrap();
         Scratch { root }
+    }
+
+    /// `PATH` for a child: the scratch `bin` (this build as `psychic`)
+    /// first, then the test's own `PATH` for the shells and coreutils.
+    pub fn path_env(&self) -> std::ffi::OsString {
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs = vec![self.path("bin")];
+        dirs.extend(std::env::split_paths(&inherited));
+        std::env::join_paths(dirs).expect("no PATH entry contains ':'")
     }
 
     /// Run psychic with the scratch HOME and data dir: every subcommand but
@@ -326,7 +339,7 @@ pub fn shell_command(shell: &str, scratch: &Scratch, opt_in: OptIn) -> Command {
     command
         .env_clear()
         .env("HOME", scratch.path("home"))
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PATH", scratch.path_env())
         .env("TERM", "dumb")
         .env("PSYCHIC_BIN", BINARY)
         .env("PSYCHIC_DATA_DIR", scratch.path("data"))

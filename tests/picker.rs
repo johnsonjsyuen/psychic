@@ -95,7 +95,7 @@ fn pick(scratch: &Scratch, keys: &[&[u8]]) -> (std::process::ExitStatus, String,
     command
         .env_clear()
         .env("HOME", scratch.path("home"))
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PATH", scratch.path_env())
         .env("TERM", "xterm-256color")
         .env("PSYCHIC_NO_RETRAIN", "1")
         .arg("--data-dir")
@@ -172,7 +172,7 @@ fn it_b_12_enter_prints_the_pick_at_once_while_another_process_holds_the_write_l
     command
         .env_clear()
         .env("HOME", scratch.path("home"))
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PATH", scratch.path_env())
         .env("TERM", "xterm-256color")
         .env("PSYCHIC_NO_RETRAIN", "1")
         .arg("--data-dir")
@@ -219,7 +219,7 @@ fn start_picker(scratch: &Scratch, env: &[(&str, &str)]) -> Pty {
     command
         .env_clear()
         .env("HOME", scratch.path("home"))
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PATH", scratch.path_env())
         .env("TERM", "xterm-256color")
         .env("PSYCHIC_NO_RETRAIN", "1")
         .envs(env.iter().copied())

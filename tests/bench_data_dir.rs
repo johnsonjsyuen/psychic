@@ -76,7 +76,7 @@ fn it_n_05_the_benchmark_writes_only_into_its_data_dir() {
     top.sort();
     assert_eq!(
         top,
-        ["data", "home", "work"].map(|name| scratch.path(name)),
+        ["bin", "data", "home", "work"].map(|name| scratch.path(name)),
         "nothing was written beside the data dir"
     );
 }
