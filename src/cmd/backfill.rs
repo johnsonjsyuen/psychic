@@ -83,7 +83,8 @@ pub(super) struct SourceReport {
     #[allow(dead_code, reason = "for corpus statistics (Phase D0) and tests")]
     pub skipped: u64,
     /// Why the source could not be read at all (Atuin: `locked`,
-    /// `unexpected schema`); `None` when it was read or simply absent.
+    /// `unreadable`, `unexpected schema`); `None` when it was read or simply
+    /// absent.
     pub unavailable: Option<&'static str>,
 }
 
@@ -149,6 +150,7 @@ pub(super) fn run(
         hook_start: store.first_hook_run()?.unwrap_or(i64::MAX),
         now,
         ignore: env_ignore,
+        home,
     };
     let mut sources = vec![import_atuin(store, &locations.atuin, &context)?];
     let files = locations
@@ -171,6 +173,8 @@ struct ImportContext<'a> {
     hook_start: i64,
     now: i64,
     ignore: Option<&'a str>,
+    /// Where the search for a repository stops (section 8).
+    home: &'a Path,
 }
 
 /// One entry of a source, ready to be filtered and recorded.
@@ -202,7 +206,8 @@ fn record_candidates(
                 continue;
             }
             let cwd = candidate.cwd.as_deref();
-            let repo_root = cwd.and_then(|cwd| repo::find_repo_root(Path::new(cwd)));
+            let repo_root =
+                cwd.and_then(|cwd| repo::find_repo_root(Path::new(cwd), Some(context.home)));
             let repo_root = repo_root.as_deref().map(Path::to_string_lossy);
             let template = template::templatize(&candidate.text);
             let outcome = CmdStore::record_run_in(
@@ -359,7 +364,7 @@ fn import_file(
     };
     let commands: Vec<HistoryCommand> = match kind {
         HistoryKind::Zsh => shell_history::parse_zsh(&bytes),
-        HistoryKind::Bash => shell_history::parse_bash(&bytes),
+        HistoryKind::Bash => shell_history::parse_bash_entries(&bytes),
         HistoryKind::Fish => shell_history::parse_fish(&bytes),
         HistoryKind::Atuin => unreachable!("Atuin is a database, not a file"),
     };
@@ -432,14 +437,14 @@ fn read_atuin(path: &Path) -> std::result::Result<Vec<Candidate>, &'static str> 
         conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 2000;")?;
         Ok(conn)
     };
-    let conn = open().map_err(|_| "locked")?;
+    let conn = open().map_err(|error| atuin_failure(&error))?;
     let columns: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('history')")
         .and_then(|mut s| {
             s.query_map([], |row| row.get(0))?
                 .collect::<rusqlite::Result<_>>()
         })
-        .map_err(|_| "locked")?;
+        .map_err(|error| atuin_failure(&error))?;
     let has = |name: &str| columns.iter().any(|column| column == name);
     if !ATUIN_COLUMNS.iter().all(|column| has(column)) {
         return Err("unexpected schema");
@@ -471,7 +476,18 @@ fn read_atuin(path: &Path) -> std::result::Result<Vec<Candidate>, &'static str> 
             })
         })
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>());
-    rows.map_err(|_| "locked")
+    rows.map_err(|error| atuin_failure(&error))
+}
+
+/// Why reading Atuin's database failed, as the report words it: `locked`
+/// when Atuin (or anything) held it past the busy timeout, `unreadable` for
+/// everything else (not a database, damaged, no permission).
+fn atuin_failure(error: &rusqlite::Error) -> &'static str {
+    use rusqlite::ErrorCode;
+    match error.sqlite_error_code() {
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => "locked",
+        _ => "unreadable",
+    }
 }
 
 fn import_atuin(store: &CmdStore, path: &Path, context: &ImportContext) -> Result<SourceReport> {
@@ -679,6 +695,32 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_line_bash_entry_is_one_command() {
+        let scratch = Scratch::new("backfill-bash-multi");
+        std::fs::write(
+            scratch.home.join(".bash_history"),
+            "#1700000000\nfor f in *; do\n  echo \"$f\"\ndone\n#1700000005\nls\n",
+        )
+        .unwrap();
+
+        let report = scratch.import(NOW);
+
+        assert_eq!(Scratch::inserted(&report, HistoryKind::Bash), 2);
+        let texts: Vec<String> = scratch
+            .runs()
+            .into_iter()
+            .map(|row| row.split('|').take(2).collect::<Vec<_>>().join("|"))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "for f in *; do\n  echo \"$f\"\ndone|1700000000",
+                "ls|1700000005"
+            ]
+        );
+    }
+
+    #[test]
     fn the_import_stops_at_the_first_hook_run() {
         let scratch = Scratch::new("backfill-hook");
         scratch
@@ -843,6 +885,40 @@ mod tests {
                 "Imported 1 commands (atuin skipped (unexpected schema), zsh 0, bash 1"
             )
         );
+    }
+
+    #[test]
+    fn an_atuin_file_that_is_no_database_is_unreadable_not_locked() {
+        let scratch = Scratch::new("backfill-atuin-garbage");
+        let path = scratch.home.join(".local/share/atuin/history.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![0x5a; 4096]).unwrap();
+
+        let report = scratch.import(NOW);
+
+        assert_eq!(report.sources[0].unavailable, Some("unreadable"));
+        assert!(
+            report
+                .summary()
+                .starts_with("Imported 0 commands (atuin skipped (unreadable), zsh 0")
+        );
+    }
+
+    #[test]
+    fn an_atuin_database_held_by_a_writer_is_locked() {
+        let scratch = Scratch::new("backfill-atuin-locked");
+        let path = scratch.home.join(".local/share/atuin/history.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        atuin_db(&path, false);
+        // A rollback-journal database under an exclusive transaction: no
+        // reader gets in until it ends.
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let report = scratch.import(NOW);
+
+        assert_eq!(report.sources[0].unavailable, Some("locked"));
+        writer.execute_batch("COMMIT").unwrap();
     }
 
     #[test]

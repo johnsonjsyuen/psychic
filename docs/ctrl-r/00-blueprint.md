@@ -139,9 +139,9 @@ selection --> println!(command) on stdout, exit 0 --> widget replaces the prompt
 | `src/db.rs` | One call to `crate::cmd::store::create_schema` in `prepare_schema` | A | [01 section 5.4](01-record.md#54-where-the-schema-is-created) |
 | `src/search_worker.rs` (test only) | The expected table and index lists of `test_an_empty_data_directory_gets_the_whole_schema` | A | [01 section 2](01-record.md#2-files-touched) |
 | `src/import/mod.rs` | `pub(crate) mod shell_history`; one new `pub(crate) fn is_dir_within_limits` | A | [01 section 12.2](01-record.md#122-changes-to-srcimport) |
-| `src/import/shell_history.rs` | Visibility of 4 items; extract `command_words` and `cwd_step`; add `replay_cwds` | A | [01 section 12.2](01-record.md#122-changes-to-srcimport) |
+| `src/import/shell_history.rs` | Visibility of 4 items; extract `command_words` and `cwd_step`; add `replay_cwds` and `parse_bash_entries` | A | [01 section 12.2](01-record.md#122-changes-to-srcimport) |
 | `src/shell_init.rs` | One extra `println!` after the "Done." line | A | [01 section 10.2](01-record.md#102-what-psychic-init-prints) |
-| `shell/psychic.zsh`, `.bash`, `.fish` | Append a recording block (A) and a Ctrl-R widget block (B) | A, B | [01 section 11](01-record.md#11-shell-hooks), [02 section 11](02-browse.md#11-shell-widgets) |
+| `shell/psychic.zsh`, `.bash`, `.fish` | Append a recording block (A) and a Ctrl-R widget block (B); bash's `__psychic_hook` returns the status it received (A) | A, B | [01 section 11](01-record.md#11-shell-hooks), [02 section 11](02-browse.md#11-shell-widgets) |
 | `src/training/mod.rs` | `TrainingSet::from_parts`, `row_weights` field, `fit_seeded`, `pub(crate) atomic_write` | C | [03 section 6.1](03-learn.md#61-refactor-of-srctrainingmodrs) |
 | `src/ranker.rs` | `compute_blend_weights` and `logistic` become `pub(crate)` | C | [03 section 7.3](03-learn.md#73-blend) |
 | `docs/how-it-works.md` | A "Shell history search" section, updated in each phase's commit ([llm.md:30-35](../../llm.md)) | A-D | - |
@@ -213,7 +213,7 @@ pointing here, not by code.
 | ADR-2 | Separate slim TUI under `src/cmd/` | Generic picker | Section 7, row 4 |
 | ADR-3 | Separate keymap table `CMD_KEYMAP` in `src/cmd/keys.rs` | Extending `KEYMAP` | `KEYMAP` has one row per `Action` enforced by tests ([src/keymap.rs:685](../../src/keymap.rs)) and feeds file-mode help; extending it edits two upstream files and shows command keys in file help |
 | ADR-4 | Recording is opt-in through a marker file `history-enabled` in the data dir, checked by the hook with one `stat` | Config file; always-on; checking in the binary | No process is spawned per command while disabled; no config system exists upstream |
-| ADR-5 | bash records from `PROMPT_COMMAND` by reading `history 1`; no DEBUG trap, no `PS0` | DEBUG trap chaining; `PS0` arithmetic trick | Cannot conflict with bash-preexec, Starship or direnv; works on bash 4.0+; `HISTCONTROL`/`HISTIGNORE` are honoured by construction |
+| ADR-5 | bash records from `PROMPT_COMMAND` by reading `history 1`, judged against a count a second function takes last in `PROMPT_COMMAND`; no DEBUG trap, no `PS0` | DEBUG trap chaining; `PS0` arithmetic trick; comparing only the newest entry with the last one seen (records other shells' lines that `history -n` loads) | Cannot conflict with bash-preexec, Starship or direnv; works on bash 4.0+ (fully on 5.1+); `HISTCONTROL`/`HISTIGNORE` are honoured by construction |
 | ADR-6 | Timestamps are Unix seconds everywhere; ties are broken by row id | Milliseconds | Matches `events.timestamp` ([src/db.rs:433](../../src/db.rs)); bash history has second resolution |
 | ADR-7 | `cwd` is the shell's logical `$PWD` string, never canonicalised | `canonicalize` | The hook and the widget must produce the same string with no syscall in the hook |
 | ADR-8 | Command tables are created from `prepare_schema` via one call into `src/cmd/store.rs` | DDL inline in `db.rs`; lazy creation on first command use | The decision is "created in `prepare_schema`"; one call keeps the DDL out of the upstream file |

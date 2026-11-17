@@ -78,7 +78,7 @@ no action flag runs `cmd::app::run`.
 | Input | Resolution |
 |---|---|
 | `cwd` | `--cwd` if given; else `$PWD` if set and absolute; else `std::env::current_dir()` as a string. Never canonicalised (ADR-7). Resolved once |
-| `repo_root` | `repo::find_repo_root(cwd)`, once |
+| `repo_root` | `repo::find_repo_root(cwd, $HOME)`, once |
 | `shell_session` | `--session`; absent means no session scope and no sequence context |
 | `now` | `jiff::Timestamp::now().as_second()`, once; all ranking in this process uses it |
 | `tui_session_id` | `rand::random::<u64>().to_string()` (as [src/main.rs:205-207](../../src/main.rs)) |

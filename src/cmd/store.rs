@@ -143,6 +143,12 @@ const D4: &str = "UPDATE command_runs SET prev_command_id = NULL WHERE prev_comm
 const D5: &str = "DELETE FROM commands WHERE id = ?1";
 
 const P1: &str = "DELETE FROM command_events; DELETE FROM command_runs; DELETE FROM commands; DELETE FROM command_imports; DELETE FROM deleted_commands;";
+/// Before P1: the pages the deletes free are overwritten with zeros.
+const P1_SECURE: &str = "PRAGMA secure_delete = ON";
+/// After P1 and `VACUUM`: copy the log into the database and cut it to zero
+/// bytes, so the old pages it still holds leave the disk. Column 0 is 1 when
+/// another connection kept it from finishing.
+const P1_CHECKPOINT: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 
 const I1: &str = "SELECT MIN(started_at) FROM command_runs WHERE source = 'hook'";
 const I2_SELECT: &str = "SELECT 1 FROM command_imports WHERE source_key = ?1";
@@ -173,6 +179,14 @@ impl<T> SqlContext<T> for rusqlite::Result<T> {
     fn op(self, operation: &'static str) -> Result<T> {
         self.map_err(|error| anyhow!("{} failed: {}", operation, describe(&error)))
     }
+}
+
+fn is_busy(error: &rusqlite::Error) -> bool {
+    use rusqlite::ErrorCode;
+    matches!(
+        error.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
 }
 
 fn describe(error: &rusqlite::Error) -> String {
@@ -364,6 +378,11 @@ pub(super) struct NewEvent<'a> {
 pub(super) struct PurgeCounts {
     pub commands: u64,
     pub runs: u64,
+    /// Whether the database was compacted and its write-ahead log emptied.
+    /// When another connection held it, the deleted text can still be in
+    /// `events.db` or `events.db-wal` until a later purge (or the last
+    /// connection closing) clears it.
+    pub log_cleared: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -735,13 +754,28 @@ impl CmdStore {
     /// text is gone from the file too. Returns what there was.
     pub(super) fn purge(&self) -> Result<PurgeCounts> {
         let before = self.counts()?;
-        self.transaction(|tx| tx.execute_batch(P1).op("deleting recorded commands"))?;
         self.conn()
-            .execute_batch("VACUUM")
-            .op("compacting the database")?;
+            .execute_batch(P1_SECURE)
+            .op("turning on secure delete")?;
+        self.transaction(|tx| tx.execute_batch(P1).op("deleting recorded commands"))?;
+        // The rows are gone now. Another connection holding the database
+        // busy is reported through `log_cleared`, so the caller still says
+        // what was deleted.
+        let vacuumed = match self.conn().execute_batch("VACUUM") {
+            Err(error) if is_busy(&error) => false,
+            result => {
+                result.op("compacting the database")?;
+                true
+            }
+        };
+        let busy: i64 = self
+            .conn()
+            .query_row(P1_CHECKPOINT, [], |row| row.get(0))
+            .op("emptying the write-ahead log")?;
         Ok(PurgeCounts {
             commands: before.commands,
             runs: before.hook_runs + before.import_runs,
+            log_cleared: vacuumed && busy == 0,
         })
     }
 
@@ -1189,6 +1223,99 @@ mod tests {
         ] {
             assert_eq!(table_rows(&store, table), 0, "{table} is empty");
         }
+    }
+
+    const SENTINEL: &[u8] = b"SENTINEL_purge_5ca1ab1e";
+
+    /// A store on disk holding enough runs of a sentinel command that its
+    /// pages reach the write-ahead log, as a real history does.
+    struct SentinelStore {
+        dir: std::path::PathBuf,
+        store: CmdStore,
+    }
+
+    fn store_with_sentinel(tag: &str) -> SentinelStore {
+        let dir = std::env::temp_dir().join(format!("psychic-cmd-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = CmdStore::open(&dir).unwrap();
+        let text = String::from_utf8(SENTINEL.to_vec()).unwrap();
+        for i in 0..200 {
+            let command = format!("echo {} {}", text, i);
+            record(&store, &hook_run(&command, "s", 100 + i, Some(0)));
+        }
+        SentinelStore { dir, store }
+    }
+
+    /// The files of the database (`events.db` and its `-wal`) that still hold
+    /// the sentinel's bytes.
+    fn files_holding_sentinel(dir: &Path) -> Vec<String> {
+        ["events.db", "events.db-wal"]
+            .into_iter()
+            .filter(|name| {
+                std::fs::read(dir.join(name)).is_ok_and(|bytes| {
+                    bytes
+                        .windows(SENTINEL.len())
+                        .any(|window| window == SENTINEL)
+                })
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn purge_leaves_no_command_text_on_disk() {
+        let SentinelStore { dir, store } = store_with_sentinel("purge-disk");
+        assert!(
+            !files_holding_sentinel(&dir).is_empty(),
+            "the text is there"
+        );
+
+        let counts = store.purge().unwrap();
+
+        assert!(counts.log_cleared);
+        assert_eq!(files_holding_sentinel(&dir), Vec::<String>::new());
+        drop(store);
+        assert_eq!(files_holding_sentinel(&dir), Vec::<String>::new());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_leaves_no_command_text_on_disk_while_another_connection_is_open() {
+        let SentinelStore { dir, store } = store_with_sentinel("purge-disk-other");
+        // Another psychic process, idle between statements.
+        let other = Connection::open(Database::get_db_path(&dir)).unwrap();
+        let rows: i64 = other
+            .query_row("SELECT COUNT(*) FROM command_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 200);
+
+        let counts = store.purge().unwrap();
+
+        assert!(counts.log_cleared);
+        assert_eq!(files_holding_sentinel(&dir), Vec::<String>::new());
+        drop(other);
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_reports_a_log_another_connection_keeps_it_from_emptying() {
+        let SentinelStore { dir, store } = store_with_sentinel("purge-busy");
+        // Another process in the middle of a read holds the log's pages.
+        let other = Connection::open(Database::get_db_path(&dir)).unwrap();
+        other.execute_batch("BEGIN").unwrap();
+        let _: i64 = other
+            .query_row("SELECT COUNT(*) FROM command_runs", [], |row| row.get(0))
+            .unwrap();
+
+        let counts = store.purge().unwrap();
+
+        assert!(!counts.log_cleared);
+        assert_eq!(table_rows(&store, "commands"), 0, "the rows are gone");
+        other.execute_batch("COMMIT").unwrap();
+        drop(other);
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

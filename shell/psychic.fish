@@ -122,9 +122,19 @@ function __psychic_postexec --on-event fish_postexec
     __psychic_history_enabled; or return
     set -q fish_private_mode; and return
     test -n "$argv[1]"; or return
-    string match -q -- ' *' "$argv[1]"; and return
+    # fish keeps a command out of its history when it starts with a space,
+    # or, if the user defined fish_should_add_to_history, when that says so
+    # (it then decides alone, leading space included).
+    if functions -q fish_should_add_to_history
+        fish_should_add_to_history "$argv[1]" >/dev/null 2>&1; or return
+    else
+        string match -q -- ' *' "$argv[1]"; and return
+    end
     set -l __psychic_bin psychic
     set -q PSYCHIC_BIN; and set __psychic_bin $PSYCHIC_BIN
+    # Not installed (or not on PATH): fish would print "command not found",
+    # and the command line with it, at every prompt.
+    command -q $__psychic_bin; or return
     set -l __psychic_dir
     set -q PSYCHIC_DATA_DIR; and set __psychic_dir --data-dir $PSYCHIC_DATA_DIR
     command $__psychic_bin $__psychic_dir track-command --cwd "$__psychic_cmd_pwd" \

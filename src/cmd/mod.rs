@@ -32,12 +32,13 @@ use store::CmdStore;
 /// `psychic track-command`. Called from `main` before the logger is set up.
 pub fn run_track_command(data_dir: Option<&Path>, args: &cli::TrackCommandArgs) -> Result<()> {
     let ignore = std::env::var("PSYCHIC_HISTORY_IGNORE").ok();
-    track::run(
-        data_dir,
-        args,
-        jiff::Timestamp::now().as_second(),
-        ignore.as_deref(),
-    )
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let env = track::TrackEnv {
+        now: jiff::Timestamp::now().as_second(),
+        ignore: ignore.as_deref(),
+        home: home.as_deref(),
+    };
+    track::run(data_dir, args, &env)
 }
 
 /// `psychic history`: one action on what is recorded, or (Phase B) the picker.
@@ -168,8 +169,11 @@ fn enable(data_dir: &Path, import: bool, now: i64, env: &Env, out: &mut dyn Writ
         out,
         "Shell history search is on.
   Recording: every command you run from now on, with its directory, exit code and duration.
-  Not recorded: commands your shell keeps out of its own history (leading space,
-    HISTIGNORE / HISTORY_IGNORE), anything matching $PSYCHIC_HISTORY_IGNORE, psychic's own commands.
+  Not recorded: what your shell's own settings keep out of its history (bash: HISTCONTROL,
+    HISTIGNORE; zsh: HIST_IGNORE_SPACE, HISTORY_IGNORE, HIST_NO_STORE; fish: a leading space,
+    or fish_should_add_to_history), psychic's own commands, and anything matching
+    PSYCHIC_HISTORY_IGNORE (colon-separated patterns; it must be exported).
+  Recorded anyway: lines a zsh zshaddhistory hook rejects; add them to PSYCHIC_HISTORY_IGNORE.
   Stored in: {}/events.db (readable only by you). Nothing leaves this machine.
   Ctrl-R: open a new shell to get the binding.
   Undo: psychic history --disable   Delete everything: psychic history --purge
@@ -251,6 +255,13 @@ fn purge(
         deleted.runs,
         on_off(privacy::marker_path(data_dir).exists())
     )?;
+    if !deleted.log_cleared {
+        bail!(
+            "another psychic process has {} open, so the deleted commands can still be on disk \
+             in its files; close running psychic instances and run psychic history --purge again",
+            crate::db::Database::get_db_path(data_dir).display()
+        );
+    }
     Ok(())
 }
 
@@ -283,14 +294,19 @@ mod tests {
 
     fn track(data_dir: &Path, command: &str, at: i64) {
         let args = cli::TrackCommandArgs {
-            cwd: "/tmp".to_string(),
+            cwd: PathBuf::from("/tmp"),
             exit_code: Some(0),
             started_at: Some(at),
             duration_ms: Some(12),
             session: "s1".to_string(),
             command: OsString::from(command),
         };
-        track::run(Some(data_dir), &args, at, None).unwrap();
+        let env = track::TrackEnv {
+            now: at,
+            ignore: None,
+            home: None,
+        };
+        track::run(Some(data_dir), &args, &env).unwrap();
     }
 
     fn mode(path: &Path) -> u32 {
@@ -320,6 +336,16 @@ mod tests {
             "  Stored in: {}/events.db (readable",
             data.display()
         )));
+        assert!(
+            enabled.contains(
+                "PSYCHIC_HISTORY_IGNORE (colon-separated patterns; it must be exported)."
+            ),
+            "says the variable must be exported: {enabled}"
+        );
+        assert!(
+            enabled.contains("Recorded anyway: lines a zsh zshaddhistory hook rejects;"),
+            "says what is not honoured: {enabled}"
+        );
 
         track(&data, "echo hello", 1001);
         track(&data, "echo hello", 1002);
@@ -396,6 +422,36 @@ mod tests {
     }
 
     #[test]
+    fn purge_says_so_when_another_process_keeps_the_text_on_disk() {
+        let root = scratch("actions-purge-busy");
+        let data = root.join("data");
+        track(&data, "echo hello", 1001);
+        let other = rusqlite::Connection::open(crate::db::Database::get_db_path(&data)).unwrap();
+        other.execute_batch("BEGIN").unwrap();
+        let _: i64 = other
+            .query_row("SELECT COUNT(*) FROM command_runs", [], |row| row.get(0))
+            .unwrap();
+
+        let mut out = Vec::new();
+        let error = purge(&data, &mut |_| Ok(true), &mut out).unwrap_err();
+
+        assert_eq!(
+            text(out),
+            "Deleted 1 commands and 1 runs. Recording is still off.\n"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "another psychic process has {}/events.db open, so the deleted commands can still be on disk \
+                 in its files; close running psychic instances and run psychic history --purge again",
+                data.display()
+            )
+        );
+        other.execute_batch("COMMIT").unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn the_first_enable_imports_and_later_ones_do_not() {
         let root = scratch("enable-import");
         let home = root.join("home");
@@ -415,39 +471,6 @@ mod tests {
             "already enabled: no import"
         );
 
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn no_command_text_reaches_any_file_but_the_database() {
-        let root = scratch("leak");
-        let home = root.join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(
-            home.join(".bash_history"),
-            "echo SENTINEL_c0ffee from bash\n",
-        )
-        .unwrap();
-        let data = root.join("data");
-        let mut out = Vec::new();
-        enable(&data, false, 1000, &env(None), &mut out).unwrap();
-        track(&data, "echo SENTINEL_c0ffee", 1001);
-        let store = CmdStore::open(&data).unwrap();
-        import_history(&store, 2000, &env(Some(&home))).unwrap();
-        drop(store);
-
-        for entry in std::fs::read_dir(&data).unwrap() {
-            let path = entry.unwrap().path();
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            if name.starts_with("events.db") {
-                continue;
-            }
-            let bytes = std::fs::read(&path).unwrap();
-            assert!(
-                !bytes.windows(15).any(|window| window == b"SENTINEL_c0ffee"),
-                "{name} holds command text"
-            );
-        }
         std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -4,6 +4,7 @@
 //! (`docs/ctrl-r/01-record.md` section 4). Behaviour lives elsewhere.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 /// `psychic track-command`: what the shell hooks call once per command.
 ///
@@ -14,7 +15,7 @@ use std::ffi::OsString;
 pub struct TrackCommandArgs {
     /// Directory the command was typed in
     #[arg(long)]
-    pub cwd: String,
+    pub cwd: PathBuf,
     /// Exit status of the command
     #[arg(long, allow_negative_numbers = true)]
     pub exit_code: Option<i32>,
@@ -79,6 +80,9 @@ pub struct HistoryArgs {
 mod tests {
     use crate::cli::{Cli, Commands};
     use clap::Parser;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::PathBuf;
 
     #[test]
     fn track_command_takes_the_text_after_the_double_dash_verbatim() {
@@ -97,7 +101,7 @@ mod tests {
             panic!("expected track-command");
         };
         assert_eq!(args.command, "-rf --weird\nline");
-        assert_eq!(args.cwd, "/x");
+        assert_eq!(args.cwd, PathBuf::from("/x"));
         assert_eq!(args.session, "s");
         assert_eq!(args.exit_code, None);
     }
@@ -145,5 +149,25 @@ mod tests {
         assert!(Cli::try_parse_from(["psychic", "history", "--no-import"]).is_err());
         assert!(Cli::try_parse_from(["psychic", "history", "--enable", "--no-import"]).is_ok());
         assert!(Cli::try_parse_from(["psychic", "history", "--purge", "-y"]).is_ok());
+    }
+
+    #[test]
+    fn track_command_takes_a_directory_that_is_not_utf8() {
+        let cwd = OsString::from_vec(b"/tmp/caf\xe9".to_vec());
+        let cli = Cli::try_parse_from([
+            OsString::from("psychic"),
+            OsString::from("track-command"),
+            OsString::from("--cwd"),
+            cwd.clone(),
+            OsString::from("--session"),
+            OsString::from("s"),
+            OsString::from("--"),
+            OsString::from("ls"),
+        ])
+        .expect("parses");
+        let Some(Commands::TrackCommand(args)) = cli.command else {
+            panic!("expected track-command");
+        };
+        assert_eq!(args.cwd, PathBuf::from(cwd));
     }
 }

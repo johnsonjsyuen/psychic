@@ -35,7 +35,7 @@ The commit message carries the `startup 6` table ([llm.md:54-62](../../llm.md)).
 ## 2. Files touched
 
 New files: `src/cmd/{mod,cli,tuning,store,template,repo,privacy,track,backfill}.rs`,
-`tests/shell_hooks.rs`, `tests/support/mod.rs`.
+`tests/shell_hooks.rs`, `tests/no_text_leaks.rs`, `tests/support/mod.rs`.
 
 | Upstream file | Exact edit |
 |---|---|
@@ -48,7 +48,7 @@ New files: `src/cmd/{mod,cli,tuning,store,template,repo,privacy,track,backfill}.
 | [src/import/mod.rs:17](../../src/import/mod.rs) | `mod shell_history;` -> `pub(crate) mod shell_history;`; add `is_dir_within_limits` (section 12.2) |
 | [src/import/shell_history.rs](../../src/import/shell_history.rs) | Section 12.2 |
 | [src/shell_init.rs:328-331](../../src/shell_init.rs) | Section 10.2 |
-| `shell/psychic.zsh`, `shell/psychic.bash`, `shell/psychic.fish` | Append the blocks of section 11 at end of file |
+| `shell/psychic.zsh`, `shell/psychic.bash`, `shell/psychic.fish` | Append the blocks of section 11 at end of file; in `shell/psychic.bash`, `__psychic_hook` also returns the status it received (section 11.3) |
 | `docs/how-it-works.md` | New section "Shell history search: `src/cmd/`" describing Phase A |
 
 M1 (`track-command` never reaches the logger set-up at [src/main.rs:229-265](../../src/main.rs)):
@@ -125,7 +125,7 @@ subcommands; the Owner column says which document specifies the behaviour.
 #[derive(clap::Args, Debug)]
 pub struct TrackCommandArgs {
     /// Directory the command was typed in
-    #[arg(long)] pub cwd: String,
+    #[arg(long)] pub cwd: std::path::PathBuf,   // any bytes: a non-UTF-8 $PWD still parses (stored lossily, section 9)
     /// Exit status of the command
     #[arg(long, allow_negative_numbers = true)] pub exit_code: Option<i32>,
     /// When it started, Unix seconds
@@ -395,7 +395,7 @@ fixes the join order (SQLite never reorders a `CROSS JOIN`).
 | D3 | `DELETE FROM command_runs WHERE command_id = ?1` (plan: `idx_command_runs_command`) | delete one |
 | D4 | `UPDATE command_runs SET prev_command_id = NULL WHERE prev_command_id = ?1` (plan: `idx_command_runs_prev`) | delete one |
 | D5 | `DELETE FROM commands WHERE id = ?1` | delete one |
-| P1 | `DELETE FROM command_events; DELETE FROM command_runs; DELETE FROM commands; DELETE FROM command_imports; DELETE FROM deleted_commands;` then, outside the transaction, `VACUUM` | purge |
+| P1 | `PRAGMA secure_delete = ON`; then in one transaction `DELETE FROM command_events; DELETE FROM command_runs; DELETE FROM commands; DELETE FROM command_imports; DELETE FROM deleted_commands;`; then `VACUUM`; then `PRAGMA wal_checkpoint(TRUNCATE)`, whose first column (busy) must be 0 (section 10.5) | purge |
 | I1 | `SELECT MIN(started_at) FROM command_runs WHERE source = 'hook'` (plan: `idx_command_runs_hook`) | backfill |
 | I2 | `SELECT 1 FROM command_imports WHERE source_key = ?1` / `INSERT OR REPLACE INTO command_imports (source_key, imported_at, runs) VALUES (?1, ?2, ?3)` | backfill |
 | I3 | `SELECT 1 FROM deleted_commands WHERE text_hash = ?1` | backfill |
@@ -431,7 +431,7 @@ Row structs are plain `pub(super)` structs in `store.rs` with the listed fields.
 | `log_events(now: i64, events: &[NewEvent])` (one transaction) | E1 | `()`; `NewEvent` has one field per E1 parameter except `timestamp`, which the method takes as `now: i64`; `action` is `enum EventAction { Impression, Pick }`, `episode_queries` is `Option<&[String]>` and is written as a JSON array |
 | `count_pick(command_id: i64)` | E2 | `()` |
 | `delete_command(command_id: i64, text: &str, now: i64)` | D1-D5 | `()` |
-| `purge()` | P1 | `PurgeCounts { commands: u64, runs: u64 }` (counted before deleting) |
+| `purge()` | P1 | `PurgeCounts { commands: u64, runs: u64, log_cleared: bool }` (counts taken before deleting; `log_cleared` = the checkpoint's busy column was 0) |
 | `first_hook_run()` | I1 | `Option<i64>` |
 | `import_done(source_key: &str)`, `mark_import(source_key: &str, now: i64, runs: u64)` | I2 | `bool`, `()` |
 | `is_tombstoned(text_hash: i64)` | I3 | `bool` |
@@ -521,21 +521,33 @@ A command is psychic's **own** when `first_command_word(text)` is in
 
 ```rust
 // src/cmd/repo.rs
-pub(super) fn find_repo_root(cwd: &Path) -> Option<PathBuf>
+pub(super) fn find_repo_root(cwd: &Path, home: Option<&Path>) -> Option<PathBuf>
 ```
 
 Return `None` unless `cwd.is_absolute()`. For `dir` in `cwd.ancestors()`, return
 `Some(dir.to_path_buf())` at the first `dir.join(".git").exists()` (directory or
-file, so worktrees and submodules count). No canonicalisation, no cache
+file, so worktrees and submodules count). When `cwd` is under `home` (`$HOME`,
+compared by path component, so a trailing slash does not matter), the walk
+stops before `home` itself: `$HOME/.git` (a dotfiles repository) or a `.git`
+above `$HOME` would otherwise make every directory a repository with
+`repo_root = $HOME`. A directory strictly below `home` with its own `.git`
+still counts, and a `cwd` outside `home` (or `home` = `None`) is walked to `/`.
+The comparison is textual, like everything else here (ADR-7): if `$HOME` and
+`$PWD` spell the same directory differently (a symlinked home), the walk does
+not see the boundary and finds the dotfiles repository again.
+Callers pass `$HOME`: `track-command` reads it from the environment, the
+importer uses the `home` it was given, the agent-transcript extractor the
+`BenchEnv` home. No canonicalisation, no cache
 (precedent: `IgnoreChecker::repo_of`, [src/import/mod.rs:338-349](../../src/import/mod.rs),
 which stays private). Called once per `track-command`, once per picker start,
 once per imported command with a known cwd. Never per keystroke.
 
 ## 9. `track-command`
 
-`src/cmd/track.rs`, `pub(super) fn run(data_dir: Option<&Path>, args: &TrackCommandArgs, now: i64, env_ignore: Option<&str>) -> anyhow::Result<()>`;
-`cmd::run_track_command` passes `jiff::Timestamp::now().as_second()` and
-`std::env::var("PSYCHIC_HISTORY_IGNORE").ok()`.
+`src/cmd/track.rs`, `pub(super) fn run(data_dir: Option<&Path>, args: &TrackCommandArgs, env: &TrackEnv) -> anyhow::Result<()>`
+with `pub(super) struct TrackEnv<'a> { now: i64, ignore: Option<&'a str>, home: Option<&'a Path> }`;
+`cmd::run_track_command` fills it with `jiff::Timestamp::now().as_second()`,
+`std::env::var("PSYCHIC_HISTORY_IGNORE").ok()` and `std::env::var_os("HOME")`.
 
 | Step | Action | On "skip" |
 |---|---|---|
@@ -544,7 +556,7 @@ once per imported command with a known cwd. Never per keystroke.
 | 3 | `text.len() > CMD_MAX_TEXT_BYTES` | return `Ok(())` |
 | 4 | `template::first_command_word(text)` in `CMD_OWN_COMMANDS` | return `Ok(())` |
 | 5 | `privacy::is_ignored(text, env_ignore)` (section 10.3) | return `Ok(())` |
-| 6 | `started_at = args.started_at.unwrap_or(now - args.duration_ms.unwrap_or(0).max(0) / 1000)`; `cwd = Some(args.cwd)` unless empty; `repo_root = cwd.and_then(find_repo_root)`; `template = templatize(text)` | - |
+| 6 | `started_at = args.started_at.unwrap_or(now - args.duration_ms.unwrap_or(0).max(0) / 1000)`; `cwd = Some(args.cwd)` unless empty; `repo_root = cwd.and_then(\|c\| find_repo_root(c, env.home))` on the path as given; then `cwd` and `repo_root` are stored with `to_string_lossy` (a non-UTF-8 byte becomes U+FFFD, as in the text, E-R-06); `template = templatize(text)` | - |
 | 7 | `CmdStore::open(data_dir)?` (creates the data dir if missing) `.record_run(&NewRun { source: Source::Hook, .. })` (section 6.1). A negative `--duration-ms` is passed as `None` | - |
 
 It does not check the opt-in marker: being called is the hook's decision
@@ -593,8 +605,11 @@ Nothing else in `shell_init.rs` changes; `HINT` ([src/shell_init.rs:96](../../sr
 |---|---|---|
 | Leading-space commands, zsh | hook | `[[ -o histignorespace && "$1" == ' '* ]]` |
 | `HISTORY_IGNORE`, zsh | hook | `[[ -n "${HISTORY_IGNORE-}" && "$1" == ${~HISTORY_IGNORE} ]]` |
+| `HIST_NO_STORE`, zsh | hook | `__psychic_history_no_store`, zsh's own rule repeated (section 11.2) |
+| `zshaddhistory` hooks, zsh | **not honoured** | Calling the user's hooks a second time is not safe (section 11.2); `--enable` says so |
 | `HISTCONTROL` (`ignorespace`, `ignoreboth`, `ignoredups`, `erasedups`) and `HISTIGNORE`, bash | by construction | The hook records only what bash itself added to its history list (section 11.3) |
-| Leading-space commands and private mode, fish | hook | `string match -q -- ' *'`, `set -q fish_private_mode` |
+| Leading-space commands and private mode, fish | hook | `string match -q -- ' *'` (only when `fish_should_add_to_history` is not defined), `set -q fish_private_mode` |
+| `fish_should_add_to_history`, fish | hook | Called again with the command line; recorded only on status 0 (section 11.4) |
 | psychic's own commands | `track.rs` step 4, `backfill.rs` | `CMD_OWN_COMMANDS` |
 | `PSYCHIC_HISTORY_IGNORE` | `track.rs` step 5, `backfill.rs` | `privacy::is_ignored` |
 | Commands over `CMD_MAX_TEXT_BYTES` | `track.rs` step 3, `backfill.rs` | length check |
@@ -648,11 +663,27 @@ today's modes.
 | Operation | Trigger | Effect |
 |---|---|---|
 | Delete one command | Picker key ([02 section 9](02-browse.md#9-keys)) | `CmdStore::delete_command`: D1-D5 in one transaction. The tombstone `fnv1a64(text)` stops a later import restoring it. Running the command again records it again |
-| Purge | `psychic history --purge` | Without `--yes`: print `Delete all recorded commands (N commands, M runs)? [y/N] ` and read one line from stdin; anything but `y`/`Y` prints `Nothing deleted.` and returns. Then P1, remove `cmd_model.txt` and `cmd_model_stats.json` if present, print `Deleted N commands and M runs. Recording is still on|off.` The marker file is not touched |
+| Purge | `psychic history --purge` | Without `--yes`: print `Delete all recorded commands (N commands, M runs)? [y/N] ` and read one line from stdin; anything but `y`/`Y` prints `Nothing deleted.` and returns. Then P1, remove `cmd_model.txt` and `cmd_model_stats.json` if present, print `Deleted N commands and M runs. Recording is still on|off.` If P1's checkpoint reported busy, then fail with E-R-23. The marker file is not touched |
 
 ```rust
 pub(super) fn fnv1a64(text: &str) -> i64  // offset 0xcbf29ce484222325, prime 0x100000001b3, over UTF-8 bytes, `as i64`
 ```
+
+Purge leaves no command text in the database's files. `DELETE` alone leaves the freed pages'
+bytes in `events.db`, and in WAL mode the old pages also sit in
+`events.db-wal` until it is overwritten; when another connection is open (a
+running picker, a `track-command` mid-flight) SQLite does not delete the log
+when purge's connection closes. So P1 turns on `secure_delete` (freed pages
+are zeroed), `VACUUM`s (the file is rewritten), and runs
+`wal_checkpoint(TRUNCATE)`, which copies the log into the database and cuts it
+to zero bytes. It waits up to `busy_timeout` (5 s) for readers; an idle open
+connection does not stop it, one in the middle of a read does, and then the
+checkpoint reports busy and the text may still be in `-wal` (E-R-23: the
+rows are deleted; running `--purge` again once the other process is done
+clears it). A `VACUUM` that finds the database busy is reported the same way,
+after the rows are gone. The `-shm` file holds only the log's index, never
+page contents. Blocks the file system frees are not overwritten; that is
+below SQLite.
 
 Neither operation edits the shell's own history file (non-goal,
 [00 section 7](00-blueprint.md#7-non-goals-not-built-do-not-add-hooks-flags-or-schema-for-them)).
@@ -702,6 +733,37 @@ function __psychic_history_enabled() {
     [[ -e "${PSYCHIC_DATA_DIR:-${HOME}/.local/share/psychic}/history-enabled" ]]
 }
 
+# HIST_NO_STORE: whether zsh keeps the line `$1` out of its history, as
+# should_ignore_line in zsh's hist.c decides it on the parsed line (aliases
+# expanded, words joined by single spaces): `history`, `r` or `fc -l` (any
+# option letters before the first non-letter include an `l`), after an
+# optional `builtin`, and followed by a space or nothing (so `history;x` is
+# kept, `history|x` is not); a function of that name runs instead unless
+# `builtin` was given, and then the line is kept.
+function __psychic_history_no_store() {
+    \builtin emulate -L zsh
+    \builtin local -a words
+    words=(${(z)1})
+    \builtin local forced='' depth=0
+    while (( depth++ < 10 )); do
+        if [[ "${words[1]-}" == builtin ]]; then
+            forced=1
+            \builtin shift words
+        elif [[ -z "${forced}" && -n "${words[1]-}" && -n "${aliases[${words[1]}]-}" ]]; then
+            words=(${(z)aliases[${words[1]}]} "${(@)words[2,-1]}")
+        else
+            break
+        fi
+    done
+    [[ "${words[2]-}" == ';' ]] && \builtin return 1
+    case "${words[1]-}" in
+        history|r) ;;
+        fc) [[ "${words[2]-}" == -* && "${${words[2]#-}%%[^[:alpha:]]*}" == *l* ]] || \builtin return 1 ;;
+        *) \builtin return 1 ;;
+    esac
+    [[ -n "${forced}" ]] || ! \builtin functions "${words[1]}" >/dev/null 2>&1
+}
+
 # Before a command runs: remember it, where it was typed and when.
 function __psychic_preexec() {
     __psychic_cmd=''
@@ -709,6 +771,7 @@ function __psychic_preexec() {
     [[ -n "$1" ]] || \builtin return 0
     [[ -o histignorespace && "$1" == ' '* ]] && \builtin return 0
     [[ -n "${HISTORY_IGNORE-}" && "$1" == ${~HISTORY_IGNORE} ]] && \builtin return 0
+    [[ -o histnostore ]] && __psychic_history_no_store "$1" && \builtin return 0
     __psychic_cmd="$1"
     __psychic_cmd_pwd="${PWD}"
     __psychic_cmd_start="${EPOCHREALTIME-}"
@@ -737,12 +800,50 @@ Facts this relies on: `preexec` receives the line as typed in `$1`, including a
 leading space, and an empty string when history is off; `precmd` sees the last
 command's `$?`; `add-zsh-hook` does not add a function twice, so re-sourcing is
 idempotent. The functions do not call `emulate -L zsh`, because that would
-reset the `histignorespace` option being tested.
+reset the `histignorespace` option being tested (`__psychic_history_no_store`,
+called only after `histnostore` is tested, does).
+
+`HIST_NO_STORE`: `__psychic_history_no_store` repeats the test of
+`should_ignore_line` in zsh's `hist.c` on the words `${(z)1}`, with aliases
+in command position expanded (up to 10 levels; zsh judges the parsed line):
+the line is dropped when its first word (after an optional `builtin`) is
+`history` or `r`, or is `fc` followed by a word of `-` and letters among which
+an `l` comes before the first non-letter, unless the next word is `;` (zsh's
+parsed text then has no space after the name), and unless a function of that
+name exists and `builtin` was not given. Checked against zsh 5.9 on a pty, by
+comparing with what zsh kept in `fc -l`: `history`, `history|cat`,
+`history&&echo y`, `history >/dev/null`, `  history 1`, `fc -l`, `fc -rl`,
+`builtin history`, `history -n`, `h` with `alias h=history`, `hh` with
+`alias hh='h -n'` are dropped by zsh and not recorded; `history;echo y`,
+`fc -W f`, `echo history` and `r` with a function `r` are kept by zsh and
+recorded.
+
+`zshaddhistory` (the function and `zshaddhistory_functions`) is **not
+honoured**, by decision: zsh calls every hook and keeps the first non-zero
+status (1: not saved; 2: saved in the session only, not to `HISTFILE`; psychic
+would treat both as "do not record", since it persists everything), but
+neither outcome is observable afterwards: the rejected line stays in `$history`
+and `fc -l` until the next line is read. The only way to learn the decision is
+to call the user's hooks a second time, which is not safe: common
+implementations have side effects (zsh-histdb inserts the line into its
+database, per-directory-history appends it to a file). `--enable` says so, and
+points to `PSYCHIC_HISTORY_IGNORE` instead (section 13.1). Likewise
+`HIST_NO_FUNCTIONS` (function definitions) is not mirrored.
 
 ### 11.3 bash (append to `shell/psychic.bash`)
 
-Decision (ADR-5): no DEBUG trap and no `PS0`. The hook runs from
-`PROMPT_COMMAND` and reads the newest entry of bash's own history list.
+One edit outside the appended block: the upstream `__psychic_hook` (directory
+tracking, which runs after the history hook) saves `$?` on entry and returns
+it, so the entries after it see the user's command's status.
+
+Decision (ADR-5): no DEBUG trap and no `PS0`. Two functions run from
+`PROMPT_COMMAND`: `__psychic_history_hook` first (before anything can change
+`$?` or load other shells' lines) and `__psychic_history_sync` last (after
+every other entry has changed the history list, as `history -a; history -n`
+does). The hook reads the newest entry of bash's own history list, and counts
+it as the user's command only if bash added it after the previous prompt's
+sync. Checked on a pty with bash 5.3 and, in the official `bash:X.Y` images,
+3.2, 4.3, 4.4, 5.0 and 5.1.
 
 ```bash
 # =============================================================================
@@ -750,11 +851,41 @@ Decision (ADR-5): no DEBUG trap and no `PS0`. The hook runs from
 # =============================================================================
 
 # Off until `psychic history --enable`. PSYCHIC_HISTORY=0 or 1 overrides.
-__psychic_session="$$-${RANDOM}${RANDOM}"
-__psychic_hist_primed=''
-__psychic_hist_seen=''
-__psychic_cmd_pwd="${PWD}"
+#
+# bash has no preexec hook (and a DEBUG trap or PS0 would collide with other
+# tools), so this works from PROMPT_COMMAND alone. Two functions share the
+# work: __psychic_history_hook runs first, before anything can change `$?` or
+# load other shells' lines into the history list, and __psychic_history_sync
+# runs last, after every other entry (Starship, direnv, `history -a;
+# history -n`) has had its turn with the list. At the next prompt, the newest
+# entry is the user's command only if the shell ran one and bash added it
+# after the sync: one entry more than the sync counted, or (erasedups replaced
+# an older copy) as many, but stamped after the sync. Lines other shells wrote
+# to HISTFILE are loaded after the hook and before the sync, so they never
+# count. docs/ctrl-r/01-record.md section 11.3.
+#
+# Kept when the script is sourced again (`source ~/.bashrc`), so the session
+# and what the sync saw carry on.
+: "${__psychic_session:=$$-${RANDOM}${RANDOM}}"
+: "${__psychic_cmd_pwd:=${PWD}}"
+: "${__psychic_hist_on=}"      # recording was on at this prompt
+: "${__psychic_hist_cmdno=}"   # \# at the last prompt: how many commands the shell had run
+: "${__psychic_hist_count=}"   # the history count when the sync ran; empty = nothing to compare with
+: "${__psychic_hist_time=}"    # the time the sync ran, Unix seconds
+: "${__psychic_hist_trusted=}" # the sync ran last in PROMPT_COMMAND
 __psychic_hist_re='^[[:space:]]*([0-9]+)[*]?[[:space:]]+([0-9]+)[[:space:]](.*)$'
+# bash 5.1 runs each element of a PROMPT_COMMAND array in turn, so the sync
+# gets an element of its own: a `PROMPT_COMMAND="$PROMPT_COMMAND; ..."` later
+# in ~/.bashrc then still runs before it. Older bash runs a string only. Also
+# from 5.1, $HISTCMD inside PROMPT_COMMAND is the history count (before, it
+# is always 1, and the count is the newest entry's number, at one fork).
+__psychic_hist_new=''
+((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1))) && __psychic_hist_new=1
+# \# in a prompt string counts the commands the shell has run; ${x@P} (bash
+# 4.4) expands it without a fork. An empty line, Ctrl-C at the prompt and a
+# syntax error leave it alone.
+__psychic_hist_cmdno_format=''
+((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))) && __psychic_hist_cmdno_format='\#'
 
 __psychic_history_enabled() {
     case "${PSYCHIC_HISTORY-}" in
@@ -764,62 +895,229 @@ __psychic_history_enabled() {
     [[ -e "${PSYCHIC_DATA_DIR:-${HOME}/.local/share/psychic}/history-enabled" ]]
 }
 
-# Before each prompt: if bash added a new entry to its history, record it.
+# The newest history entry, into __psychic_hist_{num,start,text}; fails when
+# the list is empty.
+__psychic_history_newest() {
+    \builtin local __psychic_entry
+    __psychic_entry="$(HISTTIMEFORMAT='%s ' \builtin history 1)"
+    [[ "${__psychic_entry}" =~ ${__psychic_hist_re} ]] || \builtin return 1
+    __psychic_hist_num="${BASH_REMATCH[1]}"
+    __psychic_hist_start="${BASH_REMATCH[2]}"
+    __psychic_hist_text="${BASH_REMATCH[3]}"
+}
+
+# PROMPT_COMMAND's first command, into __psychic_hist_word, and its last.
+# bash-preexec keeps `__bp_precmd_invoke_cmd` first and `__bp_interactive_mode`
+# last, putting them back at every prompt; neither touches the history list,
+# so they are looked past, rather than fought over.
+__psychic_history_ends() {
+    \builtin local __psychic_all='' __psychic_i
+    for __psychic_i in "${!PROMPT_COMMAND[@]}"; do
+        # Only element 0 runs before bash 5.1.
+        [[ -n "${__psychic_hist_new}" || "${__psychic_i}" == 0 ]] || continue
+        __psychic_all+="${PROMPT_COMMAND[__psychic_i]}"$'\n'
+    done
+    # Commands are separated by `;` or a newline; strip blanks and separators.
+    __psychic_all="${__psychic_all#"${__psychic_all%%[![:space:];]*}"}"
+    __psychic_all="${__psychic_all%"${__psychic_all##*[![:space:];]}"}"
+    __psychic_hist_first="${__psychic_all%%[[:space:];]*}"
+    if [[ "${__psychic_hist_first}" == __bp_precmd_invoke_cmd ]]; then
+        __psychic_hist_first="${__psychic_all#__bp_precmd_invoke_cmd}"
+        __psychic_hist_first="${__psychic_hist_first#"${__psychic_hist_first%%[![:space:];]*}"}"
+        __psychic_hist_first="${__psychic_hist_first%%[[:space:];]*}"
+    fi
+    __psychic_hist_last="${__psychic_all##*[[:space:];]}"
+    if [[ "${__psychic_hist_last}" == __bp_interactive_mode ]]; then
+        __psychic_hist_last="${__psychic_all%__bp_interactive_mode}"
+        __psychic_hist_last="${__psychic_hist_last%"${__psychic_hist_last##*[![:space:];]}"}"
+        __psychic_hist_last="${__psychic_hist_last##*[[:space:];]}"
+    fi
+}
+
+# Move the hook to the front of PROMPT_COMMAND, from the next prompt on.
+__psychic_history_place_hook() {
+    \builtin local __psychic_i __psychic_first=''
+    \builtin local __psychic_value
+    for __psychic_i in "${!PROMPT_COMMAND[@]}"; do
+        __psychic_value="${PROMPT_COMMAND[__psychic_i]//__psychic_history_hook;/}"
+        __psychic_value="${__psychic_value//__psychic_history_hook/}"
+        [[ "${__psychic_value}" == "${PROMPT_COMMAND[__psychic_i]}" ]] ||
+            PROMPT_COMMAND[__psychic_i]="${__psychic_value}"
+        [[ -n "${__psychic_first}" ]] || __psychic_first="${__psychic_i}"
+    done
+    [[ -n "${__psychic_hist_new}" ]] || __psychic_first=0
+    PROMPT_COMMAND[${__psychic_first:-0}]="__psychic_history_hook;${PROMPT_COMMAND[${__psychic_first:-0}]-}"
+}
+
+# Move the sync to the end of PROMPT_COMMAND, from the next prompt on.
+__psychic_history_place_sync() {
+    if [[ -n "${__psychic_hist_new}" ]]; then
+        \builtin local __psychic_i
+        for __psychic_i in "${!PROMPT_COMMAND[@]}"; do
+            [[ "${PROMPT_COMMAND[__psychic_i]}" == __psychic_history_sync ]] &&
+                \builtin unset 'PROMPT_COMMAND[__psychic_i]'
+        done
+        PROMPT_COMMAND+=(__psychic_history_sync)
+    else
+        # A newline, not `;`: it ends any command, even one with a trailing
+        # `&` or comment.
+        PROMPT_COMMAND="${PROMPT_COMMAND//$'\n'__psychic_history_sync/}"$'\n'__psychic_history_sync
+    fi
+}
+
+# The history count: $HISTCMD from bash 5.1, else the newest entry's number
+# (one fork). Into __psychic_hist_now.
+__psychic_history_count() {
+    if [[ -n "${__psychic_hist_new}" ]]; then
+        __psychic_hist_now="${HISTCMD-}"
+    elif __psychic_history_newest; then
+        __psychic_hist_now="${__psychic_hist_num}"
+    else
+        __psychic_hist_now=0
+    fi
+}
+
+# First in PROMPT_COMMAND: if the user ran a command bash added to its
+# history, record it.
 __psychic_history_hook() {
     \builtin local __psychic_status=$?
     \builtin local __psychic_pwd="${__psychic_cmd_pwd}"
     __psychic_cmd_pwd="${PWD}"
-    __psychic_history_enabled || \builtin return "${__psychic_status}"
-
-    \builtin local __psychic_entry __psychic_key=''
-    __psychic_entry="$(HISTTIMEFORMAT='%s ' \builtin history 1)"
-    if [[ "${__psychic_entry}" =~ ${__psychic_hist_re} ]]; then
-        __psychic_key="${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
-    fi
-    if [[ -z "${__psychic_hist_primed}" ]]; then
-        __psychic_hist_primed=1
-        __psychic_hist_seen="${__psychic_key}"
+    if ! __psychic_history_enabled; then
+        __psychic_hist_on='' __psychic_hist_count=''
         \builtin return "${__psychic_status}"
     fi
-    if [[ -z "${__psychic_key}" || "${__psychic_key}" == "${__psychic_hist_seen}" ]]; then
-        \builtin return "${__psychic_status}"
+    \builtin local __psychic_cmdno=''
+    [[ -n "${__psychic_hist_cmdno_format}" ]] && __psychic_cmdno="${__psychic_hist_cmdno_format@P}"
+    \builtin local __psychic_count="${__psychic_hist_count}" __psychic_since="${__psychic_hist_time}"
+    \builtin local __psychic_trusted="${__psychic_hist_trusted}" __psychic_ran=1 __psychic_first=1
+    [[ -n "${__psychic_cmdno}" && "${__psychic_cmdno}" == "${__psychic_hist_cmdno}" ]] && __psychic_ran=''
+    __psychic_hist_on=1 __psychic_hist_count='' __psychic_hist_time='' __psychic_hist_cmdno="${__psychic_cmdno}"
+    # Where the two functions stand, judged now: for this prompt (the hook)
+    # and for the sync of this prompt. Something run before the hook may
+    # have loaded other shells' lines since the last sync: nothing is
+    # recorded at this prompt, and the hook goes back to the front.
+    \builtin local __psychic_hist_first __psychic_hist_last
+    __psychic_history_ends
+    if [[ "${__psychic_hist_first}" != __psychic_history_hook ]]; then
+        __psychic_first=''
+        __psychic_history_place_hook
     fi
-    __psychic_hist_seen="${__psychic_key}"
+    if [[ "${__psychic_hist_last}" == __psychic_history_sync ]]; then
+        __psychic_hist_trusted=1
+    else
+        __psychic_hist_trusted=''
+        __psychic_history_place_sync
+    fi
 
-    \builtin local __psychic_start="${BASH_REMATCH[2]}" __psychic_text="${BASH_REMATCH[3]}" __psychic_now=''
+    # Nothing to compare with (first prompt, recording just turned on), the
+    # shell ran nothing (empty line, Ctrl-C, syntax error), or the hook was
+    # not first.
+    [[ -n "${__psychic_count}" && -n "${__psychic_ran}" && -n "${__psychic_first}" ]] ||
+        \builtin return "${__psychic_status}"
+
+    # Did bash add the command to its history? With a trusted count: one more
+    # entry is a yes; as many is a no, or erasedups dropped an older copy, and
+    # only the entry's time tells; anything else (the command itself ran
+    # `history -c`, say) is a no. Without one, only the time tells.
+    \builtin local __psychic_appended='' __psychic_hist_num='' __psychic_hist_start='' __psychic_hist_text='' __psychic_hist_now=''
+    if [[ -n "${__psychic_trusted}" ]]; then
+        __psychic_history_count
+        if [[ "${__psychic_hist_now}" == "$((__psychic_count + 1))" ]]; then
+            __psychic_appended=1
+        elif [[ "${__psychic_hist_now}" != "${__psychic_count}" ]]; then
+            \builtin return "${__psychic_status}"
+        fi
+    fi
+    [[ -n "${__psychic_appended}" || -n "${__psychic_since}" ]] || \builtin return "${__psychic_status}"
+    [[ -n "${__psychic_hist_num}" ]] || __psychic_history_newest || \builtin return "${__psychic_status}"
+    [[ -n "${__psychic_appended}" ]] || ((__psychic_hist_start > __psychic_since)) || \builtin return "${__psychic_status}"
+
+    \builtin local __psychic_start="${__psychic_hist_start}" __psychic_now=''
     \builtin printf -v __psychic_now '%(%s)T' -1 2>/dev/null || __psychic_now=''
     # In a subshell, so the shell prints no job number or "Done" line.
     (\command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
         track-command --cwd "${__psychic_pwd}" --exit-code "${__psychic_status}" \
         --started-at "${__psychic_start}" \
-        ${__psychic_now:+--duration-ms} ${__psychic_now:+"$(( (__psychic_now - __psychic_start) * 1000 ))"} \
-        --session "${__psychic_session}" -- "${__psychic_text}" >/dev/null 2>&1 &)
+        ${__psychic_now:+--duration-ms} ${__psychic_now:+"$(((__psychic_now - __psychic_start) * 1000))"} \
+        --session "${__psychic_session}" -- "${__psychic_hist_text}" >/dev/null 2>&1 &)
+    \builtin return "${__psychic_status}"
+}
+
+# Last in PROMPT_COMMAND: note where the history list stands once every other
+# entry is done with it.
+__psychic_history_sync() {
+    \builtin local __psychic_status=$?
+    if [[ -n "${__psychic_hist_on}" ]]; then
+        \builtin local __psychic_hist_now='' __psychic_hist_num='' __psychic_hist_start='' __psychic_hist_text=''
+        __psychic_history_count
+        __psychic_hist_count="${__psychic_hist_now}"
+        \builtin printf -v __psychic_hist_time '%(%s)T' -1 2>/dev/null || __psychic_hist_time=''
+    fi
     \builtin return "${__psychic_status}"
 }
 
 if [[ ";${PROMPT_COMMAND:-};" != *";__psychic_history_hook;"* ]]; then
     PROMPT_COMMAND="__psychic_history_hook${PROMPT_COMMAND:+;${PROMPT_COMMAND}}"
 fi
+__psychic_history_ends
+[[ "${__psychic_hist_last}" == __psychic_history_sync ]] || __psychic_history_place_sync
+\builtin unset __psychic_hist_first __psychic_hist_last
 ```
 
 | Property | How it is obtained |
 |---|---|
 | Command text | Group 3 of `history 1`; multi-line entries arrive whole (POSIX `.` matches a newline) |
 | Start time | Group 2: the history entry's own timestamp, forced to epoch seconds by a one-command `HISTTIMEFORMAT='%s '` |
-| "A new command ran" | The key (history number, timestamp, text) differs from the last one seen (the text is in the key because `erasedups` can leave number and second unchanged). The first invocation only primes the key, so the entry loaded from `HISTFILE` at shell start is never recorded |
+| "This shell ran a command" | `\#` (the prompt escape: commands the shell has executed), expanded with no fork by `${var@P}` (bash >= 4.4), moved since the last prompt. An empty line, Ctrl-C at the prompt and a syntax error leave it alone, so they record nothing. On bash < 4.4 this check is skipped and the next rows decide alone |
+| The history count | bash >= 5.1: `$HISTCMD` (the number the next entry gets). Before 5.1, `$HISTCMD` is always 1 inside `PROMPT_COMMAND`, so the count is the newest entry's number from `history 1` (one `$(...)` fork in the sync and one in the hook per prompt) |
+| "bash added it to its history" | The count against the one the sync took after the previous prompt's `PROMPT_COMMAND`: one more is a yes; the same is a yes only if the newest entry is stamped after the sync (under `erasedups` the new entry replaced an older copy, so the count did not move); anything else is a no. Entries another shell wrote to `HISTFILE` are loaded by `history -n`/`history -r` after the hook and before the sync, so they are never taken for this shell's |
+| Hook is first, sync is last | Checked by the hook at every prompt on the first and last command word of `PROMPT_COMMAND` (all elements joined, from bash 5.1; element 0 before), looking past bash-preexec's `__bp_precmd_invoke_cmd` (first) and `__bp_interactive_mode` (last), which bash-preexec puts back at every prompt and which do not touch the history list. bash >= 5.1: the sync is its own array element, so `PROMPT_COMMAND="$PROMPT_COMMAND; ..."` (which edits element 0) still runs before it; older bash: the last line of the string, after a newline (which ends any command, even one ending in `&` or a comment). If the hook is not first, something before it may have loaded other shells' lines since the sync: nothing is recorded at that prompt, and the hook is moved back to the front of the first element. If the sync is not last, it is moved back to the end, and the next prompt judges by time only (the newest entry must be stamped after the sync) |
+| First prompt | Only primes: there is no count to compare with until a sync has run. So is the first prompt after recording is turned on |
+| Sourced again | The session id and the hook state are set only when unset (`: "${var:=...}"`), so `source ~/.bashrc` keeps the session and the next command is recorded |
 | cwd the command was typed in | `$PWD` saved at the end of the previous invocation |
 | Exit status | `$?` on entry to the function |
-| Duration | Whole seconds x 1000 (bash >= 4.2 for `printf '%(%s)T'`; omitted on 4.0/4.1) |
-| `HISTCONTROL`, `HISTIGNORE`, `set +o history` | A command bash did not add to its history produces no new key, so it is not recorded. No pattern is re-implemented |
-| Coexistence | The function is prepended to `PROMPT_COMMAND` (string or element 0 of the array form) and returns the status it received, so later entries (Starship, direnv, `__psychic_hook`) see the same `$?`. No trap and no `PS0` are touched |
-| Cost when enabled | One `$(...)` fork of the shell per prompt (no exec) plus the background binary |
+| Duration | Whole seconds x 1000 (bash >= 4.2 for `printf '%(%s)T'`; omitted on 3.2-4.1, where the sync's time is unknown too, so only an appended entry counts) |
+| `HISTCONTROL`, `HISTIGNORE`, `set +o history` | A command bash did not add to its history leaves the count where the sync found it and the newest entry stamped before the sync, so it is not recorded. No pattern is re-implemented |
+| Coexistence | The hook is prepended to `PROMPT_COMMAND` (string, or element 0 of the array form), the sync appended; both, and the upstream `__psychic_hook` (which runs after the hook), return the status they received, so later entries (Starship, direnv, the user's own) see the user's command's `$?`. No trap and no `PS0` are touched |
+| Cost when enabled | bash >= 5.1: builtins only when nothing was added to the history (empty line, ignored command), one `$(...)` fork of the shell (no exec) plus the background binary per recorded command. Older bash: one fork in the sync at every prompt, and one in the hook when a command ran |
 
-Known limitation, stated in `docs/how-it-works.md`: with `ignoredups` or
-`ignoreboth` an immediate repeat of the identical command is not added to
-bash's history and therefore not recorded. Two identical commands entered within the same second under `erasedups`
-are recorded once. If another tool is prepended to `PROMPT_COMMAND` after
-psychic and does not preserve `$?`, the recorded exit code is that tool's;
-loading psychic last in `~/.bashrc` avoids it.
+Known limitations, stated in `docs/how-it-works.md`:
+
+- With `ignoredups` or `ignoreboth` an immediate repeat of the identical
+  command is not added to bash's history and therefore not recorded (decided:
+  the shell's own decision is the definition of the opt-out).
+- Under `erasedups`, a command that replaces an older copy of itself is
+  recorded only if bash stamps it in a later second than the sync of the
+  prompt it was typed at; one typed and run within the same second is lost.
+- When the hook finds itself not first (something was prepended to
+  `PROMPT_COMMAND`, as `PROMPT_COMMAND="history -n; $PROMPT_COMMAND"` does),
+  the command run just before that prompt is not recorded. Usually that is the
+  line that did the prepending, or the first prompt of the shell, which records
+  nothing anyway.
+- When the sync is not last (something appended behind it: a new array
+  element on any version, or a string append on bash < 5.1), the next command
+  is judged by time only and is lost if run within the second its prompt
+  appeared; a `history -n` that loaded another shell's line in the very second
+  after the sync could then be taken for the user's command.
+- bash-preexec's two entries are trusted not to touch the history list; a
+  `precmd_functions` entry (run inside `__bp_precmd_invoke_cmd`, before the
+  hook) that runs `history -n` is not detected.
+- A command that itself rewrites the history list (`history -c`, `history -r`,
+  `history -n`, `history -s`, `history -d`) is recorded only when the count
+  ends up exactly one past the sync's, and then the newest entry is what is
+  recorded. With `shopt -u cmdhist`, a multi-line command adds one entry per
+  line, so it is not recorded.
+- An entry another shell wrote with a timestamp in the future (clock skew
+  between machines sharing `HISTFILE`) and loaded when this shell ran an
+  ignored command can be taken for the user's.
+- `unset HISTCMD` (bash >= 5.1) stops recording, silently.
+- Re-sourcing the script on bash < 5.1 prepends `__psychic_hook` a second time
+  (its registration looks for `;__psychic_hook;`, and the sync's newline
+  follows it); the second call is a no-op.
+- If another tool is prepended to `PROMPT_COMMAND` after psychic and does not
+  preserve `$?`, the recorded exit code is that tool's; loading psychic last
+  in `~/.bashrc` avoids it.
 
 ### 11.4 fish (append to `shell/psychic.fish`)
 
@@ -856,9 +1154,19 @@ function __psychic_postexec --on-event fish_postexec
     __psychic_history_enabled; or return
     set -q fish_private_mode; and return
     test -n "$argv[1]"; or return
-    string match -q -- ' *' "$argv[1]"; and return
+    # fish keeps a command out of its history when it starts with a space,
+    # or, if the user defined fish_should_add_to_history, when that says so
+    # (it then decides alone, leading space included).
+    if functions -q fish_should_add_to_history
+        fish_should_add_to_history "$argv[1]" >/dev/null 2>&1; or return
+    else
+        string match -q -- ' *' "$argv[1]"; and return
+    end
     set -l __psychic_bin psychic
     set -q PSYCHIC_BIN; and set __psychic_bin $PSYCHIC_BIN
+    # Not installed (or not on PATH): fish would print "command not found",
+    # and the command line with it, at every prompt.
+    command -q $__psychic_bin; or return
     set -l __psychic_dir
     set -q PSYCHIC_DATA_DIR; and set __psychic_dir --data-dir $PSYCHIC_DATA_DIR
     command $__psychic_bin $__psychic_dir track-command --cwd "$__psychic_cmd_pwd" \
@@ -869,6 +1177,18 @@ end
 ```
 
 fish >= 4 also sets `fish_private_mode` for `fish --no-config`, so such a shell records nothing.
+
+`fish_should_add_to_history` (fish >= 4): when the user defined it, fish calls
+it with the command line and adds the command to its history only when it
+returns 0; it then decides alone, leading space included (fish's own
+documentation). The hook calls it once more with the same `$argv[1]` (checked
+on fish 4.2.1: fish passes `fish_postexec` the same string) and records only on
+0, instead of the leading-space rule. Calling it again is safe because fish
+documents it as a predicate run before the command, which cannot see `$status`.
+
+`command -q $__psychic_bin; or return` keeps a missing binary silent: without
+it fish prints `<bin>: command not found` and the function's arguments, the
+command text, at every prompt (E-R-01).
 
 No `--started-at`: `track.rs` step 6 derives it from `--duration-ms`
 (`$CMD_DURATION` is milliseconds). `$status` is read on the first line, before
@@ -909,6 +1229,7 @@ is not consulted (it is rarely exported).
 | `src/import/mod.rs`, after `is_off_limits` ([:188](../../src/import/mod.rs)) | Add `pub(crate) fn is_dir_within_limits(path: &Path, home: &Path) -> bool { path.is_absolute() && !is_off_limits(path, home) && resolve_safely(path, home).is_some_and(\|r\| r.kind == PathKind::Dir) }`. It goes through `resolve_safely` ([:255](../../src/import/mod.rs)), not `Path::is_dir`, so a symlink into a macOS protected folder is never followed |
 | [src/import/shell_history.rs:26](../../src/import/shell_history.rs) | `pub(super) struct HistoryCommand` -> `pub(crate)` |
 | [src/import/shell_history.rs:92](../../src/import/shell_history.rs), [:136](../../src/import/shell_history.rs), [:158](../../src/import/shell_history.rs) | `parse_zsh`, `parse_bash`, `parse_fish`: `pub(super)` -> `pub(crate)` |
+| `src/import/shell_history.rs`, after `parse_bash` | Add `pub(crate) fn parse_bash_entries(bytes: &[u8]) -> Vec<HistoryCommand>`: the file as bash reads it back. If its first line is a timestamp line (bash's `HIST_TIMESTAMP_START`: `#` and a digit), each non-timestamp line that does not directly follow a timestamp line is appended, after a `\n`, to the entry before it, so a multi-line command is one entry; the timestamp is the last timestamp line before the entry's first line. Otherwise it is `parse_bash` (bash itself reads such a file one entry per line, checked with bash 5.3 `history -r`). `parse_bash` and the path import (`replay`, [src/import/sources.rs:89](../../src/import/sources.rs)) are unchanged: they look at one line at a time |
 | [src/import/shell_history.rs:372-383](../../src/import/shell_history.rs) | Extract into `fn command_words(words: Vec<Option<String>>) -> Option<NamedCommand>` with `struct NamedCommand { name: String, arguments: Vec<Option<String>> }` (a struct, not a tuple, per [llm.md](../../llm.md)) (skips `NAME=value`, `builtin`, `command`; returns name and arguments) |
 | [src/import/shell_history.rs:385-404](../../src/import/shell_history.rs) | Extract the decision into `cwd_step` (below); `replay` calls it. Behaviour of `replay` is unchanged and its tests ([:507-581](../../src/import/shell_history.rs)) pass unmodified |
 | `src/import/shell_history.rs`, after `replay` | Add `replay_cwds` (below) |
@@ -939,7 +1260,7 @@ and `previous = replace(&mut cwd, target)`; `Lost` sets `previous = cwd.take()`;
 
 ### 12.3 Shell-file algorithm (per file)
 
-1. `commands = parse_zsh|parse_bash|parse_fish(bytes)`;
+1. `commands = parse_zsh|parse_bash_entries|parse_fish(bytes)`;
    `cwds = replay_cwds(&commands, home, &mut |p| crate::import::is_dir_within_limits(p, home))`.
 2. Assign timestamps by one backward pass,
    `fn assign_times(timestamps: &[Option<i64>], now: i64, ceiling: i64) -> Vec<AssignedTime { at: i64, synthetic: bool }>`
@@ -962,7 +1283,7 @@ and `previous = replace(&mut cwd, target)`; `Lost` sets `previous = cwd.take()`;
    imported once only).
 5. Otherwise `record_run_in` with `source = Import`, `exit_code = None`,
    `duration_ms = None`, `started_at = at[i]`, `cwd = cwds[i]`,
-   `repo_root = cwd.and_then(find_repo_root)`, `shell_session =
+   `repo_root = cwd.and_then(|c| find_repo_root(c, Some(home)))`, `shell_session =
    "import:<kind>:<h>"` for real timestamps and `"import-synth:<kind>:<h>"` for
    synthetic ones, where `<h>` is `format!("{:016x}", fnv1a64(path) as u64)[..8]`.
    A `RunOutcome::Duplicate` counts as skipped.
@@ -998,7 +1319,9 @@ Query: `SELECT command, timestamp, duration, exit, cwd, session FROM history
 4-5 of 12.3 with `synthetic = false` and `source = Import`.
 
 `BackfillReport { sources: Vec<SourceReport { kind, key, found, inserted, skipped, unavailable: Option<&'static str> }> }`
-(`unavailable` is `Some("locked")` or `Some("unexpected schema")` when Atuin could not be read; a missing
+(`unavailable` says why Atuin could not be read: `Some("locked")` when SQLite reported `SQLITE_BUSY` or
+`SQLITE_LOCKED` past the 2 s busy timeout, `Some("unreadable")` for any other open or read failure (not a
+database, damaged, no permission), `Some("unexpected schema")` when a column is missing; a missing
 file is `None` with `found 0`). A source's whole file is one transaction that also writes its
 `command_imports` row, so a failed file leaves no trace (E-R-14). The filter of 12.3 step 4 that
 also applies to `track-command` (empty, too long, own, ignored) is one function, `track::is_recordable`.
@@ -1020,8 +1343,11 @@ files, and a skipped Atuin source prints `atuin skipped (<reason>)` in place of
 ```
 Shell history search is on.
   Recording: every command you run from now on, with its directory, exit code and duration.
-  Not recorded: commands your shell keeps out of its own history (leading space,
-    HISTIGNORE / HISTORY_IGNORE), anything matching $PSYCHIC_HISTORY_IGNORE, psychic's own commands.
+  Not recorded: what your shell's own settings keep out of its history (bash: HISTCONTROL,
+    HISTIGNORE; zsh: HIST_IGNORE_SPACE, HISTORY_IGNORE, HIST_NO_STORE; fish: a leading space,
+    or fish_should_add_to_history), psychic's own commands, and anything matching
+    PSYCHIC_HISTORY_IGNORE (colon-separated patterns; it must be exported).
+  Recorded anyway: lines a zsh zshaddhistory hook rejects; add them to PSYCHIC_HISTORY_IGNORE.
   Stored in: <data dir>/events.db (readable only by you). Nothing leaves this machine.
   Ctrl-R: open a new shell to get the binding.
   Undo: psychic history --disable   Delete everything: psychic history --purge
@@ -1083,7 +1409,7 @@ within one test: `Database`'s schema registry is keyed by path
 | TC-R-04 | `glob_match` | (`*password*`, `mysql -ppassword1`), (`git ?`, `git s`), (`git ?`, `git st`), (`[a-c]x`, `bx`), (`[!a-c]x`, `bx`), (`a\*b`, `a*b`), (`a\*b`, `aXb`), (`[x`, `[x`) | true, true, false, true, false, true, false, true | whole-text anchoring, escape, unclosed bracket |
 | TC-R-05 | `is_ignored` | text `export TOKEN=1`; patterns `None`, `""`, `ls:export *`, `:` | false, false, true, false | empty list elements |
 | TC-R-06 | `fnv1a64` | `""`, `"a"` | `0xcbf29ce484222325 as i64`, `0xaf63dc4c8601ec8c as i64` | published FNV-1a vectors |
-| TC-R-07 | `find_repo_root` | temp tree `r/.git/`, `r/a/b/`; inputs `r/a/b`, `r`, temp root, `relative/x` | `Some(r)`, `Some(r)`, `None`, `None` | `.git` as a file (`r2/.git` file) -> `Some(r2)` |
+| TC-R-07 | `find_repo_root` | temp tree with its own `home`: `home/r/.git/`, `home/r/a/b/`, `home/plain/`; home = `home`; inputs `home/r/a/b`, `home/r`, `home/plain`, `home`, `relative/x` | `Some(r)`, `Some(r)`, `None`, `None`, `None` | `.git` as a file (`home/r2/.git` file) -> `Some(r2)`. Second tree with `home/.git/`: `home/notes/2024` -> `None` (also with home given as `home/`), `home/src/app/src` with `home/src/app/.git` -> `Some(home/src/app)`, `home/notes/2024` with home `None` -> `Some(home)`. Third: `srv/repo/.git`, input `srv/repo/x/y` outside home -> `Some(srv/repo)`. No answer depends on what lies above the temp dir |
 | TC-R-08 | `record_run` aggregates | same text 3 times: exit 0 at t=100, exit 1 at t=200, exit NULL at t=150 | `run_count 3, success 1, fail 1, first_run_at 100, last_run_at 200, last_exit_code 1` | out-of-order arrival does not overwrite `last_exit_code` |
 | TC-R-09 | `record_run` predecessor | session `s`: A at 100, B at 160, C at 160+1801; session `t`: D at 170 | B.prev = A, C.prev = NULL (gap), D.prev = NULL (other session) | `CMD_SEQUENCE_MAX_GAP_SECS` boundary: gap exactly 1800 -> linked |
 | TC-R-10 | import uniqueness | `record_run` Import twice with same text and `started_at` | second returns `Duplicate`; `run_count == 1` | Hook rows with the same pair are both inserted |
@@ -1095,7 +1421,12 @@ within one test: `Database`'s schema registry is keyed by path
 | TC-R-16 | `track::run` derives the start | now 1000, `--duration-ms 2500`, no `--started-at` | `started_at == 998` | `--started-at 990` wins; no duration -> 1000 |
 | TC-R-17 | `tighten_permissions` | temp dir 0755 with `events.db` 0644 | dir `0o700`, file `0o600`; a second call performs no `set_permissions` (modes already right) | missing `-wal`/`-shm` are not an error |
 | TC-R-18 | `delete_command` | A (3 runs, 2 events), B with `prev = A` | A gone from all three tables; B.prev NULL; `deleted_commands` has `fnv1a64(A.text)` | - |
-| TC-R-19 | clap surface | `["psychic","track-command","--cwd","/x","--session","s","--","-rf --weird\nline"]` | `command == "-rf --weird\nline"` | missing `--` -> parse error; `history --enable --purge` -> parse error (group) |
+| TC-R-19 | clap surface | `["psychic","track-command","--cwd","/x","--session","s","--","-rf --weird\nline"]` | `command == "-rf --weird\nline"` | missing `--` -> parse error; `history --enable --purge` -> parse error (group); `--cwd` with the bytes `/tmp/caf\xe9` parses |
+| TC-R-20 | `parse_bash_entries` | `#1700000000`, `echo one`, `#1700000001`, `echo "multi`, `line"`, `#1700000002`, `#1700000003`, `ls`, `#1700000004` | `echo one`@..000, `echo "multi\nline"`@..001, `ls`@..003 | two timestamp lines in a row (the last wins); a trailing timestamp line; a file not starting with a timestamp line is one entry per line, as bash reads it (`old plain`, `#1700000001`, `echo "multi`, `line"` -> 3 entries) |
+| TC-R-21 | `purge` on disk | a file data dir with 200 runs of a sentinel text | after `purge`: `log_cleared`; neither `events.db` nor `events.db-wal` holds the sentinel's bytes, before and after the store is dropped | the same with a second, idle connection open; a second connection inside a read transaction -> `log_cleared == false`, rows still deleted; the `--purge` action then prints its line and fails with E-R-23 |
+| TC-R-22 | Atuin failures | `history.db` of 4096 bytes of `Z`; a real Atuin database under another connection's `BEGIN EXCLUSIVE` | `unavailable` `Some("unreadable")`, summary `atuin skipped (unreadable)`; `Some("locked")` | - |
+| TC-R-23 | `track::run` cwd | `--cwd` with the bytes `/tmp/caf\xe9`; a cwd `H/notes` with `H/.git` and home `H` | cwd stored as `/tmp/caf\u{FFFD}`; `repo_root` NULL | - |
+| TC-R-24 | `backfill::run`, bash | `.bash_history` `#1700000000`, `for f in *; do`, `  echo "$f"`, `done`, `#1700000005`, `ls` | 2 runs: the loop as one text with its newlines at 1700000000, `ls` at 1700000005 | - |
 
 ### 15.2 Integration tests
 
@@ -1107,23 +1438,49 @@ within one test: `Database`'s schema registry is keyed by path
 | IT-R-04 | Atuin import | Build a temp `history.db` with the A1-A4 schema and 4 rows with nanosecond timestamps: (exit 0, cwd `/x`), (exit 1, cwd `unknown`), (exit -1, cwd `/y`), and a fourth with `deleted_at` set | 3 rows imported; `started_at` in seconds; `exit_code` 0, 1, NULL; `cwd` `/x`, NULL, `/y`; `duration_ms` NULL where Atuin's is -1; the Atuin file's mtime and size are unchanged | `remove_dir_all` |
 | IT-R-05 | Tombstone blocks re-import | Import, `delete_command` one, import again | The deleted text is absent after the second import | `remove_dir_all` |
 | IT-R-06 | Enable, disable, purge | Temp data dir; `--enable --no-import`, record 2 runs, `--status`, `--purge --yes`, `--disable` | Marker exists then not; modes 700/600; status lines as section 13.3; after purge all five tables are empty and the marker is still present | `remove_dir_all` |
-| IT-R-07 | No command text leaks | Temp data dir; run `track::run` and `backfill::run` with texts containing `SENTINEL_c0ffee` | No file in the data dir other than `events.db*` contains the bytes `SENTINEL_c0ffee` | `remove_dir_all` |
+| IT-R-07 | No command text leaks (`tests/no_text_leaks.rs`, the built binary, so its real logger writes the real `app.log`) | Temp `HOME` (cleared environment) with `.bash_history`, `.zsh_history` and a non-database Atuin `history.db`, all holding `SENTINEL_c0ffee`; `--data-dir` in the temp dir. Run `history --enable` (imports), `track-command` with the sentinel (succeeding, and failing on a data dir that is a file), `history --import`, `--status`, `--purge --yes` | No invocation's stdout or stderr contains the sentinel; it is in `events.db*` before the purge (so it went through every path); `app.log` exists and holds `atuin skipped (unreadable)` (so a leak would show); no file in the data dir other than `events.db*`, recursively, contains the bytes; nothing was written to `HOME/.local/share/psychic`. Checked to fail when a `log::debug!` of the text is added to the importer | `remove_dir_all` |
 | IT-S-zsh, IT-S-bash, IT-S-fish | Real shell, real hook (`tests/shell_hooks.rs`) | Section 15.3 | Section 15.3 | `remove_dir_all` |
 
 ### 15.3 Shell-level tests (`tests/shell_hooks.rs`)
 
-One `#[test]` per shell. Binary: `env!("CARGO_BIN_EXE_psychic")`.
+One `#[test]` per shell for the session below, once with `PSYCHIC_HISTORY=1` and
+once with the marker file instead (`psychic --data-dir T/data history --enable
+--no-import`, run with `HOME=T/home`, and no `PSYCHIC_HISTORY`); then the
+scenario tests after the table. Binary: `env!("CARGO_BIN_EXE_psychic")`.
 
 | Step | Detail |
 |---|---|
 | Skip rule | If `Command::new(<shell>).arg("--version")` fails to spawn: `println!("skipped: <shell> not installed")` and return (pass) |
-| Scratch | `T = temp_dir()/psychic-shell-<shell>-<pid>`; `T/home`, `T/data`, `T/work/sub`; `T/hook` = stdout of `psychic <shell>` |
+| Scratch | `T = temp_dir()/psychic-shell-<shell>-<tag>-<pid>`; `T/home`, `T/data`, `T/work/sub`; `T/hook` = stdout of `psychic --data-dir T/data <shell>` run with `HOME=T/home` |
+| Database | Created before the shell starts (`psychic --data-dir T/data history --status`, or the `--enable` of the marker variant): otherwise the session's first two background `track-command`s both create it, and one can lose the race to switch it to WAL mode (`database is locked`) and drop a run |
 | Environment (cleared, then) | `HOME=T/home`, `PATH` inherited, `TERM=dumb`, `PSYCHIC_BIN=<binary>`, `PSYCHIC_DATA_DIR=T/data`, `PSYCHIC_HISTORY=1`, `PSYCHIC_NO_RETRAIN=1`, `HISTFILE=T/home/hist`; bash also `HISTCONTROL=ignorespace`, `HISTIGNORE='secret*'`; zsh also `ZDOTDIR=T/home` |
 | Launch | On a pty (`libc::openpty`; child via `std::process::Command` with the slave as stdin/stdout/stderr and `pre_exec` doing `setsid()` + `ioctl(0, TIOCSCTTY, 0)`; window 24x80). zsh: `zsh -f -i`; bash: `bash --norc --noprofile -i`; fish: `fish -i -C 'source T/hook'` with `XDG_CONFIG_HOME=T/home/.config` and `XDG_DATA_HOME=T/home/.local/share` (not `--no-config`: fish 4 sets `fish_private_mode` under `--no-config`, and the hook records nothing in private mode) (the hook is loaded before the first prompt, because `fish_postexec` would otherwise record the `source` line itself). cwd `T/work` |
 | Drive | A reader thread drains the master. Write each line + `\n`, sleeping 500 ms before the first line and 150 ms between lines |
 | Lines | (zsh only) `setopt histignorespace`, `HISTORY_IGNORE='secret*'`; then for all: (zsh, bash) `source T/hook`; then `true`, `false`, `cd sub`, `echo in-sub`, ` echo leading-space`, (zsh, bash) `secret-thing`, `echo 'multi` / `line'`; then the single byte `0x04` (Ctrl-D on an empty line ends all three shells without a command that could itself be recorded) |
 | Wait | Child exit within 30 s (else kill and fail). The `0x04` is re-sent every 2 s until the shell exits: fish 4.2 sometimes drops a Ctrl-D that arrives while it is still finishing the previous command (seen with recording off too, after a `cd` whose upstream `track-visit` hook fails), and a second Ctrl-D on an empty line does nothing else. Then poll `SELECT COUNT(*) FROM command_runs` every 50 ms for up to 5 s until it equals the expected count |
-| Expected rows, ordered by `started_at, id` (text / cwd / exit_code / source) | `true` / `T/work` / 0 / hook; `false` / `T/work` / 1 / hook; `cd sub` / `T/work` / 0 / hook; `echo in-sub` / `T/work/sub` / 0 / hook; the multi-line echo: text starts with `echo 'multi`, contains a newline or `;`, ends with `line'` / `T/work/sub` / 0 / hook. Exactly 5 rows; no text contains `leading-space` or `secret`; all 5 share one `shell_session`; `commands.template` of `cd sub` is `cd PATH` |
+| Expected rows, compared sorted (text / cwd / exit_code / source) | `true` / `T/work` / 0 / hook; `false` / `T/work` / 1 / hook; `cd sub` / `T/work` / 0 / hook; `echo in-sub` / `T/work/sub` / 0 / hook; the multi-line echo: text starts with `echo 'multi`, contains a newline or `;`, ends with `line'` / `T/work/sub` / 0 / hook. Exactly 5 rows; no text contains `leading-space` or `secret`; all 5 share one `shell_session`; `commands.template` of `cd sub` is `cd PATH`. Not by `started_at, id`: the runs land in the same second and their background `track-command`s take the write lock in any order |
+
+Scenario tests (same scratch, launch and environment; rows compared as a
+sorted list of `(text, exit_code)`):
+
+| Test | Steps | Expected runs |
+|---|---|---|
+| bash, `history -a; history -n` | `source T/hook`; `PROMPT_COMMAND="$PROMPT_COMMAND; history -a; history -n"`; `echo one`; (another shell appends `echo from-another-shell` to `T/home/hist`); empty line; ` echo ignored`; (append `echo from-another-shell-2`); empty line; Ctrl-C; `false`; `echo two`; 300 ms between steps | the `PROMPT_COMMAND=...` line, `echo one`, `echo two` (0), `false` (1): nothing of the other shell, nothing for the empty lines, Ctrl-C or the ignored command, nothing twice |
+| bash, `history -a; history -c; history -r` | as above with that `PROMPT_COMMAND` | as above |
+| bash, `history -a; history -n` prepended | `PROMPT_COMMAND="history -a; history -n; $PROMPT_COMMAND"`; `echo one`; (append); ` echo ignored`; (append); `echo two`; `echo three` | `echo one`, `echo two`, `echo three`: the hook moves back to the front; the prepending line itself is not recorded (section 11.3) |
+| bash, next to bash-preexec | `source T/bp`, a stand-in that re-pins `__bp_precmd_invoke_cmd` first and `__bp_interactive_mode` last (an array element) at every prompt, as bash-preexec does, without its DEBUG trap; `PROMPT_COMMAND="$PROMPT_COMMAND; history -a; history -n"`; `echo one`; (append); ` echo ignored`; `false`; `echo two` | the `source` and `PROMPT_COMMAND=...` lines, `echo one`, `false` (1), `echo two`: no fight over the ends of `PROMPT_COMMAND` |
+| bash, `HISTCONTROL=ignoredups` | `echo same`, `echo same`, `echo other` | `echo same` once, `echo other` (the decision of section 11.3) |
+| bash, `$?` after the hooks | `PROMPT_COMMAND="$PROMPT_COMMAND; echo \$? >> T/seen"`; `false`; `true`; `(exit 3)` | `T/seen` ends with `1`, `0`, `3` |
+| zsh, `HIST_NO_STORE` | `setopt histnostore` and `alias h=history` before `source T/hook`; `history`, `fc -rl`, `builtin history 1`, `h >/dev/null`, `fc -W /dev/null`, `echo history`, `history;echo y` | `echo history`, `fc -W /dev/null`, `history;echo y` |
+| fish, `fish_should_add_to_history` | `T/fish-init` defines it to reject `secret*`, sourced after the hook by `-C`; `echo kept`, `secret-thing`, ` echo spaced` | `echo kept`, `echo spaced` (the function decides alone, leading space included) |
+| fish, binary missing | `PSYCHIC_BIN=T/no-such-psychic`; `echo first`, `echo second` | The terminal shows neither the missing path nor `__psychic_postexec` |
+
+Each scenario test except the `ignoredups` one fails against the hooks of
+commit `4c37b59`. Old bash versions are not in the suite (one bash per
+machine); they were checked by hand in the `bash:3.2`, `4.3`, `4.4`, `5.0` and
+`5.1` images: no line of another shell, no ignored command and nothing twice
+was recorded, and every command at 0.3 s spacing was, except the documented
+ones (section 11.3).
 
 The pty helper (about 60 lines) lives in `tests/support/mod.rs`, declared with
 `mod support;` in `tests/shell_hooks.rs`; Phase B's `tests/picker.rs` uses the
@@ -1133,28 +1490,29 @@ same module. It is not shared with `src/`.
 
 | # | Failure | Detection | Response | Fallback | Logging |
 |---|---|---|---|---|---|
-| E-R-01 | `psychic` not on PATH in a hook | Shell cannot exec | Nothing: background job fails, output discarded | Command not recorded | None |
+| E-R-01 | `psychic` not on PATH in a hook | Shell cannot exec; fish checks first with `command -q` (section 11.4) | Nothing: background job fails, output discarded; fish returns before calling it | Command not recorded | None |
 | E-R-02 | No data dir (`HOME` unset, no `--data-dir`) | `data_dir.is_none()` | `Err("No data directory: pass --data-dir, or set HOME")`, exit 1 | Not recorded | None (stderr discarded by the hook) |
 | E-R-03 | Database locked more than 5 s | `SQLITE_BUSY` after `busy_timeout = 5000` ([src/db.rs:209](../../src/db.rs)) | `Err("recording a command failed: database busy")`, exit 1 | That run is lost; no retry | None |
 | E-R-04 | Disk full / read-only data dir | rusqlite or io error | `Err` naming the operation and path, exit 1 | Not recorded | None |
 | E-R-05 | Clap rejects the hook's arguments (non-numeric `--exit-code`, missing `--`) | clap error | clap's message on stderr (discarded), exit 2 | Not recorded | None |
-| E-R-06 | Command text is not UTF-8 | `to_string_lossy` replaces bytes | Recorded with U+FFFD | - | None |
+| E-R-06 | Command text or `--cwd` is not UTF-8 | `to_string_lossy` replaces bytes (`--cwd` is a `PathBuf`, so clap accepts any bytes) | Recorded with U+FFFD; the repository is looked up on the real path first | - | None |
 | E-R-07 | Command over `CMD_MAX_TEXT_BYTES`, empty, own, or ignored | Section 9 steps 2-5 | `Ok(())`, exit 0 | Not recorded by design | None |
 | E-R-08 | `chmod` fails (file owned by another user) | `tighten_permissions` returns `Err` | `CmdStore::open` returns `Err("could not make <path> private")` | `track-command`: not recorded. `--enable`: prints the error, marker not written | Picker/actions: `log::error!` with the path |
 | E-R-09 | Marker file cannot be written | io error in `--enable` | `Err("could not write <marker path>")`, exit 1 | Recording stays off | stderr via `main` |
 | E-R-10 | History file missing or unreadable | `fs::read` error | Source reports `found 0` | Other sources continue | `log::info!("import: <kind> history not readable")` |
 | E-R-11 | History file is not valid UTF-8 | - | `from_utf8_lossy` (upstream parsers, [src/import/shell_history.rs:93](../../src/import/shell_history.rs)) | - | None |
 | E-R-12 | Atuin DB missing | `!path.exists()` | Source skipped, `found 0` | - | None |
-| E-R-13 | Atuin DB locked or unexpected schema | open/query error, or `pragma_table_info` check fails | `unavailable: Some("locked")` / `Some("unexpected schema")` in the report; summary prints `atuin skipped (<reason>)` | Shell files still import | `log::warn!` with the reason, no row data |
+| E-R-13 | Atuin DB locked, unreadable, or unexpected schema | open/query error with `SQLITE_BUSY`/`SQLITE_LOCKED` -> `locked`; any other open/query error (not a database, damaged, permission) -> `unreadable`; `pragma_table_info` check fails -> `unexpected schema` | `unavailable: Some(<reason>)` in the report; summary prints `atuin skipped (<reason>)` | Shell files still import | `log::warn!` with the reason, no row data |
 | E-R-14 | Import transaction fails mid-file | rusqlite error | Roll back that file's transaction; `command_imports` not updated; continue with the next source | A later `--import` retries the file (synthetic entries included, since I2 has no row) | `log::error!("import of <source_key> failed: <sqlite code>")` |
 | E-R-15 | `--purge` without `--yes` and stdin is not a terminal | `!std::io::stdin().is_terminal()` | `bail!("stdin is not a terminal, so psychic can't ask before deleting; pass --yes")` (wording as [src/shell_init.rs:269-271](../../src/shell_init.rs)) | Nothing deleted | stderr via `main` |
 | E-R-16 | zsh without `zsh/datetime` | `EPOCHREALTIME` empty | Hook omits `--started-at` and `--duration-ms` | `track.rs` uses `now`; duration NULL | None |
 | E-R-17 | bash older than 4.2 | `printf '%(%s)T'` fails | Hook omits `--duration-ms` | duration NULL | None |
-| E-R-18 | bash history disabled or command suppressed by `HISTCONTROL`/`HISTIGNORE` | No new history key | Not recorded | By design | None |
+| E-R-18 | bash history disabled or command suppressed by `HISTCONTROL`/`HISTIGNORE` | `$HISTCMD` where the sync left it, newest entry stamped before the sync | Not recorded | By design | None |
 | E-R-19 | Two `track-command` processes at once | SQLite write lock | Second waits on `busy_timeout` | - | None |
 | E-R-20 | Clock goes backwards between runs | `started_at` smaller than the session's last | S3 (`started_at <= ?2`) finds an older predecessor or none; S5 keeps `last_run_at` as the max | - | None |
 | E-R-22 | `--import`, or a first `--enable` that imports, with `HOME` unset | `env.home()` is `None` | `Err("HOME is not set, so psychic can't find your shell history")`, exit 1 | `--enable`: marker not written | stderr via `main` |
 | E-R-21 | A shell needed by a shell test is not installed | `--version` spawn fails | Test prints `skipped: ...` and passes | - | test stdout |
+| E-R-23 | `--purge` while another connection is inside a read (a running picker, say) | `PRAGMA wal_checkpoint(TRUNCATE)` returns busy = 1 after `busy_timeout`, or `VACUUM` fails with `SQLITE_BUSY`/`SQLITE_LOCKED` | The rows are deleted and `Deleted ...` is printed; then `Err("another psychic process has <db> open, so the deleted commands can still be on disk in its files; close running psychic instances and run psychic history --purge again")`, exit 1 | Rerun once the other process is gone; the next checkpoint clears the log | stderr via `main` |
 
 ## 17. References
 

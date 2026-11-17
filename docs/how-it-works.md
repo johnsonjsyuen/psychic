@@ -2541,8 +2541,9 @@ there either way for binding to another key. In bash it needs bash 4+ for
 **How each shell tracks directories.** zsh has a `chpwd` hook. fish runs a
 function `--on-variable PWD`, disowned so no "job has ended" line appears. bash
 has neither, so `__psychic_hook` runs from `PROMPT_COMMAND` (prepended once,
-however often the script is loaded) and acts only when `$PWD` differs from the
-last prompt's; it starts from the directory the shell opened in, so opening a
+however often the script is loaded), acts only when `$PWD` differs from the
+last prompt's, and returns the `$?` it was called with, so `PROMPT_COMMAND`
+entries after it still see the status of the user's command; it starts from the directory the shell opened in, so opening a
 shell is not a visit. Checked on bash 3.2 by `cd`ing and calling the hook: one
 visit per change. Because it compares only at prompts, several `cd`s on one
 command line count as one visit; fish records each.
@@ -2767,7 +2768,7 @@ New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
 | `cmd/tuning.rs` | Every tunable constant of the feature |
 | `cmd/store.rs` | The command tables and every SQL statement on them (`CmdStore`); a plan test per indexed statement |
 | `cmd/template.rs` | Word splitting and `templatize` (`cd foo` -> `cd PATH`); own-command detection |
-| `cmd/repo.rs` | `find_repo_root`: nearest ancestor with a `.git` entry, on the logical path |
+| `cmd/repo.rs` | `find_repo_root`: nearest ancestor with a `.git` entry, on the logical path, stopping below `$HOME` (a dotfiles `~/.git` is no repository) |
 | `cmd/privacy.rs` | Opt-in marker, `PSYCHIC_HISTORY_IGNORE` globs, permissions, FNV-1a tombstones |
 | `cmd/track.rs` | `psychic track-command` |
 | `cmd/backfill.rs` | Import from Atuin, zsh, bash and fish history |
@@ -2791,17 +2792,37 @@ makes imports idempotent.
 prompt (no process when off; `PSYCHIC_HISTORY=0|1` overrides), stash the
 command, its `$PWD` and start time before it runs, and make one background
 `psychic track-command ... -- TEXT` call before the next prompt. zsh uses
-`preexec`/`precmd`; fish `fish_preexec`/`fish_postexec`; bash prepends a
-function to `PROMPT_COMMAND` that reads `history 1` - no DEBUG trap and no
-`PS0`, so it cannot fight bash-preexec or Starship, and `HISTCONTROL` /
-`HISTIGNORE` are honoured because only what bash itself kept is recorded.
-`PSYCHIC_BIN` and `PSYCHIC_DATA_DIR` point the hooks at another build and
-data dir (tests use them). Known bash gaps: an immediate repeat under
-`ignoredups`/`ignoreboth` is not added to bash's history and so not recorded;
-two identical commands in the same second under `erasedups` count once; a
-tool prepended to `PROMPT_COMMAND` after psychic that does not preserve `$?`
-makes the recorded exit code its own (load psychic last); durations have
-1-second resolution.
+`preexec`/`precmd`; fish `fish_preexec`/`fish_postexec`. bash has neither and
+psychic takes no DEBUG trap and no `PS0` (bash-preexec and Starship own
+those), so two functions run from `PROMPT_COMMAND`: a hook first, which keeps
+`$?` and reads `history 1`, and a sync last (its own array element on bash
+5.1+, so a later `PROMPT_COMMAND="$PROMPT_COMMAND; ..."` still runs before
+it), which notes the history count (`$HISTCMD` from 5.1; before that it is
+always 1 there, so the newest entry's number) and the time once every other
+entry - a `history -a; history -n`, say - has changed the list. The newest
+entry is the user's command only if the shell ran one (`\#` moved, bash 4.4+)
+and bash added it after the sync: one more entry, or (`erasedups`) as many but
+stamped later. The hook checks at every prompt that it is still first and the
+sync still last (looking past bash-preexec's own first and last entries),
+and moves them back if not. So `HISTCONTROL`/`HISTIGNORE` are honoured because
+only what bash itself kept is recorded, and lines other shells wrote to
+`HISTFILE` - which an earlier version recorded as this shell's, with this
+shell's cwd and status - never are. Checked on bash 3.2, 4.3, 4.4, 5.0, 5.1 and
+5.3. zsh also honours `HIST_NO_STORE` (zsh's own rule, repeated, aliases
+expanded), fish `fish_should_add_to_history` (called again: it is a
+predicate). zsh's `zshaddhistory` hooks are not honoured: their verdict cannot
+be observed, and calling them twice is unsafe (zsh-histdb would insert twice),
+so `--enable` says so. `PSYCHIC_BIN` and `PSYCHIC_DATA_DIR` point the hooks at
+another build and data dir (tests use them); fish checks the binary exists
+first, or it would print "command not found" and the command at every prompt.
+Known bash gaps (`docs/ctrl-r/01-record.md` section 11.3 has the full list):
+an immediate repeat under `ignoredups`/`ignoreboth` is not added to bash's
+history and so not recorded; under `erasedups` a repeat run within the second
+its prompt appeared is lost; the command after which the hook found itself no
+longer first is not recorded, and the one after the sync stopped being last
+is judged by its timestamp alone; a tool prepended to `PROMPT_COMMAND` after
+psychic that does not preserve `$?` makes the recorded exit code its own (load
+psychic last); durations have 1-second resolution.
 
 **`track-command`** is dispatched in `main` before the logger is set up, so
 it never opens `app.log` and command text cannot reach a log. It trims the
@@ -2809,25 +2830,43 @@ text and skips it when empty, over 8,192 bytes, psychic's own (`psychic`,
 `p`, `pd`, `pc` as the command word) or matching `PSYCHIC_HISTORY_IGNORE`
 (colon-separated globs over the whole text, matched by a 60-line matcher
 rather than a regex crate). Then one `Database::new`, a permissions check and
-a five-statement transaction. Measured at Phase A (release build, 300 runs
+a five-statement transaction. A non-UTF-8 `$PWD` or text is stored lossily
+(U+FFFD), never dropped. Measured at Phase A (release build, 300 runs
 each, spawned from Python, so including about 1.2 ms of spawn cost): p50
 5.4 ms, p95 7.6 ms for 300 distinct commands; p50 5.4 ms, p95 6.9 ms for one
-command repeated. The budget (B4) is 10 ms p95.
+command repeated. The budget (B4) is 10 ms p95. Those runs used a data dir on
+tmpfs. On ext4 (NVMe), 400 runs of each interleaved: p50 15.7 ms, p95 19.4 ms
+for commit `4c37b59`, p50 15.9 ms, p95 19.1 ms after the bash-hook rework that
+followed it, so no change from that; the cost is the disk: the process
+holds the database's only connection, so on close SQLite checkpoints the
+write-ahead log into the database and deletes it, four `fsync`s worth about
+11 ms. Skipping that checkpoint (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`) was
+tried and is worse: the log grows (18 MB after 400 runs) and every new
+process re-reads it to rebuild its index. B4 is not met on a real disk; it
+needs a decision (a persistent log file, or a different durability setting
+for this one connection) that has not been made.
 
 **Privacy.** Every `CmdStore::open` makes the data dir `0700` and `events.db`,
 its `-wal`/`-shm`, the marker and the command model files `0600` (only when
 they differ; file-only users who never enable history keep their modes).
 Errors from the command code name the operation and SQLite error code, never
-a bound value. `--purge` empties the five tables, `VACUUM`s, and removes the
-command model; the marker is left alone. Deleting one command leaves a
+a bound value. `--purge` turns on `secure_delete`, empties the five tables,
+`VACUUM`s, and truncates the write-ahead log with a `TRUNCATE` checkpoint, so
+no deleted text stays in the database's files even while another psychic
+process has the database open; if one is in the middle of a read, the checkpoint cannot
+finish and purge fails telling the user to close it and purge again. It also
+removes the command model; the marker is left alone. Deleting one command leaves a
 tombstone so a later import does not restore it. Shell history files are
 never edited.
 
 **Import** (`--import`, and the first `--enable` unless `--no-import`):
 Atuin's `history.db` first (opened read-only; true cwd, exit codes and
-durations; units told apart by magnitude; skipped with a reason if its schema
-is not the expected one), then `~/.zsh_history` (and `$ZDOTDIR`'s), `~/.bash_history`
-and fish's history, through the parsers of `import/shell_history.rs`. The cwd
+durations; units told apart by magnitude; skipped with a reason - `locked`,
+`unreadable` or `unexpected schema`), then `~/.zsh_history` (and `$ZDOTDIR`'s),
+`~/.bash_history` and fish's history, through the parsers of
+`import/shell_history.rs`. bash's is read as bash reads it back: in a file
+that starts with a `#<epoch>` line, the lines up to the next one are one
+command (`parse_bash_entries`); the path import keeps reading it line by line. The cwd
 of each file entry comes from `replay_cwds`, the same `cd` replay the path
 import uses (state before the entry's own `cd`). Entries without a timestamp
 get synthetic ones, one second apart, ending at the file's mtime, and are

@@ -152,6 +152,47 @@ pub(crate) fn parse_bash(bytes: &[u8]) -> Vec<HistoryCommand> {
     commands
 }
 
+/// `~/.bash_history` as bash itself reads it back, for importing whole
+/// commands. When the file starts with a timestamp line (`#` and a digit),
+/// every line up to the next timestamp line belongs to one entry, so a
+/// multi-line command is one command joined with `\n`. Otherwise bash reads
+/// one entry per line, and so does this (it is `parse_bash` then).
+///
+/// The path import keeps `parse_bash`: it looks at one line at a time anyway.
+pub(crate) fn parse_bash_entries(bytes: &[u8]) -> Vec<HistoryCommand> {
+    let text = String::from_utf8_lossy(bytes);
+    if !is_bash_timestamp_line(&text) {
+        return parse_bash(bytes);
+    }
+    let mut commands: Vec<HistoryCommand> = Vec::new();
+    // The timestamp line just read, waiting for the entry it belongs to.
+    let mut pending: Option<Option<i64>> = None;
+    for line in text.lines() {
+        if is_bash_timestamp_line(line) {
+            let digits = line[1..].split(|c: char| !c.is_ascii_digit()).next();
+            pending = Some(digits.and_then(|digits| digits.parse().ok()));
+            continue;
+        }
+        match (pending.take(), commands.last_mut()) {
+            (None, Some(command)) => {
+                command.text.push('\n');
+                command.text.push_str(line);
+            }
+            (timestamp, _) => commands.push(HistoryCommand {
+                text: line.to_string(),
+                timestamp: timestamp.flatten(),
+            }),
+        }
+    }
+    commands
+}
+
+/// bash's `HIST_TIMESTAMP_START`: `#` followed by a digit.
+fn is_bash_timestamp_line(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.len() >= 2 && bytes[0] == b'#' && bytes[1].is_ascii_digit()
+}
+
 /// `fish_history`: a YAML-like list of `- cmd: <command>` entries with a
 /// `  when: <epoch>` line. Newlines and backslashes in the command are escaped
 /// as `\n` and `\\`.
@@ -528,6 +569,34 @@ mod tests {
             parse_bash(b"#1700000000\ncd /tmp\nls\n"),
             vec![command("cd /tmp", Some(1700000000)), command("ls", None)]
         );
+    }
+
+    #[test]
+    fn bash_entries_join_the_lines_between_timestamps_as_bash_reads_them() {
+        let history = b"#1700000000\necho one\n#1700000001\necho \"multi\nline\"\n#1700000002\n#1700000003\nls\n#1700000004\n";
+        assert_eq!(
+            parse_bash_entries(history),
+            vec![
+                command("echo one", Some(1700000000)),
+                command("echo \"multi\nline\"", Some(1700000001)),
+                command("ls", Some(1700000003)),
+            ]
+        );
+    }
+
+    #[test]
+    fn bash_entries_without_a_leading_timestamp_are_one_per_line() {
+        // bash decides by the first line: these are three entries to it.
+        let history = b"old plain\n#1700000001\necho \"multi\nline\"\n";
+        assert_eq!(
+            parse_bash_entries(history),
+            vec![
+                command("old plain", None),
+                command("echo \"multi", Some(1700000001)),
+                command("line\"", None),
+            ]
+        );
+        assert_eq!(parse_bash_entries(b"ls\npwd\n"), parse_bash(b"ls\npwd\n"));
     }
 
     #[test]

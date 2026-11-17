@@ -110,6 +110,37 @@ function __psychic_history_enabled() {
     [[ -e "${PSYCHIC_DATA_DIR:-${HOME}/.local/share/psychic}/history-enabled" ]]
 }
 
+# HIST_NO_STORE: whether zsh keeps the line `$1` out of its history, as
+# should_ignore_line in zsh's hist.c decides it on the parsed line (aliases
+# expanded, words joined by single spaces): `history`, `r` or `fc -l` (any
+# option letters before the first non-letter include an `l`), after an
+# optional `builtin`, and followed by a space or nothing (so `history;x` is
+# kept, `history|x` is not); a function of that name runs instead unless
+# `builtin` was given, and then the line is kept.
+function __psychic_history_no_store() {
+    \builtin emulate -L zsh
+    \builtin local -a words
+    words=(${(z)1})
+    \builtin local forced='' depth=0
+    while (( depth++ < 10 )); do
+        if [[ "${words[1]-}" == builtin ]]; then
+            forced=1
+            \builtin shift words
+        elif [[ -z "${forced}" && -n "${words[1]-}" && -n "${aliases[${words[1]}]-}" ]]; then
+            words=(${(z)aliases[${words[1]}]} "${(@)words[2,-1]}")
+        else
+            break
+        fi
+    done
+    [[ "${words[2]-}" == ';' ]] && \builtin return 1
+    case "${words[1]-}" in
+        history|r) ;;
+        fc) [[ "${words[2]-}" == -* && "${${words[2]#-}%%[^[:alpha:]]*}" == *l* ]] || \builtin return 1 ;;
+        *) \builtin return 1 ;;
+    esac
+    [[ -n "${forced}" ]] || ! \builtin functions "${words[1]}" >/dev/null 2>&1
+}
+
 # Before a command runs: remember it, where it was typed and when.
 function __psychic_preexec() {
     __psychic_cmd=''
@@ -117,6 +148,7 @@ function __psychic_preexec() {
     [[ -n "$1" ]] || \builtin return 0
     [[ -o histignorespace && "$1" == ' '* ]] && \builtin return 0
     [[ -n "${HISTORY_IGNORE-}" && "$1" == ${~HISTORY_IGNORE} ]] && \builtin return 0
+    [[ -o histnostore ]] && __psychic_history_no_store "$1" && \builtin return 0
     __psychic_cmd="$1"
     __psychic_cmd_pwd="${PWD}"
     __psychic_cmd_start="${EPOCHREALTIME-}"

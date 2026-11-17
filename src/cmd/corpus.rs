@@ -580,7 +580,11 @@ fn session_of(line: &Value, file_stem: &str) -> String {
 
 /// Read every transcript under `projects_dir` (read-only) and record its
 /// Bash calls into `store` in global time order, in one transaction.
-pub(super) fn extract_agent(projects_dir: &Path, store: &CmdStore) -> Result<AgentReport> {
+pub(super) fn extract_agent(
+    projects_dir: &Path,
+    home: Option<&Path>,
+    store: &CmdStore,
+) -> Result<AgentReport> {
     let files = transcript_files(projects_dir);
     let mut report = AgentReport {
         files: files.len() as u64,
@@ -612,7 +616,7 @@ pub(super) fn extract_agent(projects_dir: &Path, store: &CmdStore) -> Result<Age
                 repo_roots
                     .entry(cwd.clone())
                     .or_insert_with(|| {
-                        repo::find_repo_root(Path::new(cwd))
+                        repo::find_repo_root(Path::new(cwd), home)
                             .map(|root| root.to_string_lossy().into_owned())
                     })
                     .clone()
@@ -921,7 +925,7 @@ mod tests {
         let before = (mtime(&main), mtime(&agent));
 
         let store = CmdStore::open(&root.join("data")).unwrap();
-        let report = extract_agent(&projects, &store).unwrap();
+        let report = extract_agent(&projects, None, &store).unwrap();
         assert_eq!(
             (
                 report.files,

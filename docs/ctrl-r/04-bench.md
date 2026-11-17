@@ -144,7 +144,7 @@ parsing; several blocks on one line are handled in array order):
 Then all entries of all files are stably sorted by `(started_ms, file path, line number)`
 (block order within a line is kept) and written inside one `CmdStore::transaction` with `record_run_in`: `source = Hook` (they carry true cwd
 and outcome), `shell_session = "agent:<session>"`, `repo_root =
-find_repo_root(cwd)` (memoised per cwd), `template = templatize(text)`. The filters of
+find_repo_root(cwd, home)` (memoised per cwd; `home` is `BenchEnv::home`), `template = templatize(text)`. The filters of
 [01 section 9](01-record.md#9-track-command) steps 2-4 apply (empty, over
 `CMD_MAX_TEXT_BYTES`, psychic's own commands); `PSYCHIC_HISTORY_IGNORE` does not.
 Exit status is a boolean in the transcripts, so `exit_code` is 0 or 1 only.

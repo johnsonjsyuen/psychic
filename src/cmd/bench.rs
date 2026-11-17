@@ -93,7 +93,7 @@ pub(super) fn run(
         BenchCommand::ExtractAgent { projects_dir: dir } => {
             let dir = projects_dir(dir, env)?;
             let store = empty_store(data_dir)?;
-            let report = corpus::extract_agent(&dir, &store)?;
+            let report = corpus::extract_agent(&dir, env.home.as_deref(), &store)?;
             if report.files == 0 {
                 writeln!(out, "no transcripts found under {}", dir.display())?;
                 return Ok(());
