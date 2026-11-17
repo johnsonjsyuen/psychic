@@ -266,9 +266,9 @@ pub(super) enum RunOutcome {
     Duplicate,
 }
 
-pub(super) struct CommandRow {
+pub(super) struct CommandRow<Text = String> {
     pub id: i64,
-    pub text: String,
+    pub text: Text,
     pub last_run_at: i64,
     pub run_count: u32,
     pub success_count: u32,
@@ -657,29 +657,52 @@ impl CmdStore {
     /// Every command.
     #[cfg(test)]
     pub(super) fn load_commands(&self) -> Result<Vec<CommandRow>> {
-        self.load_commands_in(IdRange {
+        let every = IdRange {
             first: i64::MIN,
             last: i64::MAX,
+        };
+        self.load_commands_in(every, |row| CommandRow {
+            text: row.text.to_string(),
+            id: row.id,
+            last_run_at: row.last_run_at,
+            run_count: row.run_count,
+            success_count: row.success_count,
+            fail_count: row.fail_count,
+            pick_count: row.pick_count,
+            last_exit_code: row.last_exit_code,
         })
     }
 
-    /// The commands with an id in `range`, in id order.
-    pub(super) fn load_commands_in(&self, range: IdRange) -> Result<Vec<CommandRow>> {
+    /// The commands with an id in `range`, in id order, each turned into a
+    /// `T` by `build` while its row is current: the text is borrowed from
+    /// SQLite, not copied into a `String` first (R1 is most of start-up).
+    pub(super) fn load_commands_in<T>(
+        &self,
+        range: IdRange,
+        mut build: impl FnMut(CommandRow<&str>) -> T,
+    ) -> Result<Vec<T>> {
         self.rows(
             R1,
             params![range.first, range.last],
             "loading commands",
             |row| {
-                Ok(CommandRow {
+                let text = row.get_ref(1)?.as_str().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(build(CommandRow {
                     id: row.get(0)?,
-                    text: row.get(1)?,
+                    text,
                     last_run_at: row.get(2)?,
                     run_count: row.get(3)?,
                     success_count: row.get(4)?,
                     fail_count: row.get(5)?,
                     pick_count: row.get(6)?,
                     last_exit_code: row.get(7)?,
-                })
+                }))
             },
         )
     }

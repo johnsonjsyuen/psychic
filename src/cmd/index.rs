@@ -17,6 +17,7 @@ use super::tuning::{CMD_EVENT_WINDOW_SECS, CMD_LOAD_READERS};
 use anyhow::Result;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Strings (directories, repository roots, templates) as small ids.
 #[derive(Default)]
@@ -122,20 +123,16 @@ fn split_ids(ids: IdRange, parts: usize) -> Vec<IdRange> {
 
 /// R1 over `range`, as entries.
 fn read_entries(store: &CmdStore, range: IdRange) -> Result<Vec<CommandEntry>> {
-    Ok(store
-        .load_commands_in(range)?
-        .into_iter()
-        .map(|row| {
-            let mut entry = CommandEntry::new(row.id, &row.text);
-            entry.last_run_at = row.last_run_at;
-            entry.run_count = row.run_count;
-            entry.success_count = row.success_count;
-            entry.fail_count = row.fail_count;
-            entry.pick_count = row.pick_count;
-            entry.last_exit_code = row.last_exit_code;
-            entry
-        })
-        .collect())
+    store.load_commands_in(range, |row| {
+        let mut entry = CommandEntry::new(row.id, row.text);
+        entry.last_run_at = row.last_run_at;
+        entry.run_count = row.run_count;
+        entry.success_count = row.success_count;
+        entry.fail_count = row.fail_count;
+        entry.pick_count = row.pick_count;
+        entry.last_exit_code = row.last_exit_code;
+        entry
+    })
 }
 
 /// What R2-R8 return, read before the index exists.
@@ -231,6 +228,10 @@ pub(super) struct LoadParams {
     pub cwd: Option<String>,
     pub repo_root: Option<String>,
     pub shell_session: Option<String>,
+}
+
+fn ms_since(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 /// Insert `at` keeping `times` ascending.
@@ -362,18 +363,24 @@ impl CommandIndex {
     pub(super) fn load(store: &CmdStore, p: &LoadParams) -> Result<(CommandIndex, RankContext)> {
         let file = store.file();
         let readers = if file.is_some() { CMD_LOAD_READERS } else { 1 };
+        let started = Instant::now();
         let ranges = match store.command_ids()? {
             Some(ids) => split_ids(ids, readers),
             None => Vec::new(),
         };
-        let (parts, context) = std::thread::scope(|scope| {
+        let (parts, context, context_ms) = std::thread::scope(|scope| {
             let file = file.as_deref();
             let open = move || -> Result<CmdStore> {
                 let side = CmdStore::open_file(file.expect("only with a file"))?;
                 side.map_for_reading()?;
                 Ok(side)
             };
-            let context = file.map(|_| scope.spawn(move || ContextRows::read(&open()?, p)));
+            let context = file.map(|_| {
+                scope.spawn(move || {
+                    let rows = ContextRows::read(&open()?, p);
+                    Ok::<_, anyhow::Error>((rows?, ms_since(started)))
+                })
+            });
             let others: Vec<_> = ranges
                 .iter()
                 .skip(1)
@@ -388,12 +395,16 @@ impl CommandIndex {
                     .into_iter()
                     .map(|reader| reader.join().expect("a reader does not panic")),
             );
-            let context = match context {
-                Some(reader) => reader.join().expect("a reader does not panic"),
-                None => ContextRows::read(store, p),
+            let (context, context_ms) = match context {
+                Some(reader) => match reader.join().expect("a reader does not panic") {
+                    Ok((rows, at)) => (Ok(rows), at),
+                    Err(error) => (Err(error), ms_since(started)),
+                },
+                None => (ContextRows::read(store, p), ms_since(started)),
             };
-            (parts, context)
+            (parts, context, context_ms)
         });
+        let read_ms = ms_since(started);
 
         let mut index = CommandIndex::default();
         let total = parts
@@ -408,7 +419,17 @@ impl CommandIndex {
                 index.push_entry(entry);
             }
         }
+        let pushed_ms = ms_since(started);
         let ctx = index.apply(context?, p);
+        // Each stage ends this many ms after the load started; numbers only.
+        log::info!(
+            "TIMING {{\"op\":\"cmd_index_stages\",\"readers\":{},\"context_ms\":{:.3},\"read_ms\":{:.3},\"pushed_ms\":{:.3},\"applied_ms\":{:.3}}}",
+            readers,
+            context_ms,
+            read_ms,
+            pushed_ms,
+            ms_since(started)
+        );
         Ok((index, ctx))
     }
 

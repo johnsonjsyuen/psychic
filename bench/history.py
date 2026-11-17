@@ -303,6 +303,8 @@ def startup(b, n):
     """6.2 (B3): start to first results on screen, from the TIMING lines."""
     keys = {"cmd_first_full_render": [], "cmd_first_results": [], "cmd_first_render": [],
             "cmd_index_load": [], "cmd_model_load": [], "first_query": []}
+    # cmd_index_stages: when each part of the index load ended, from its start.
+    stages = {"read_ms": [], "context_ms": [], "pushed_ms": [], "applied_ms": []}
     dropped = 0
     for trial in range(n + 1):
         offset = b.log_size()
@@ -320,6 +322,9 @@ def startup(b, n):
         if "cmd_first_full_render" not in ops:
             dropped += 1
             continue
+        for key in stages:
+            if "cmd_index_stages" in ops and key in ops["cmd_index_stages"]:
+                stages[key].append(ops["cmd_index_stages"][key])
         for key in keys:
             if key == "first_query":
                 if "cmd_query" in ops:
@@ -336,6 +341,11 @@ def startup(b, n):
     for key, values in keys.items():
         if values:
             print(f"  {labels[key]:<32}{percentile(values, .5):9.2f}{percentile(values, .95):9.2f}{max(values):9.2f}")
+    stage_labels = {"read_ms": "commands read (R1, all readers)", "context_ms": "R2-R8 read (beside R1)",
+                    "pushed_ms": "entries in the index", "applied_ms": "R2-R8 applied (load done)"}
+    for key, values in stages.items():
+        if values:
+            print(f"    {stage_labels[key]:<30}{percentile(values, .5):9.2f}{percentile(values, .95):9.2f}{max(values):9.2f}")
     if not keys["cmd_model_load"]:
         print("model not loaded: rerun setup")
     status = verdict(percentile(b3, .95), TARGETS["B3_first_results_ms_p95"], unreliable=unreliable)
@@ -383,6 +393,7 @@ def keystroke(b, n, pause=0.0):
     model_loaded = any(line["op"] == "cmd_model_load" for line in lines)
     queries = [line for line in lines if line["op"] == "cmd_query"][1:]
     results = [line["ms"] for line in lines if line["op"] == "cmd_key_to_results"][1:]
+    draws = [line["draw_ms"] for line in lines if line["op"] == "cmd_key_to_results" and "draw_ms" in line][1:]
     total = [q["total_ms"] for q in queries]
     fresh = [q for q in queries if not q["reused"]]
     first_letter = [q["total_ms"] for q in fresh if q["query_len"] == 1 and not q["narrowed"]]
@@ -398,6 +409,7 @@ def keystroke(b, n, pause=0.0):
     print(f"{'':<42}{'p50':>9}{'p95':>9}{'max':>9}{'n':>6}")
     line("keystroke -> first byte, the echo (B2)", redraw)
     line("keystroke -> results drawn", results)
+    line("  of which the draw", draws)
     line("worker per keystroke (B1)", total)
     line("  of those not reused", [q["total_ms"] for q in fresh])
     line("  first letter (full scan)", first_letter)

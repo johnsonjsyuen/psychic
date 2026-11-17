@@ -215,7 +215,7 @@ runs.
 
 | Query | Fills |
 |---|---|
-| R1 | One entry per row: `db_id`, `text`, `last_run_at`, the four counts, `last_exit_code`; `run_times` empty, `last_fail_at = 0` |
+| R1 | One entry per row, built from the borrowed row on the reader's thread: `db_id`, `text`, `last_run_at`, the four counts, `last_exit_code`; `run_times` empty, `last_fail_at = 0` |
 | R2 | `ctx.dir = Some(dirs.intern(cwd))`; `dir_stats[(idx, dir)] = DirStat { runs, last_run_at }` |
 | R3 | `ctx.repo = Some(repos.intern(repo_root))`; `repo_runs[(idx, repo)] = count` |
 | R4 | Push `started_at` to `run_times` (rows arrive ascending); non-zero `exit_code` -> `last_fail_at = max` |
@@ -290,7 +290,9 @@ pub(super) fn spawn<T>(data_dir: &Path, params: LoadParams, event_tx: Sender<T>)
    `rayon::broadcast(|_| { let _ = matcher.fuzzy_match("warm up", "wu"); })` - the
    rayon pool starts, and every rayon thread creates its matcher scratch space,
    off the load's critical path and not inside the first query.
-3. Send `Loaded`. Log `TIMING {"op":"cmd_index_load","ms":..,"commands":N}` and
+3. Send `Loaded`. (`CommandIndex::load` has logged `TIMING {"op":"cmd_index_stages","readers":N,"context_ms":..,"read_ms":..,"pushed_ms":..,"applied_ms":..}`:
+   when R2-R8, all reads, the entries' move into the index and the
+   application of R2-R8 ended, in ms from the load's start.) Log `TIMING {"op":"cmd_index_load","ms":..,"commands":N}` and
    `TIMING {"op":"cmd_worker_ready","ms":<since PROCESS_START>}`.
 4. Loop: `rx.recv()`, then drain with `try_recv` into a queue applying the
    supersession rule; process the queue in order. While seeds (section 6.3)
@@ -530,9 +532,9 @@ TIMING lines written by the UI thread, each once per process, of the form
 (end of the first draw that had at least one row, or that followed a
 `QueryUpdated` with zero rows). `cmd_first_full_render` is what B3 measures.
 One more, per accepted `QueryUpdated` (Phase D): `TIMING
-{"op":"cmd_key_to_results","ms":<ms>}` after the draw that follows it, `ms`
+{"op":"cmd_key_to_results","ms":<ms>,"draw_ms":<ms>}` after the draw that follows it, `ms`
 counted from when the UI thread sent the query (the key handler) to the end
-of that draw: the key-to-results time `bench/history.py` reports beside B2
+of that draw, `draw_ms` that draw alone: the key-to-results time `bench/history.py` reports beside B2
 ([04 section 6.3](04-bench.md#63-keystroke-n200---pause-s---b2-and-b1)).
 
 ### 8.3 Layout and rows

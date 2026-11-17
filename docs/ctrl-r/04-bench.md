@@ -516,6 +516,7 @@ appended `TIMING` lines. One extra warm-up trial first, discarded.
 | first results | `cmd_first_results.ms` |
 | first paint | `cmd_first_render.ms` |
 | index load | `cmd_index_load.ms` |
+| its stages: commands read, R2-R8 read, entries in the index, R2-R8 applied (each from the load's start) | `cmd_index_stages.read_ms`, `.context_ms`, `.pushed_ms`, `.applied_ms` |
 | model load | `cmd_model_load.ms` |
 | first query, worker | the first `cmd_query.total_ms` |
 
@@ -555,6 +556,7 @@ verdict is the worse of the two runs.
 |---|---|
 | **keystroke -> first byte, the echo (B2)** | the measured intervals |
 | keystroke -> results drawn | `cmd_key_to_results` lines except the first |
+| of which the draw | their `draw_ms` |
 | **worker time per keystroke (B1)** | `total_ms` of every `cmd_query` TIMING line of this run except the first (the Backspaces are answered by the worker's reuse rules, [02 section 6.3](02-browse.md#63-filter), as a user's are; `reused` says which) |
 | worker per keystroke, not reused | the lines with `reused: false` (each did a filter and a ranking) |
 | first letter | the lines with `reused: false`, `narrowed: false` and `query_len` 1: a scan of every command |

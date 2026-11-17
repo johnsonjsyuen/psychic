@@ -428,7 +428,7 @@ Row structs are plain `pub(super)` structs in `store.rs` with the listed fields.
 |---|---|---|
 | `transaction`, `record_run_in`, `record_run` | S1-S5 | section 6.1 |
 | `command_ids()` | R1 ids | `Option<IdRange { first: i64, last: i64 }>` (`None`: no command) |
-| `load_commands_in(range: IdRange)` | R1 | `Vec<CommandRow { id: i64, text: String, last_run_at: i64, run_count: u32, success_count: u32, fail_count: u32, pick_count: u32, last_exit_code: Option<i32> }>`, in id order; `load_commands()` (tests only) is the whole range |
+| `load_commands_in<T>(range: IdRange, build: impl FnMut(CommandRow<&str>) -> T)` | R1 | `Vec<T>`, in id order, `build` called on each `CommandRow<Text = String> { id: i64, text: Text, last_run_at: i64, run_count: u32, success_count: u32, fail_count: u32, pick_count: u32, last_exit_code: Option<i32> }` while its row is current, the text borrowed from SQLite (no `String` per row); `load_commands()` (tests only) is the whole range as `Vec<CommandRow>` |
 | `file()`, `open_file(path)`, `map_for_reading()` | - | The database file (`None` in memory); another connection to it, with `Database::new` only (no directory creation or permission change); `PRAGMA mmap_size = 268435456` on this connection. Used by the picker's start-up readers ([02 section 5.2](02-browse.md#52-load-picker-start)) |
 | `runs_in_cwd(cwd: &str)` | R2 | `Vec<CwdRunsRow { command_id: i64, runs: u32, last_run_at: i64 }>` |
 | `runs_in_repo(repo_root: &str)` | R3 | `Vec<CountRow { command_id: i64, runs: u32 }>` |
