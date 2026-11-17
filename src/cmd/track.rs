@@ -1,14 +1,15 @@
 //! `psychic track-command`: record one command the shell just ran.
 //!
 //! Runs on every prompt while recording is on, in the background, so it is
-//! kept to process start, one database open and one short transaction
-//! (budget B4, 10 ms p95). It never checks the opt-in marker - being called is
-//! the hook's decision - and never logs: `main` dispatches here before the
-//! logger exists. See `docs/ctrl-r/01-record.md` section 9.
+//! kept to process start, one database open and one short transaction, and
+//! its connection skips the checkpoint on close (budget B4, 10 ms p95; see
+//! [`CmdStore::open_for_recording`]). It never checks the opt-in marker -
+//! being called is the hook's decision - and never logs: `main` dispatches
+//! here before the logger exists. See `docs/ctrl-r/01-record.md` section 9.
 
 use super::cli::TrackCommandArgs;
 use super::store::{CmdStore, NewRun, Source};
-use super::tuning::CMD_MAX_TEXT_BYTES;
+use super::tuning::{CMD_MAX_TEXT_BYTES, CMD_WAL_TRUNCATE_BYTES};
 use super::{privacy, repo, template};
 use anyhow::{Result, bail};
 use std::path::Path;
@@ -58,7 +59,8 @@ pub(super) fn run(data_dir: Option<&Path>, args: &TrackCommandArgs, env: &TrackE
     let repo_root = repo_root.as_deref().map(Path::to_string_lossy);
     let template = template::templatize(text);
 
-    CmdStore::open(data_dir)?.record_run(&NewRun {
+    let store = CmdStore::open_for_recording(data_dir)?;
+    store.record_run(&NewRun {
         text,
         template: &template,
         started_at,
@@ -69,6 +71,8 @@ pub(super) fn run(data_dir: Option<&Path>, args: &TrackCommandArgs, env: &TrackE
         shell_session: &args.session,
         source: Source::Hook,
     })?;
+    // A busy log is left for a later run: the run itself is recorded.
+    store.close_recording(CMD_WAL_TRUNCATE_BYTES)?;
     Ok(())
 }
 

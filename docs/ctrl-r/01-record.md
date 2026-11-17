@@ -113,6 +113,7 @@ All in `src/cmd/tuning.rs`, each `pub(super) const` with a doc comment.
 | `CMD_EVENT_WINDOW_SECS` | `i64` | `2_592_000` | 30 days: how far back individual runs (R4) and picks (R8) are loaded |
 | `CMD_OWN_COMMANDS` | `&[&str]` | `["psychic", "p", "pd", "pc"]` | First words that are never recorded |
 | `CMD_PATH_ARG_COMMANDS` | `&[&str]` | `["cd","pushd","ls","ll","la","cat","less","more","bat","vim","vi","nvim","nano","emacs","hx","code","rm","rmdir","mkdir","touch","cp","mv","ln","chmod","chown","source",".","open","xdg-open","head","tail","wc","du","tree"]` | Commands whose every non-flag argument is a path for templating |
+| `CMD_WAL_TRUNCATE_BYTES` | `u64` | `2 * 1024 * 1024` | `track-command` checkpoints and truncates `events.db-wal` (W1) once it is longer than this (section 9.1) |
 
 ## 4. CLI surface
 
@@ -309,8 +310,14 @@ impl CmdStore {
     /// `create_dir_all(data_dir)`, then `Database::new(&Database::get_db_path(data_dir))`
     /// (pragmas, schema), then `privacy::tighten_permissions(data_dir)` (section 10.4).
     pub(super) fn open(data_dir: &Path) -> anyhow::Result<Self>;
+    /// `open`, then `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` on this connection (section 9.1). `track-command` only.
+    pub(super) fn open_for_recording(data_dir: &Path) -> anyhow::Result<Self>;
+    /// Consumes the store: W1 when `events.db-wal` is longer than `limit` bytes, then close (section 9.1).
+    pub(super) fn close_recording(self, limit: u64) -> anyhow::Result<LogBound>;
     #[cfg(test)] pub(super) fn in_memory() -> Self;   // Database::new(Path::new(":memory:"))
 }
+/// Within: log not over `limit`, left alone. Truncated: W1 returned busy = 0. Busy: W1 returned busy = 1.
+pub(super) enum LogBound { Within, Truncated, Busy }
 ```
 
 ### 6.1 Write path (S)
@@ -397,6 +404,7 @@ fixes the join order (SQLite never reorders a `CROSS JOIN`).
 | D4 | `UPDATE command_runs SET prev_command_id = NULL WHERE prev_command_id = ?1` (plan: `idx_command_runs_prev`) | delete one |
 | D5 | `DELETE FROM commands WHERE id = ?1` | delete one |
 | P1 | `PRAGMA secure_delete = ON`; then in one transaction `DELETE FROM command_events; DELETE FROM command_runs; DELETE FROM commands; DELETE FROM command_imports; DELETE FROM deleted_commands;`; then `VACUUM`; then `PRAGMA wal_checkpoint(TRUNCATE)`, whose first column (busy) must be 0 (section 10.5) | purge |
+| W1 | `PRAGMA busy_timeout` set to 0 on this connection; then `PRAGMA wal_checkpoint(TRUNCATE)`; busy (first column) 1 is not an error (section 9.1) | `track-command`, once `events.db-wal` is over `CMD_WAL_TRUNCATE_BYTES` |
 | I1 | `SELECT MIN(started_at) FROM command_runs WHERE source = 'hook'` (plan: `idx_command_runs_hook`) | backfill |
 | I2 | `SELECT 1 FROM command_imports WHERE source_key = ?1` / `INSERT OR REPLACE INTO command_imports (source_key, imported_at, runs) VALUES (?1, ?2, ?3)` | backfill |
 | I3 | `SELECT 1 FROM deleted_commands WHERE text_hash = ?1` | backfill |
@@ -434,6 +442,7 @@ Row structs are plain `pub(super)` structs in `store.rs` with the listed fields.
 | `log_events(now: i64, events: &[NewEvent])` (one transaction) | E1 | `()`; `NewEvent` has one field per E1 parameter except `timestamp`, which the method takes as `now: i64`; `action` is `enum EventAction { Impression, Pick }`, `episode_queries` is `Option<&[String]>` and is written as a JSON array |
 | `count_pick(command_id: i64)` | E2 | `()` |
 | `delete_command(command_id: i64, text: &str, now: i64)` | D1-D5 | `()` |
+| `open_for_recording(data_dir)`, `close_recording(self, limit: u64)` | W1 | `Self`; `LogBound` (section 6). The log's length is one `fs::metadata` of `events.db-wal` (missing = 0) |
 | `purge()` | P1 | `PurgeCounts { commands: u64, runs: u64, log_cleared: bool }` (counts taken before deleting; `log_cleared` = the checkpoint's busy column was 0) |
 | `first_hook_run()` | I1 | `Option<i64>` |
 | `import_done(source_key: &str)`, `mark_import(source_key: &str, now: i64, runs: u64)` | I2 | `bool`, `()` |
@@ -560,7 +569,8 @@ with `pub(super) struct TrackEnv<'a> { now: i64, ignore: Option<&'a str>, home: 
 | 4 | `template::first_command_word(text)` in `CMD_OWN_COMMANDS` | return `Ok(())` |
 | 5 | `privacy::is_ignored(text, env_ignore)` (section 10.3) | return `Ok(())` |
 | 6 | `started_at = args.started_at.unwrap_or(now - args.duration_ms.unwrap_or(0).max(0) / 1000)`; `cwd = Some(args.cwd)` unless empty; `repo_root = cwd.and_then(\|c\| find_repo_root(c, env.home))` on the path as given; then `cwd` and `repo_root` are stored with `to_string_lossy` (a non-UTF-8 byte becomes U+FFFD, as in the text, E-R-06); `template = templatize(text)` | - |
-| 7 | `CmdStore::open(data_dir)?` (creates the data dir if missing) `.record_run(&NewRun { source: Source::Hook, .. })` (section 6.1). A negative `--duration-ms` is passed as `None` | - |
+| 7 | `CmdStore::open_for_recording(data_dir)?` (creates the data dir if missing) `.record_run(&NewRun { source: Source::Hook, .. })` (section 6.1). A negative `--duration-ms` is passed as `None` | - |
+| 8 | `store.close_recording(CMD_WAL_TRUNCATE_BYTES)?` (section 9.1); `LogBound::Busy` is not an error | - |
 
 It does not check the opt-in marker: being called is the hook's decision
 (section 10.1). `main` returns from M1 before its own `create_dir_all`
@@ -572,7 +582,53 @@ no logger is installed (section 2, M1).
 Budget: B4. Cost model: process start + clap parse, one `Database::new`
 (first-open schema work is about 0.7 ms, [src/db.rs:151-153](../../src/db.rs)),
 at most 7 `stat` calls for permissions, one `.git` walk, one 5-statement
-transaction with `synchronous = NORMAL` under WAL (no fsync per commit).
+transaction with `synchronous = NORMAL` under WAL (no fsync per commit), one
+`stat` of the log, and no checkpoint on close (section 9.1).
+
+### 9.1 The write-ahead log of `track-command`
+
+By default the last connection to close checkpoints the log into
+`events.db` and deletes it. For `track-command` that connection is nearly
+always its own, and the checkpoint is about four `fsync`s, ~11 ms on an ext4
+NVMe disk: p50 ~16 ms, p95 ~18 ms at the perf DB, against B4's 10 ms.
+`open_for_recording` therefore sets `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, and
+the run stays in `events.db-wal`.
+
+That alone lets the log grow without bound (12.9 MB after 310 runs, ~43 KB
+per run at the perf DB). Cause: a connection that opens the database while
+no other process has it open truncates `-shm` and rebuilds the log index
+from the log (`walIndexRecover`), and the rebuilt index marks no frame as
+checkpointed (`nBackfill = 0`). SQLite rewinds the log to its start only
+when the index says every frame is checkpointed (`walRestartLog`), so across
+one-shot processes it never rewinds; auto-checkpoint copies frames but
+cannot reset the log either, and every new process re-reads the whole log
+(about 0.25 ms per MiB). `SQLITE_FCNTL_PERSIST_WAL` grows the same way.
+
+`close_recording` keeps the bound by hand: when `events.db-wal` is longer
+than `CMD_WAL_TRUNCATE_BYTES` it runs W1, which copies the log into the
+database and cuts it to zero bytes. W1 runs with `busy_timeout = 0`: if
+another connection is writing, checkpointing or inside a read, it returns
+busy at once (after a passive checkpoint), the log stays, and a later run
+tries again. An idle open connection (a picker between reads) does not
+block it. When the picker or file mode is the last connection to close, it
+checkpoints and deletes the log as before.
+
+| Property | Guarantee |
+|---|---|
+| Durability | A crash or power loss can lose the runs still only in the log (not synced under `synchronous = NORMAL`); the log's checksums drop a torn tail. The database is only written by checkpoints, which sync the log before and the database after, so it cannot be corrupted |
+| Log size | At most `CMD_WAL_TRUNCATE_BYTES` plus one run's frames (one run past the bound truncates it), unless every run meets a busy log; measured 2,047 KiB max over 5,000 sequential runs and 2.1-2.7 MiB with 8 writers at once |
+| Cost to other openers | The first connection to open the database alone re-reads up to 2 MiB of log: +0.4-0.6 ms on the picker's `db_open`, no measurable change in first render (two A/B runs of 30 starts each) |
+| Purge | Unchanged: P1 truncates the log, wherever its frames came from (TC-R-27) |
+| Rejected: `synchronous = OFF` on this connection | Fastest (p95 6.2 ms), but the close-time checkpoint then writes the database unsynced and deletes the log: a power loss can corrupt the database |
+
+Measured on ext4 NVMe, the perf DB copied per series, 500 runs after 10
+warm-up runs, two thirds repeating one of 50 texts and one third new
+(`bench/history.py track` repeats 50 texts only): before p50 13.9-16.3 ms,
+p95 17.7-18.3 ms, p99 19.0-20.5 ms; after p50 5.3-5.8 ms, p95 7.2-8.8 ms,
+p99 13.7-17.3 ms (the p99 is the runs that truncate, about 1 in 48). With 8
+writers at once (2,000 runs) p50 is ~3.1 ms either way, but p95 rises from
+12.4-13.7 ms to ~21.5 ms: a run that truncates holds the write lock
+through its `fsync`s while the other writers wait on `busy_timeout`.
 
 ## 10. Privacy
 
@@ -656,7 +712,8 @@ from `track-command`, every `psychic history` action, the picker, training and
 backfill) and from `--enable`. This is where existing databases are tightened:
 the first `--enable` or the first recorded command. SQLite creates `-wal` and
 `-shm` with the mode of the main database file, so they stay `0600` once
-`events.db` is. Upstream sets no mode anywhere (`Database::new`,
+`events.db` is; after a `track-command` they stay on disk between runs
+(section 9.1), and truncating keeps the file and its mode. Upstream sets no mode anywhere (`Database::new`,
 [src/db.rs:162-200](../../src/db.rs); `create_dir_all`, [src/main.rs:233](../../src/main.rs));
 those call sites are not changed, so a user who never enables history keeps
 today's modes.
@@ -676,7 +733,8 @@ Purge leaves no command text in the database's files. `DELETE` alone leaves the 
 bytes in `events.db`, and in WAL mode the old pages also sit in
 `events.db-wal` until it is overwritten; when another connection is open (a
 running picker, a `track-command` mid-flight) SQLite does not delete the log
-when purge's connection closes. So P1 turns on `secure_delete` (freed pages
+when purge's connection closes, and the log `track-command` leaves behind
+(section 9.1) holds the runs of up to the last 2 MiB of recording. So P1 turns on `secure_delete` (freed pages
 are zeroed), `VACUUM`s (the file is rewritten), and runs
 `wal_checkpoint(TRUNCATE)`, which copies the log into the database and cuts it
 to zero bytes. It waits up to `busy_timeout` (5 s) for readers; an idle open
@@ -1378,6 +1436,9 @@ Prints, one per line: `recording: on|off` (marker exists; then
 | Spawn anything when recording is off | The builtin file test of `__psychic_history_enabled` | Requirement: no process per command while disabled |
 | Install or replace a bash `DEBUG` trap, or assign `PS0` | `PROMPT_COMMAND` + `history 1` (section 11.3) | bash-preexec owns the DEBUG trap; Starship uses `PS0` |
 | Set up fern or open `app.log` in `track-command` | Early dispatch M1 | B4, and section 10.6 |
+| Skip the close-time checkpoint without bounding the log, or rely on `wal_autocheckpoint`/`journal_size_limit` for it | `open_for_recording` + `close_recording` (section 9.1) | A lone process rebuilds the log index with nothing checkpointed, so SQLite never rewinds the log: it only grows |
+| `PRAGMA synchronous = OFF` (or `journal_mode = MEMORY/OFF`) to make `track-command` fast | Section 9.1 | A checkpoint without `fsync` followed by deleting the log can corrupt the database on power loss; only losing the last runs is acceptable |
+| Let W1 wait on `busy_timeout` | `busy_timeout = 0` before W1; a busy result is left for a later run | A picker mid-read would hold the shell's background process for up to 5 s |
 | `log::info!("recorded {}", text)` or `{:?}` of a `NewRun` anywhere | Log ids and counts; do not derive `Debug` on `NewRun` | Section 10.6 |
 | Write SQL on the command tables outside `src/cmd/store.rs` | Add a method to `CmdStore` and a row to section 6 | One place to test plans and to audit |
 | Recompute `run_count` etc. with `COUNT(*)` at read time | Maintain the aggregates in S5 | Picker start must not scan 500,000 runs |
@@ -1429,6 +1490,9 @@ within one test: `Database`'s schema registry is keyed by path
 | TC-R-21 | `purge` on disk | a file data dir with 200 runs of a sentinel text | after `purge`: `log_cleared`; neither `events.db` nor `events.db-wal` holds the sentinel's bytes, before and after the store is dropped | the same with a second, idle connection open; a second connection inside a read transaction -> `log_cleared == false`, rows still deleted; the `--purge` action then prints its line and fails with E-R-23 |
 | TC-R-22 | Atuin failures | `history.db` of 4096 bytes of `Z`; a real Atuin database under another connection's `BEGIN EXCLUSIVE` | `unavailable` `Some("unreadable")`, summary `atuin skipped (unreadable)`; `Some("locked")` | - |
 | TC-R-23 | `track::run` cwd | `--cwd` with the bytes `/tmp/caf\xe9`; a cwd `H/notes` with `H/.git` and home `H` | cwd stored as `/tmp/caf\u{FFFD}`; `repo_root` NULL | - |
+| TC-R-25 | recording log, unbounded vs bounded | a file data dir; 20 one-shot `open_for_recording` + record + drop; then a fresh dir with 60 one-shot runs closed by `close_recording(64 KiB)` | without the bound the log grows on every run (> 256 KiB after 20); with it the log never exceeds 128 KiB, `Truncated` at least 3 times, the log is 0 bytes after each, all 60 runs readable | a run closed with `close_recording(u64::MAX)` leaves the log non-empty and the run readable by a new connection |
+| TC-R-26 | recording log, busy | log over 64 KiB; another connection inside a read transaction | `close_recording` returns `Busy` in under 1 s and the log stays; after the reader commits (still open, idle) the next one returns `Truncated` and the log is 0 bytes | - |
+| TC-R-27 | purge after recording connections | 30 one-shot runs of a sentinel text closed with `close_recording(u64::MAX)` (text in `-wal`) | `purge` from a normal `open`: `log_cleared`; neither file holds the sentinel, before and after drop. `events.db`, `-wal`, `-shm` are `0600` after a recording run | - |
 | TC-R-24 | `backfill::run`, bash | `.bash_history` `#1700000000`, `for f in *; do`, `  echo "$f"`, `done`, `#1700000005`, `ls` | 2 runs: the loop as one text with its newlines at 1700000000, `ls` at 1700000005 | - |
 
 ### 15.2 Integration tests
@@ -1512,6 +1576,7 @@ same module. It is not shared with `src/`.
 | E-R-17 | bash older than 4.2 | `printf '%(%s)T'` fails | Hook omits `--duration-ms` | duration NULL | None |
 | E-R-18 | bash history disabled or command suppressed by `HISTCONTROL`/`HISTIGNORE` | `$HISTCMD` where the sync left it, newest entry stamped before the sync | Not recorded | By design | None |
 | E-R-19 | Two `track-command` processes at once | SQLite write lock | Second waits on `busy_timeout` | - | None |
+| E-R-24 | `track-command` finds the log over `CMD_WAL_TRUNCATE_BYTES` while another connection writes, checkpoints or reads | W1 returns busy = 1 (`busy_timeout` 0) | `LogBound::Busy`, `Ok(())`, exit 0: the run is recorded | The log stays over the bound until a later run (or the last connection closing) truncates it | None |
 | E-R-20 | Clock goes backwards between runs | `started_at` smaller than the session's last | S3 (`started_at <= ?2`) finds an older predecessor or none; S5 keeps `last_run_at` as the max | - | None |
 | E-R-22 | `--import`, or a first `--enable` that imports, with `HOME` unset | `env.home()` is `None` | `Err("HOME is not set, so psychic can't find your shell history")`, exit 1 | `--enable`: marker not written | stderr via `main` |
 | E-R-21 | A shell needed by a shell test is not installed | `--version` spawn fails | Test prints `skipped: ...` and passes | - | test stdout |

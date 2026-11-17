@@ -2855,11 +2855,20 @@ for commit `4c37b59`, p50 15.9 ms, p95 19.1 ms after the bash-hook rework that
 followed it, so no change from that; the cost is the disk: the process
 holds the database's only connection, so on close SQLite checkpoints the
 write-ahead log into the database and deletes it, four `fsync`s worth about
-11 ms. Skipping that checkpoint (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`) was
-tried and is worse: the log grows (18 MB after 400 runs) and every new
-process re-reads it to rebuild its index. B4 is not met on a real disk; it
-needs a decision (a persistent log file, or a different durability setting
-for this one connection) that has not been made.
+11 ms. Skipping only that checkpoint (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`)
+lets the log grow (18 MB after 400 runs), and every new process re-reads it:
+a process that opens the database alone rebuilds the log index with nothing
+marked as checkpointed, and SQLite rewinds the log only when everything is,
+so across one-shot processes it never rewinds. So `track-command` now opens
+with `CmdStore::open_for_recording` (no checkpoint on close) and closes with
+`close_recording`, which, once `events.db-wal` is over 2 MiB, runs
+`wal_checkpoint(TRUNCATE)` without waiting (busy: a later run does it). A
+crash can lose the last runs still only in the log, never the database.
+On ext4 at the perf DB, 500 runs per series, three series: p50 5.3-5.8 ms,
+p95 7.2-8.8 ms (before: 13.9-16.3 ms, 17.7-18.3 ms); the log stayed at or
+under 2,047 KiB over 5,000 runs. The picker's first open re-reads up to 2 MiB
+of log (+0.4-0.6 ms `db_open`). Details and the rejected options:
+`docs/ctrl-r/01-record.md` section 9.1.
 
 **Privacy.** Every `CmdStore::open` makes the data dir `0700` and `events.db`,
 its `-wal`/`-shm`, the marker and the command model files `0600` (only when

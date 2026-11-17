@@ -12,6 +12,7 @@ use super::privacy;
 use super::tuning::CMD_SEQUENCE_MAX_GAP_SECS;
 use crate::db::Database;
 use anyhow::{Context, Result, anyhow};
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::path::{Path, PathBuf};
 
@@ -153,6 +154,10 @@ const P1_SECURE: &str = "PRAGMA secure_delete = ON";
 /// bytes, so the old pages it still holds leave the disk. Column 0 is 1 when
 /// another connection kept it from finishing.
 const P1_CHECKPOINT: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
+
+/// W1, after a `track-command` run once the log is over its bound: the same
+/// checkpoint as P1's, but on a connection that does not wait for others.
+const W1_CHECKPOINT: &str = P1_CHECKPOINT;
 
 const I1: &str = "SELECT MIN(started_at) FROM command_runs WHERE source = 'hook'";
 const I2_SELECT: &str = "SELECT 1 FROM command_imports WHERE source_key = ?1";
@@ -363,6 +368,18 @@ pub(super) struct PurgeCounts {
     pub log_cleared: bool,
 }
 
+/// What [`CmdStore::close_recording`] did with the write-ahead log.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum LogBound {
+    /// The log was within its bound and was left as it is.
+    Within,
+    /// The log was over its bound; it was checkpointed and cut to zero bytes.
+    Truncated,
+    /// The log was over its bound, but another connection was writing,
+    /// checkpointing or reading from it; a later run tries again.
+    Busy,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct StoreCounts {
     pub commands: u64,
@@ -440,6 +457,69 @@ impl CmdStore {
         Ok(CmdStore {
             db,
             file: Some(file),
+        })
+    }
+
+    /// [`CmdStore::open`] for one `track-command` run: closing this connection
+    /// does not checkpoint the write-ahead log, even when it is the last one.
+    ///
+    /// That checkpoint (and deleting the log after it) is about four `fsync`s,
+    /// most of the process's time on a real disk. Without it the run stays in
+    /// `events.db-wal`, which under `synchronous = NORMAL` is not synced
+    /// either: a crash or power loss can lose the last runs, never the
+    /// database. Close with [`CmdStore::close_recording`], which keeps the
+    /// log bounded.
+    pub(super) fn open_for_recording(data_dir: &Path) -> Result<Self> {
+        let store = Self::open(data_dir)?;
+        store
+            .conn()
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+            .op("configuring the connection")?;
+        Ok(store)
+    }
+
+    /// Close a connection from [`CmdStore::open_for_recording`], first
+    /// checkpointing and truncating the write-ahead log (W1) if it is longer
+    /// than `limit` bytes.
+    ///
+    /// The bound has to be kept by hand. A process that opens the database
+    /// while no other has it open discards the shared log index (`-shm`) and
+    /// rebuilds it from the log, and the rebuilt index records nothing as
+    /// checkpointed. SQLite only rewinds the log to its start when the index
+    /// says everything is checkpointed, so with one short-lived process per
+    /// command the log would only ever grow (to 18 MB in 400 runs), and every
+    /// process would re-read all of it. Truncating resets it.
+    ///
+    /// The checkpoint does not wait: when another connection is in the way
+    /// it reports busy at once and the next run tries again, so a running
+    /// picker never holds up a shell's background recording.
+    pub(super) fn close_recording(self, limit: u64) -> Result<LogBound> {
+        let Some(file) = &self.file else {
+            return Ok(LogBound::Within);
+        };
+        let mut wal = file.clone().into_os_string();
+        wal.push("-wal");
+        let length = match std::fs::metadata(&wal) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not read {}", wal.display()));
+            }
+        };
+        if length <= limit {
+            return Ok(LogBound::Within);
+        }
+        self.conn()
+            .busy_timeout(std::time::Duration::ZERO)
+            .op("configuring the connection")?;
+        let busy: i64 = self
+            .conn()
+            .query_row(W1_CHECKPOINT, [], |row| row.get(0))
+            .op("emptying the write-ahead log")?;
+        Ok(if busy == 0 {
+            LogBound::Truncated
+        } else {
+            LogBound::Busy
         })
     }
 
@@ -1346,6 +1426,166 @@ mod tests {
         other.execute_batch("COMMIT").unwrap();
         drop(other);
         drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- The recording connection's log (W1) ------------------------------
+
+    /// A fresh data dir on disk for `tag`.
+    fn disk_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("psychic-cmd-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn wal_length(dir: &Path) -> u64 {
+        std::fs::metadata(dir.join("events.db-wal")).map_or(0, |m| m.len())
+    }
+
+    /// What one `track-command` process does with the store: open alone,
+    /// record one run, close (`limit: None` drops it unbounded). Each call is
+    /// the only connection, so it rebuilds the log index as a new process does.
+    fn record_alone(dir: &Path, text: &str, at: i64, limit: Option<u64>) -> LogBound {
+        let store = CmdStore::open_for_recording(dir).unwrap();
+        record(&store, &hook_run(text, "s", at, Some(0)));
+        match limit {
+            Some(limit) => store.close_recording(limit).unwrap(),
+            None => LogBound::Within,
+        }
+    }
+
+    /// A bound a few runs on a fresh database cross.
+    const SMALL_LIMIT: u64 = 64 * 1024;
+
+    #[test]
+    fn closing_a_recording_connection_leaves_the_run_in_the_log() {
+        let dir = disk_dir("rec-no-ckpt");
+        drop(CmdStore::open(&dir).unwrap()); // created, checkpointed, log deleted
+        assert_eq!(wal_length(&dir), 0);
+
+        record_alone(&dir, "ls", 100, Some(u64::MAX));
+
+        assert!(wal_length(&dir) > 0, "no checkpoint on close");
+        let store = CmdStore::open(&dir).unwrap();
+        assert_eq!(table_rows(&store, "command_runs"), 1, "and it is readable");
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn without_the_bound_the_log_of_one_shot_connections_only_grows() {
+        // Why `close_recording` exists: each new lone connection rebuilds
+        // the log index with nothing checkpointed, so SQLite never rewinds
+        // the log, auto-checkpoint or not.
+        let dir = disk_dir("rec-unbounded");
+        let mut lengths = Vec::new();
+        for i in 0..20 {
+            record_alone(&dir, &format!("cmd {}", i), 100 + i, None);
+            lengths.push(wal_length(&dir));
+        }
+        assert!(
+            lengths.windows(2).all(|pair| pair[1] > pair[0]),
+            "{lengths:?}"
+        );
+        assert!(lengths[19] > 4 * SMALL_LIMIT, "{lengths:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_log_of_one_shot_recording_connections_stays_bounded() {
+        let dir = disk_dir("rec-bounded");
+        let mut largest = 0;
+        let mut truncated = 0;
+        for i in 0..60 {
+            let bound = record_alone(&dir, &format!("cmd {}", i % 7), 100 + i, Some(SMALL_LIMIT));
+            if bound == LogBound::Truncated {
+                truncated += 1;
+                assert_eq!(wal_length(&dir), 0, "cut to zero bytes");
+            }
+            largest = largest.max(wal_length(&dir));
+        }
+        assert!(
+            truncated >= 3,
+            "the bound was crossed and kept: {truncated}"
+        );
+        // At most the bound plus the one run that found the log over it.
+        assert!(largest <= 2 * SMALL_LIMIT, "largest log {largest}");
+        let store = CmdStore::open(&dir).unwrap();
+        assert_eq!(table_rows(&store, "command_runs"), 60, "no run was lost");
+        assert_eq!(table_rows(&store, "commands"), 7);
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_reader_in_the_log_defers_the_bound_without_waiting() {
+        let dir = disk_dir("rec-busy");
+        for i in 0..6 {
+            record_alone(&dir, &format!("cmd {}", i), 100 + i, None);
+        }
+        assert!(wal_length(&dir) > SMALL_LIMIT);
+        // A picker in the middle of a read.
+        let other = Connection::open(Database::get_db_path(&dir)).unwrap();
+        other.execute_batch("BEGIN").unwrap();
+        let _: i64 = other
+            .query_row("SELECT COUNT(*) FROM command_runs", [], |row| row.get(0))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let bound = record_alone(&dir, "late", 200, Some(SMALL_LIMIT));
+
+        assert_eq!(bound, LogBound::Busy);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "no wait"
+        );
+        assert!(wal_length(&dir) > SMALL_LIMIT, "left for a later run");
+        // The read ends; the picker stays open, idle, which does not block.
+        other.execute_batch("COMMIT").unwrap();
+        assert_eq!(
+            record_alone(&dir, "later", 201, Some(SMALL_LIMIT)),
+            LogBound::Truncated
+        );
+        assert_eq!(wal_length(&dir), 0);
+        drop(other);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_clears_text_the_recording_connections_left_in_the_log() {
+        let dir = disk_dir("rec-purge");
+        let text = String::from_utf8(SENTINEL.to_vec()).unwrap();
+        for i in 0..30 {
+            let command = format!("echo {} {}", text, i);
+            record_alone(&dir, &command, 100 + i, Some(u64::MAX));
+        }
+        assert!(
+            files_holding_sentinel(&dir).contains(&"events.db-wal".to_string()),
+            "the runs are still in the log"
+        );
+
+        let store = CmdStore::open(&dir).unwrap();
+        let counts = store.purge().unwrap();
+
+        assert!(counts.log_cleared);
+        assert_eq!(files_holding_sentinel(&dir), Vec::<String>::new());
+        drop(store);
+        assert_eq!(files_holding_sentinel(&dir), Vec::<String>::new());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_log_a_recording_connection_keeps_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = disk_dir("rec-mode");
+        record_alone(&dir, "ls", 100, Some(u64::MAX));
+        for name in ["events.db", "events.db-wal", "events.db-shm"] {
+            let mode = std::fs::metadata(dir.join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{name}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

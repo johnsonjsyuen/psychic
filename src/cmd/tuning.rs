@@ -27,6 +27,12 @@ pub(super) const CMD_PATH_ARG_COMMANDS: &[&str] = &[
     "source", ".", "open", "xdg-open", "head", "tail", "wc", "du", "tree",
 ];
 
+/// `track-command` leaves its runs in `events.db-wal` instead of checkpointing
+/// on close; once the log is longer than this many bytes, the run that finds
+/// it so checkpoints it and cuts it to zero. Bounds both the log and what the
+/// next process to open the database alone re-reads (about 0.25 ms per MiB).
+pub(super) const CMD_WAL_TRUNCATE_BYTES: u64 = 2 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Phase B: the picker (`docs/ctrl-r/02-browse.md` section 3)
 // ---------------------------------------------------------------------------
