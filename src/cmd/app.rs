@@ -470,7 +470,13 @@ fn log_once(logged: &mut bool, op: &str) {
     }
 }
 
-type Tui = Terminal<CrosstermBackend<std::fs::File>>;
+/// The picker's terminal. Buffered: a frame reaches the terminal as one
+/// write when ratatui flushes it, not one write per escape sequence (an
+/// unbuffered `/dev/tty` took about 6 ms of syscalls per redraw of the list).
+type Tui = Terminal<CrosstermBackend<std::io::BufWriter<std::fs::File>>>;
+
+/// Big enough for a full 40 x 120 frame of styled cells.
+const FRAME_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Undo whatever part of the terminal set-up happened (E-B-03), on a
 /// terminal that never became a `Terminal`.
@@ -507,6 +513,7 @@ fn enter_terminal() -> Result<Tui> {
             tty,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
+        let tty = std::io::BufWriter::with_capacity(FRAME_BUFFER_BYTES, tty);
         Ok(Terminal::new(CrosstermBackend::new(tty))?)
     })();
     if set_up.is_err() {

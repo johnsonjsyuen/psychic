@@ -45,6 +45,7 @@ by id and the start-up reader methods, [01 section 6.5](01-record.md#65-cmdstore
 |---|---|
 | `shell/psychic.zsh`, `shell/psychic.bash`, `shell/psychic.fish` | Append the widget blocks of section 11 after the Phase A recording blocks |
 | `docs/how-it-works.md` | Extend the "Shell history search" section with the picker |
+| `src/input.rs` | `leave_tui` takes any writer (`<W: std::io::Write>`), for the picker's buffered terminal (section 4, step 5) |
 
 Reused as they are, with no edit:
 
@@ -109,8 +110,12 @@ loads while the terminal is being set up):
 4. `tty_input::attach_stdin_to_terminal()`; `tty_input::spawn(event_tx.clone())`.
 5. Open `/dev/tty` read+write, `enable_raw_mode`, `EnterAlternateScreen`,
    `EnableMouseCapture`, `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`,
-   `Terminal::new(CrosstermBackend::new(tty))` - the sequence of
+   `Terminal::new(CrosstermBackend::new(BufWriter::with_capacity(64 KiB, tty)))` - the sequence of
    [src/main.rs:765-781](../../src/main.rs), so `input::leave_tui` undoes it exactly.
+   The writer is buffered (file mode's is not): ratatui flushes once per
+   `draw`, so a frame is one `write` instead of one per escape sequence.
+   Unbuffered, a redraw of the list took 5.6 ms p50 of syscalls on a pty
+   (the render itself 0.2 ms); buffered 0.8 ms.
 6. Open the UI thread's own `CmdStore` for event logging; spawn the tick thread.
 7. Event loop (section 8.2).
 8. On exit: `input.shutdown()`, `input::leave_tui(&mut terminal)`, print the
@@ -971,6 +976,9 @@ Targets B1-B3, B5. The decisions that make them reachable:
 | No per-row allocation on the query path | `Arc<str>` texts; the model-scored rows' features in one buffer of the ranking, not a vector per row; `CmdRow`s built only for the 200 sent |
 | One log write per query, after the send | Section 6.5 |
 | Render is pure | `draw(&mut Frame, &CmdApp)`; time-ago uses `list_clock`; `~` uses `app.home` |
+| One write per frame | The terminal's writer is a 64 KiB `BufWriter` (section 4, step 5): the redraw after a keystroke went from 5.6 to 0.8 ms p50 |
+| Match once | The filter decides the match (Skim's rule, a byte scan on ASCII texts) and gives fzf's score in the same pass; Skim's score is computed for the model's rows only (section 6.3) |
+| Bounded model | At most `CMD_MODEL_MAX_TREES` (100) trees ([03 section 3](03-learn.md#3-constants-phase-c)) |
 
 Start-up allowances per stage; they sum to the B3 target:
 
