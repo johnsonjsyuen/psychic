@@ -142,3 +142,38 @@ function __psychic_postexec --on-event fish_postexec
         --session "$__psychic_session" -- "$argv[1]" >/dev/null 2>&1 &
     disown 2>/dev/null
 end
+
+# =============================================================================
+# Ctrl-R: search command history in psychic
+# =============================================================================
+
+# Enter on a command replaces the command line with it; Escape leaves it alone.
+# Does nothing (and prints nothing) when the binary is not installed.
+function __psychic_history_widget
+    set -l __psychic_bin psychic
+    set -q PSYCHIC_BIN; and set __psychic_bin $PSYCHIC_BIN
+    command -q $__psychic_bin; or return
+    set -l __psychic_dir
+    set -q PSYCHIC_DATA_DIR; and set __psychic_dir --data-dir $PSYCHIC_DATA_DIR
+    set -l __psychic_query (commandline | string collect)
+    set -l result (command $__psychic_bin $__psychic_dir history --session="$__psychic_session" --cwd="$PWD" --query="$__psychic_query" | string collect)
+    if test -n "$result"
+        commandline --replace -- $result
+    end
+    commandline --function repaint
+end
+
+# Bound to Ctrl-R only where history search is on and nothing else has claimed
+# the key. Set PSYCHIC_NO_CTRL_R before loading this to skip it; bind the
+# function yourself with, e.g.,
+#   bind \cx\cr __psychic_history_widget
+if not set -q PSYCHIC_NO_CTRL_R; and __psychic_history_enabled
+    # --user: fish 4 lists the preset binding beside the user's own. Each
+    # mode on its own: a user's insert-mode Ctrl-R is theirs too.
+    for __psychic_mode in default insert
+        set -l __psychic_current (bind --user -M $__psychic_mode \cr 2>/dev/null)
+        if test -z "$__psychic_current"; or string match -q -- '*history-pager*' $__psychic_current
+            bind -M $__psychic_mode \cr __psychic_history_widget
+        end
+    end
+end

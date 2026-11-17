@@ -159,7 +159,7 @@ Not edited: `src/keymap.rs`, `src/help.rs`, `src/render.rs`, `src/app.rs`,
 | Choice | Rationale |
 |---|---|
 | Rust, in the existing binary | One install, one data dir, shared LightGBM link; a second binary doubles release work |
-| SQLite, same `events.db` | Same connection setup and pragmas ([src/db.rs:207-216](../../src/db.rs)); one file to protect, back up and purge |
+| SQLite, same `events.db` | Same connection setup and pragmas ([src/db.rs:207-216](../../src/db.rs)), plus `mmap_size` on the picker's start-up readers only ([02 section 5.2](02-browse.md#52-load-picker-start)); one file to protect, back up and purge |
 | LightGBM LambdaRank, same parameters as files | Already linked and measured ([src/training/mod.rs:177-199](../../src/training/mod.rs)); parameter changes are a benchmark-driven tuning step, not a starting point |
 | `fuzzy-matcher` SkimMatcherV2 | Already the file matcher ([src/search_worker.rs:808](../../src/search_worker.rs)); one definition of "matches" for filter, features, training and benchmark |
 | rayon | Already a dependency; the 50,000-row filter needs it for B1 |

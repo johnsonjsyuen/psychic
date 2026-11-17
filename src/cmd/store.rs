@@ -13,7 +13,7 @@ use super::tuning::CMD_SEQUENCE_MAX_GAP_SECS;
 use crate::db::Database;
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -116,7 +116,11 @@ const S3: &str = "SELECT command_id, started_at FROM command_runs WHERE shell_se
 const S4: &str = "INSERT OR IGNORE INTO command_runs (command_id, started_at, cwd, repo_root, exit_code, duration_ms, shell_session, prev_command_id, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
 const S5: &str = "UPDATE commands SET run_count = run_count + 1, success_count = success_count + ?2, fail_count = fail_count + ?3, first_run_at = MIN(first_run_at, ?4), last_exit_code = CASE WHEN ?4 >= last_run_at THEN ?5 ELSE last_exit_code END, last_run_at = MAX(last_run_at, ?4) WHERE id = ?1";
 
-const R1: &str = "SELECT id, text, last_run_at, run_count, success_count, fail_count, pick_count, last_exit_code FROM commands";
+/// The id range R1 is split over.
+/// Two subqueries: SQLite finds a lone MIN or MAX of the rowid at one end of
+/// the tree, but scans the table for both in one SELECT.
+const R1_IDS: &str = "SELECT (SELECT MIN(id) FROM commands), (SELECT MAX(id) FROM commands)";
+const R1: &str = "SELECT id, text, last_run_at, run_count, success_count, fail_count, pick_count, last_exit_code FROM commands WHERE id BETWEEN ?1 AND ?2";
 const R2: &str = "SELECT command_id, COUNT(*), MAX(started_at) FROM command_runs WHERE cwd = ?1 GROUP BY command_id";
 const R3: &str =
     "SELECT command_id, COUNT(*) FROM command_runs WHERE repo_root = ?1 GROUP BY command_id";
@@ -158,9 +162,13 @@ const I3: &str = "SELECT 1 FROM deleted_commands WHERE text_hash = ?1";
 const I4: &str = "SELECT COUNT(*) FROM command_imports";
 const I5: &str = "SELECT 1 FROM commands c JOIN command_runs r ON r.command_id = c.id WHERE c.text = ?1 AND r.source = 'hook' LIMIT 1";
 
+/// Room for the whole of a 500,000-run database; only address space.
+const MMAP_FOR_READING: &str = "PRAGMA mmap_size = 268435456";
+
 const T1_COMMANDS: &str = "SELECT COUNT(*) FROM commands";
 const T1_RUNS: &str = "SELECT source, COUNT(*) FROM command_runs GROUP BY source";
 const T1_PICKS: &str = "SELECT COUNT(*) FROM command_events WHERE action = 'pick'";
+#[allow(dead_code, reason = "training reads it (Phase C)")]
 const T2: &str = "SELECT id, text, template FROM commands";
 const T3: &str = "SELECT id, command_id, started_at, cwd, repo_root, exit_code, shell_session, prev_command_id, source FROM command_runs ORDER BY started_at, id";
 const T4: &str = "SELECT id, timestamp, action, command_id, query, rank, session_id, subsession_id, episode_queries, cwd, repo_root, shell_session FROM command_events ORDER BY id";
@@ -254,10 +262,6 @@ pub(super) enum RunOutcome {
     Duplicate,
 }
 
-#[allow(
-    dead_code,
-    reason = "read by the picker (Phase B) or training (Phase C)"
-)]
 pub(super) struct CommandRow {
     pub id: i64,
     pub text: String,
@@ -269,49 +273,36 @@ pub(super) struct CommandRow {
     pub last_exit_code: Option<i32>,
 }
 
-#[allow(
-    dead_code,
-    reason = "read by the picker (Phase B) or training (Phase C)"
-)]
+/// Command ids from `first` to `last`, both included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct IdRange {
+    pub first: i64,
+    pub last: i64,
+}
+
 pub(super) struct CwdRunsRow {
     pub command_id: i64,
     pub runs: u32,
     pub last_run_at: i64,
 }
 
-#[allow(
-    dead_code,
-    reason = "read by the picker (Phase B) or training (Phase C)"
-)]
 pub(super) struct CountRow {
     pub command_id: i64,
     pub runs: u32,
 }
 
-#[allow(
-    dead_code,
-    reason = "read by the picker (Phase B) or training (Phase C)"
-)]
 pub(super) struct RecentRunRow {
     pub command_id: i64,
     pub started_at: i64,
     pub exit_code: Option<i32>,
 }
 
-#[allow(
-    dead_code,
-    reason = "read by the picker (Phase B) or training (Phase C)"
-)]
 pub(super) struct FollowerRow {
     pub command_id: i64,
     pub template: String,
     pub runs: u32,
 }
 
-#[allow(
-    dead_code,
-    reason = "read by the picker (Phase B) or training (Phase C)"
-)]
 pub(super) struct PickRow {
     pub command_id: i64,
     pub query: String,
@@ -319,20 +310,12 @@ pub(super) struct PickRow {
     pub episode_queries: Vec<String>,
 }
 
-#[allow(
-    dead_code,
-    reason = "read by the picker (Phase B) or training (Phase C)"
-)]
 pub(super) struct DirUse {
     pub dir: String,
     pub runs: u32,
     pub last_run_at: i64,
 }
 
-#[allow(
-    dead_code,
-    reason = "read by the picker (Phase B) or training (Phase C)"
-)]
 pub(super) struct PrecededBy {
     pub template: String,
     pub runs: u32,
@@ -340,10 +323,6 @@ pub(super) struct PrecededBy {
 
 /// `command_events.action`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "read by the picker (Phase B) or training (Phase C)"
-)]
 pub(super) enum EventAction {
     Impression,
     Pick,
@@ -393,20 +372,14 @@ pub(super) struct StoreCounts {
     pub picks: u64,
 }
 
-#[allow(
-    dead_code,
-    reason = "read by the picker (Phase B) or training (Phase C)"
-)]
+#[allow(dead_code, reason = "training reads it (Phase C)")]
 pub(super) struct CommandRecord {
     pub id: i64,
     pub text: String,
     pub template: String,
 }
 
-#[allow(
-    dead_code,
-    reason = "read by the picker (Phase B) or training (Phase C)"
-)]
+#[allow(dead_code, reason = "training reads it (Phase C)")]
 pub(super) struct RunRecord {
     pub id: i64,
     pub command_id: i64,
@@ -419,10 +392,7 @@ pub(super) struct RunRecord {
     pub source: Source,
 }
 
-#[allow(
-    dead_code,
-    reason = "read by the picker (Phase B) or training (Phase C)"
-)]
+#[allow(dead_code, reason = "training reads it (Phase C)")]
 pub(super) struct EventRecord {
     pub id: i64,
     pub timestamp: i64,
@@ -451,27 +421,57 @@ fn parse_queries(json: Option<String>) -> Vec<String> {
 /// The command tables of one `events.db`, behind one connection.
 pub(super) struct CmdStore {
     db: Database,
+    /// The path the database was opened with; `None` in memory. Another
+    /// connection opens the same spelling, so `Database` knows its schema
+    /// is done (a relative data dir and SQLite's absolute path would not match).
+    file: Option<PathBuf>,
 }
 
-#[allow(
-    dead_code,
-    reason = "the read path serves the picker (Phase B) and training (Phase C)"
-)]
 impl CmdStore {
     /// Create `data_dir` if needed, open its `events.db` (pragmas, schema),
     /// and make both private (section 10.4).
     pub(super) fn open(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("could not create {}", data_dir.display()))?;
-        let db = Database::new(&Database::get_db_path(data_dir))?;
+        let file = Database::get_db_path(data_dir);
+        let db = Database::new(&file)?;
         privacy::tighten_permissions(data_dir)?;
-        Ok(CmdStore { db })
+        Ok(CmdStore {
+            db,
+            file: Some(file),
+        })
+    }
+
+    /// The database file, so another thread can open a connection of its
+    /// own with [`CmdStore::open_file`]. `None` for an in-memory store,
+    /// which another connection would see empty.
+    pub(super) fn file(&self) -> Option<PathBuf> {
+        self.file.clone()
+    }
+
+    /// Read the database file through a memory map from now on: a scan of
+    /// `commands` then takes its pages straight from the page cache instead
+    /// of copying each one in (about 6 of 17 ms of R1 at 50,000 commands,
+    /// cold). For the picker's start-up reads; writes are unaffected.
+    pub(super) fn map_for_reading(&self) -> Result<()> {
+        self.conn()
+            .execute_batch(MMAP_FOR_READING)
+            .op("mapping the database")
+    }
+
+    /// Another connection to a database [`CmdStore::open`] has set up.
+    pub(super) fn open_file(path: &Path) -> Result<Self> {
+        Ok(CmdStore {
+            db: Database::new(path)?,
+            file: Some(path.to_path_buf()),
+        })
     }
 
     #[cfg(test)]
     pub(super) fn in_memory() -> Self {
         CmdStore {
             db: Database::new(Path::new(":memory:")).expect("an in-memory database opens"),
+            file: None,
         }
     }
 
@@ -563,19 +563,44 @@ impl CmdStore {
 
     // --- Read path at picker start -----------------------------------------
 
+    /// The smallest and largest command id; `None` when nothing is recorded.
+    pub(super) fn command_ids(&self) -> Result<Option<IdRange>> {
+        let (first, last): (Option<i64>, Option<i64>) = self
+            .conn()
+            .prepare_cached(R1_IDS)
+            .and_then(|mut s| s.query_row([], |row| Ok((row.get(0)?, row.get(1)?))))
+            .op("loading commands")?;
+        Ok(first.zip(last).map(|(first, last)| IdRange { first, last }))
+    }
+
+    /// Every command.
+    #[cfg(test)]
     pub(super) fn load_commands(&self) -> Result<Vec<CommandRow>> {
-        self.rows(R1, [], "loading commands", |row| {
-            Ok(CommandRow {
-                id: row.get(0)?,
-                text: row.get(1)?,
-                last_run_at: row.get(2)?,
-                run_count: row.get(3)?,
-                success_count: row.get(4)?,
-                fail_count: row.get(5)?,
-                pick_count: row.get(6)?,
-                last_exit_code: row.get(7)?,
-            })
+        self.load_commands_in(IdRange {
+            first: i64::MIN,
+            last: i64::MAX,
         })
+    }
+
+    /// The commands with an id in `range`, in id order.
+    pub(super) fn load_commands_in(&self, range: IdRange) -> Result<Vec<CommandRow>> {
+        self.rows(
+            R1,
+            params![range.first, range.last],
+            "loading commands",
+            |row| {
+                Ok(CommandRow {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    last_run_at: row.get(2)?,
+                    run_count: row.get(3)?,
+                    success_count: row.get(4)?,
+                    fail_count: row.get(5)?,
+                    pick_count: row.get(6)?,
+                    last_exit_code: row.get(7)?,
+                })
+            },
+        )
     }
 
     pub(super) fn runs_in_cwd(&self, cwd: &str) -> Result<Vec<CwdRunsRow>> {
@@ -834,6 +859,7 @@ impl CmdStore {
         Ok(counts)
     }
 
+    #[allow(dead_code, reason = "training reads it (Phase C)")]
     pub(super) fn all_commands(&self) -> Result<Vec<CommandRecord>> {
         self.rows(T2, [], "reading commands", |row| {
             Ok(CommandRecord {
@@ -946,6 +972,11 @@ pub(super) mod test_support {
             .query_row(S2, [text], |row| row.get(0))
             .optional()
             .unwrap()
+    }
+
+    /// Any statement, for breaking a store on purpose.
+    pub(in crate::cmd) fn execute(store: &CmdStore, sql: &str) {
+        store.conn().execute_batch(sql).unwrap();
     }
 
     /// `SELECT COUNT(*) FROM <table>`.
@@ -1533,7 +1564,8 @@ mod plan_tests {
             ("S2", S2, &["sqlite_autoindex_commands_1"]),
             ("S3", S3, &["idx_command_runs_session"]),
             ("S5", S5, &["INTEGER PRIMARY KEY"]),
-            ("R1", R1, &["SCAN commands"]),
+            ("R1 ids", R1_IDS, &["SEARCH commands"]),
+            ("R1", R1, &["SEARCH commands USING INTEGER PRIMARY KEY"]),
             ("R2", R2, &["USING COVERING INDEX idx_command_runs_cwd"]),
             ("R3", R3, &["USING COVERING INDEX idx_command_runs_repo"]),
             ("R4", R4, &["USING COVERING INDEX idx_command_runs_time"]),

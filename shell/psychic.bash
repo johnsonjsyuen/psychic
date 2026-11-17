@@ -315,3 +315,29 @@ fi
 __psychic_history_ends
 [[ "${__psychic_hist_last}" == __psychic_history_sync ]] || __psychic_history_place_sync
 \builtin unset __psychic_hist_first __psychic_hist_last
+
+# =============================================================================
+# Ctrl-R: search command history in psychic
+# =============================================================================
+
+# Enter on a command replaces the line being edited with it; Escape leaves the
+# line alone. Needs bash 4 or newer, for READLINE_LINE.
+__psychic_history_widget() {
+    \builtin local result
+    result="$(\command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
+        history --session="${__psychic_session}" --cwd="${PWD}" --query="${READLINE_LINE}")" || return
+    [[ -n "${result}" ]] || return
+    READLINE_LINE="${result}"
+    READLINE_POINT=${#READLINE_LINE}
+}
+
+# Bound only in an interactive bash 4+, where history search is on and Ctrl-R
+# still does what readline does by default. Set PSYCHIC_NO_CTRL_R before
+# loading this to skip it; bind the function yourself with, e.g.,
+#   bind -x '"\C-x\C-r": __psychic_history_widget'
+if [[ $- == *i* && -z "${PSYCHIC_NO_CTRL_R-}" && "${BASH_VERSINFO[0]}" -ge 4 ]] && __psychic_history_enabled; then
+    if ! \builtin bind -X 2>/dev/null | \command grep -q '^"\\C-r"' &&
+        \builtin bind -p 2>/dev/null | \command grep -q '^"\\C-r": reverse-search-history'; then
+        \builtin bind -x '"\C-r": __psychic_history_widget'
+    fi
+fi

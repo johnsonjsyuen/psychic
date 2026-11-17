@@ -363,7 +363,8 @@ was before the update, so the order of assignments does not matter.
 
 | ID | Statement | Expected plan contains |
 |---|---|---|
-| R1 | `SELECT id, text, last_run_at, run_count, success_count, fail_count, pick_count, last_exit_code FROM commands` | `SCAN commands` (the one deliberate full scan) |
+| R1 ids | `SELECT (SELECT MIN(id) FROM commands), (SELECT MAX(id) FROM commands)` (two subqueries: SQLite finds a lone `MIN`/`MAX` of the rowid at one end of the tree, but scans for both in one `SELECT`) | `SEARCH commands` |
+| R1 | `SELECT id, text, last_run_at, run_count, success_count, fail_count, pick_count, last_exit_code FROM commands WHERE id BETWEEN ?1 AND ?2` | `SEARCH commands USING INTEGER PRIMARY KEY` (together, the parts read every row: the one deliberate full read, split by id so several connections share it, [02 section 5.2](02-browse.md#52-load-picker-start)) |
 | R2 | `SELECT command_id, COUNT(*), MAX(started_at) FROM command_runs WHERE cwd = ?1 GROUP BY command_id` | `USING COVERING INDEX idx_command_runs_cwd` |
 | R3 | `SELECT command_id, COUNT(*) FROM command_runs WHERE repo_root = ?1 GROUP BY command_id` | `USING COVERING INDEX idx_command_runs_repo` |
 | R4 | `SELECT command_id, started_at, exit_code FROM command_runs WHERE started_at > ?1 ORDER BY started_at` with `?1 = now - CMD_EVENT_WINDOW_SECS` | `USING COVERING INDEX idx_command_runs_time` |
@@ -418,7 +419,9 @@ Row structs are plain `pub(super)` structs in `store.rs` with the listed fields.
 | Method | Statements | Returns |
 |---|---|---|
 | `transaction`, `record_run_in`, `record_run` | S1-S5 | section 6.1 |
-| `load_commands()` | R1 | `Vec<CommandRow { id: i64, text: String, last_run_at: i64, run_count: u32, success_count: u32, fail_count: u32, pick_count: u32, last_exit_code: Option<i32> }>` |
+| `command_ids()` | R1 ids | `Option<IdRange { first: i64, last: i64 }>` (`None`: no command) |
+| `load_commands_in(range: IdRange)` | R1 | `Vec<CommandRow { id: i64, text: String, last_run_at: i64, run_count: u32, success_count: u32, fail_count: u32, pick_count: u32, last_exit_code: Option<i32> }>`, in id order; `load_commands()` (tests only) is the whole range |
+| `file()`, `open_file(path)`, `map_for_reading()` | - | The database file (`None` in memory); another connection to it, with `Database::new` only (no directory creation or permission change); `PRAGMA mmap_size = 268435456` on this connection. Used by the picker's start-up readers ([02 section 5.2](02-browse.md#52-load-picker-start)) |
 | `runs_in_cwd(cwd: &str)` | R2 | `Vec<CwdRunsRow { command_id: i64, runs: u32, last_run_at: i64 }>` |
 | `runs_in_repo(repo_root: &str)` | R3 | `Vec<CountRow { command_id: i64, runs: u32 }>` |
 | `runs_since(cutoff: i64)` | R4 | `Vec<RecentRunRow { command_id: i64, started_at: i64, exit_code: Option<i32> }>` |
@@ -1413,7 +1416,7 @@ within one test: `Database`'s schema registry is keyed by path
 | TC-R-08 | `record_run` aggregates | same text 3 times: exit 0 at t=100, exit 1 at t=200, exit NULL at t=150 | `run_count 3, success 1, fail 1, first_run_at 100, last_run_at 200, last_exit_code 1` | out-of-order arrival does not overwrite `last_exit_code` |
 | TC-R-09 | `record_run` predecessor | session `s`: A at 100, B at 160, C at 160+1801; session `t`: D at 170 | B.prev = A, C.prev = NULL (gap), D.prev = NULL (other session) | `CMD_SEQUENCE_MAX_GAP_SECS` boundary: gap exactly 1800 -> linked |
 | TC-R-10 | import uniqueness | `record_run` Import twice with same text and `started_at` | second returns `Duplicate`; `run_count == 1` | Hook rows with the same pair are both inserted |
-| TC-R-11 | every plan | `EXPLAIN QUERY PLAN` of S2, S3, R2-R8, R9, R10, D2-D4, I1 with a `plan()` helper shaped like [src/db.rs:1424-1433](../../src/db.rs) | Each contains the string in its "Expected plan contains" cell; R5 does not contain `TEMP B-TREE` | R6 with 1, 2 and 3 placeholders |
+| TC-R-11 | every plan | `EXPLAIN QUERY PLAN` of S2, S3, R1 ids, R1-R8, R9, R10, D2-D4, I1 with a `plan()` helper shaped like [src/db.rs:1424-1433](../../src/db.rs) | Each contains the string in its "Expected plan contains" cell; R5 does not contain `TEMP B-TREE` | R6 with 1, 2 and 3 placeholders |
 | TC-R-12 | `create_schema` idempotence | call 3 times on `:memory:` | no error; `SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'idx_command%'` = 11 | - |
 | TC-R-13 | `assign_times` | timestamps `[None, Some(50), None, None]`, now 100, ceiling 100 | `at = [49, 50, 98, 99]`, `synthetic = [true, false, true, true]` | `[Some(500)]` -> `at = [99]`, synthetic (future timestamp); `[Some(30), Some(20), Some(10), Some(5)]` -> all kept, none synthetic (out-of-order file); ceiling 60 with `[None]` -> `at = [59]` |
 | TC-R-14 | `replay_cwds` | home `/h`, dirs `/h/a`, `/h/a/b`; commands `cd a`, `ls`, `cd b && make`, `z foo`, `ls`, `cd /h/a`, `pwd` | `[/h, /h/a, /h/a, /h/a/b, None, None, /h/a]` | the command's own `cd` does not apply to itself; lost and regained cwd |

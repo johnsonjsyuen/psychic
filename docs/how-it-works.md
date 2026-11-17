@@ -2530,6 +2530,9 @@ define the same commands; the help screen reads them out of the zsh one.
   anything prints it and exits. A pick under `$PWD` is inserted relative to it, anything
   else absolute, quoted for the shell (`${(q)}`, `printf %q`, `string escape`), with a
   trailing space.
+- **Ctrl-R** (once `psychic history --enable` is on) opens the command-history
+  picker with the line being edited as the query and replaces the line with
+  the pick; see "Shell history search" below.
 
 **Ctrl-T never takes a key someone else has.** Each script binds it only where it
 still does the shell's default (`transpose-chars`), or nothing: an fzf binding,
@@ -2752,11 +2755,12 @@ Why: User might scroll up/down many times. Only log once per (query, file) combi
 
 Ctrl-R over the user's shell history, ranked by directory, repository and
 the previous command. Specified in `docs/ctrl-r/` (start at its README); built
-in phases. **Phase A, "Record", and the benchmark corpora of Phase D0 are what
-exists today:** commands are recorded and imported, `psychic history` manages
-them, and `psychic internal bench-history` builds and describes benchmark
-corpora. The picker (`psychic history` with no action flag, Phase B) and
-`--retrain` (Phase C) exit with "not built yet".
+in phases. **Phases A ("Record"), D0 (benchmark corpora) and B ("Browse")
+are what exists today:** commands are recorded and imported, `psychic
+history` manages them, `psychic history` with no action flag is the Ctrl-R
+picker (heuristic ranking; the learned model is Phase C), and `psychic
+internal bench-history` builds and describes benchmark corpora. `--retrain`
+(Phase C) exits with "not built yet".
 
 New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
 `history_mode` and `ToggleHistoryMode` already mean directory back/forward.
@@ -2774,6 +2778,13 @@ New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
 | `cmd/backfill.rs` | Import from Atuin, zsh, bash and fish history |
 | `cmd/bench.rs` | `psychic internal bench-history`: clap types, the data-dir guard's callee, `stats` |
 | `cmd/corpus.rs` | The seeded synthetic generator and the Claude Code transcript extractor |
+| `cmd/index.rs` | `CommandIndex`: every ranking statistic in memory, loaded at picker start (or, Phase C, filled by replay) |
+| `cmd/worker.rs` | The picker's worker thread: requests and responses, the filter, narrowing and reuse, the `cmd_query` TIMING line |
+| `cmd/rank.rs` | The heuristic, `rank_commands` (partial sort) and the one total order |
+| `cmd/app.rs` | The picker's UI thread: start-up, event loop, keys, pick output |
+| `cmd/render.rs` | List, preview, debug pane, help overlay (pure: no I/O, no clock) |
+| `cmd/keys.rs` | `CmdAction`, `CMD_KEYMAP` (its own table, not `keymap::KEYMAP`) |
+| `cmd/events.rs` | Impression and pick logging into `command_events` |
 
 **Tables** (same `events.db`, created by `store::create_schema`, which
 `Database::prepare_schema` calls once per file per process): `commands` (one
@@ -2872,6 +2883,60 @@ import uses (state before the entry's own `cd`). Entries without a timestamp
 get synthetic ones, one second apart, ending at the file's mtime, and are
 imported once per file only. Nothing at or after the first hook-recorded run
 is imported (the hook has it).
+
+**The picker** (`psychic history [--query Q] [--session ID] [--cwd DIR]`,
+`docs/ctrl-r/02-browse.md`). A slim TUI of its own beside file mode's, not a
+mode of it (ADR-2), with the same shape: a worker thread answering
+`UpdateQuery`/`GetRows`/`Details`/`Delete` with query ids, stale answers
+dropped, consecutive queries collapsed. The worker is spawned before the
+terminal is set up. It loads `CommandIndex` with R1-R8 side by side: R1 (every
+command) split by id over four connections that each build their entries, R2-R8
+(this directory, this repository, 30 days of runs, the session's last three
+commands and what followed them, this session's commands, 30 days of picks) on
+a fifth, every one memory-mapped (`PRAGMA mmap_size`; the only connections in
+psychic that are), while the rayon pool starts and warms the matcher. After
+that no SQL runs per keystroke. A query is a `SkimMatcherV2` filter over the
+index (rayon from 2,000 candidates, and only with a query), then the heuristic
+`(1.0*recency + 0.5*dir + 0.2*repo + 0.6*fuzzy) / 2.3` with recency
+`1/(1 + age/3600)` and dir/repo the share of the command's runs made there,
+damped below 10 runs; ties go to the newer run, then the larger id. Only the
+first page is sorted (`select_nth` over 32-byte keys, then a sort of 200); the
+rest is sorted if a page reaches it. Typing a longer query re-matches only the
+matches of its longest prefix typed before; deleting back to a query reuses
+its matches, and the empty query's ranking is kept per scope until a delete.
+One `cmd_query` TIMING line per query, after the answer, numbers only. The UI
+thread shows rank, a red `!` for a failed last run, `*` for "run here", the
+command (newlines as `↵`, control characters made safe) and its age; a preview
+with counts, last directories and what usually came before; Ctrl-O a debug
+pane with the heuristic's parts (`model: none` until Phase C); Ctrl-G help
+generated from `CMD_KEYMAP`. Tab cycles the scope (all, this directory, this
+repo, this session), Delete/Ctrl-X deletes a command after a `y`. A query on
+screen for 200 ms logs its visible rows as impressions; Enter logs the pick
+(with every query of the episode, the cwd, repository and `--session`), bumps
+`pick_count`, restores the terminal and prints the command on stdout before
+asking the worker to stop (it is not waited for). A newer preview request
+replaces older queued ones, so scrolling cannot queue SQL ahead of a
+keystroke. Nothing re-ranks on a timer. Measured at Phase B on the 50,000-command perf DB (pty,
+release, rough): first results on screen 38-40 ms p50 / 46-52 ms p95 over three runs (B3 <= 50,
+so at the target, not under it), worker per keystroke 1.5 / 5.5 ms (B1 <= 8),
+keystroke to redraw 1.4 / 2.1-2.7 ms
+(B2 <= 16); the spec's section 12 has the breakdown.
+
+**Ctrl-R widgets.** Appended to the three scripts, after the recording block.
+Each passes the line being edited as `--query=` (with `=`, so a line starting
+with `-` stays a value), the shell's `$PWD` and its recording session id, and
+replaces the whole line with the pick, cursor at the end; Escape or a failing
+picker leaves the line alone. The pick is not run: the user presses Enter, and
+the recording hook records that run once, in the same session, so training can
+tie it to the pick event (same command and session, run within 300 s). Bound
+only when recording is on, `PSYCHIC_NO_CTRL_R` is unset, and Ctrl-R still has
+the shell's default binding (zsh `history-incremental-search-backward` in
+emacs, `redisplay` in viins; bash `reverse-search-history`, no `bind -x` on it;
+fish no user binding, asked per mode with `bind --user -M <mode> \cr` because
+fish 4 lists the preset beside the user's), so fzf's or Atuin's Ctrl-R is never taken over. bash
+binds with `bind -x` and never calls `history -s`. fish's widget checks the
+binary with `command -q` first and stays quiet without it.
+`tests/picker.rs` drives the picker alone and under each shell's Ctrl-R on a pty.
 
 **Benchmark corpora** (`psychic --data-dir DIR internal bench-history
 generate|extract-agent|stats`; `docs/ctrl-r/04-bench.md` section 4). Every
@@ -3370,6 +3435,8 @@ psychic history --disable                # stop recording; keeps what is recorde
 psychic history --status
 psychic history --import                 # Atuin, zsh, bash, fish history
 psychic history --purge [--yes]          # delete every recorded command
+psychic history [--query Q] [--session ID] [--cwd DIR]
+                                         # the picker (what Ctrl-R runs); prints the pick
 psychic track-command --cwd DIR --exit-code N [--started-at S] [--duration-ms MS] --session ID -- TEXT
                                          # what the shell hooks call; never logs
 

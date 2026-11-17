@@ -5,7 +5,10 @@
 //! (`track`), opt-in and privacy (`privacy`), templating (`template`), the
 //! repository root (`repo`) and the shell history import (`backfill`). Phase
 //! D0 adds the benchmark corpora: `psychic internal bench-history` (`bench`)
-//! and the synthetic and agent-transcript corpus builders (`corpus`).
+//! and the synthetic and agent-transcript corpus builders (`corpus`). Phase B,
+//! "Browse", is the picker: the in-memory statistics (`index`), the worker
+//! thread and its filter (`worker`), heuristic ranking (`rank`), the UI
+//! (`app`, `render`, `keys`) and impression/pick logging (`events`).
 //!
 //! Identifiers say `cmd`/`command`, never `history`: `src/history.rs` and
 //! `history_mode` already mean directory back/forward (ADR-1).
@@ -13,16 +16,23 @@
 //! Nothing here formats a command's text into a log line or an error message
 //! (`docs/ctrl-r/01-record.md` section 10.6), and nothing here uses `eprintln!`.
 
+mod app;
 mod backfill;
 pub mod bench;
 pub mod cli;
 mod corpus;
+mod events;
+mod index;
+mod keys;
 mod privacy;
+mod rank;
+mod render;
 mod repo;
 pub mod store;
 mod template;
 mod track;
 mod tuning;
+mod worker;
 
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, IsTerminal, Write};
@@ -41,7 +51,7 @@ pub fn run_track_command(data_dir: Option<&Path>, args: &cli::TrackCommandArgs) 
     track::run(data_dir, args, &env)
 }
 
-/// `psychic history`: one action on what is recorded, or (Phase B) the picker.
+/// `psychic history`: one action on what is recorded, or the picker.
 pub fn run_history(data_dir: &Path, args: cli::HistoryArgs) -> Result<()> {
     let now = jiff::Timestamp::now().as_second();
     let env = Env::from_process();
@@ -75,7 +85,8 @@ pub fn run_history(data_dir: &Path, args: cli::HistoryArgs) -> Result<()> {
     } else if args.retrain {
         bail!("psychic history: not built yet (Phase C)")
     } else {
-        bail!("psychic history: not built yet (Phase B)")
+        drop(out);
+        app::run(data_dir, &args)
     }
 }
 

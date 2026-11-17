@@ -231,7 +231,6 @@ pub(super) fn is_own_command(text: &str) -> bool {
 }
 
 /// How many words (not operators) `text` has.
-#[allow(dead_code, reason = "the `argument_count` feature (Phase C)")]
 pub(super) fn word_count(text: &str) -> usize {
     raw_words(text)
         .iter()

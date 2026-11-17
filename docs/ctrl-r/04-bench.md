@@ -288,8 +288,8 @@ For each split, with `t_s` its training cut:
 |---|---|---|---|
 | `recency` | `last_run_at` descending, then `db_id` descending | none | **The baseline of R1-R3** ("fzf: newest first among fuzzy matches") |
 | `fzf_scored` | `fuzzy_score` descending, then `last_run_at` descending, then `db_id` descending | none | Information only: what fzf does when it sorts by match score with recency as tie-break (ADR-17) |
-| `heuristic` | `rank_commands(.., model = None)` | none | R3 |
-| `model` | `rank_commands(.., Some(&model_s))` | per seed | R1, R2 |
+| `heuristic` | `rank_commands(.., head = usize::MAX, model = None)` | none | R3 |
+| `model` | `rank_commands(.., head = usize::MAX, Some(&model_s))` | per seed | R1, R2 |
 
 ### 5.4 Slices
 
@@ -407,7 +407,7 @@ the method of [bench/harness.py:218-248](../../bench/harness.py).
 | Reported (p50, p95, n, misses) | From |
 |---|---|
 | **keystroke -> redraw (B2)** | the measured intervals |
-| **worker time per keystroke (B1)** | `total_ms` of every `cmd_query` TIMING line of this run except the first |
+| **worker time per keystroke (B1)** | `total_ms` of every `cmd_query` TIMING line of this run except the first (the Backspaces are answered by the worker's reuse rules, [02 section 6.3](02-browse.md#63-filter), as a user's are; `reused` says which) |
 | filter / heuristic / features / predict / blend (p50) | the same lines |
 | matched, stage2 (p50, max) | the same lines |
 
@@ -426,7 +426,7 @@ database; load the model. Take 400 runs at an even stride over the last 20% of
 the timeline; lookup `j` uses the context of run `j` (its cwd, repo, session,
 with `now` = the newest `started_at` + 1) and query length `j % 4` taken from
 that run's command text. For each: `full` = ranking with stage 2 over all
-matches (`rank_with` with `k = usize::MAX`, [03 section 7.2](03-learn.md#72-rank_commands-with-a-model)),
+matches (`rank_with` with `head = k = usize::MAX`, [03 section 7.2](03-learn.md#72-rank_commands-with-a-model)),
 `two` = ranking with `k = CMD_STAGE2_K`. Report the mean of
 `|top10(full) ∩ top10(two)| / min(10, matched)`, the share with equal row 1, the
 share of lookups with `matched > CMD_STAGE2_K`, and PASS/FAIL against B8.
@@ -436,7 +436,7 @@ share of lookups with `matched > CMD_STAGE2_K`, and PASS/FAIL against B8.
 `bench-history latency --keystrokes 300`: `CommandIndex::load` for the context
 in `--data-dir/bench-context.json` (written by 6.1; missing file ->
 `bail!("run ./bench/history.py setup first")`), the model, then the key cycle of 6.3 driven straight through
-`filter_candidates` (with the worker's narrowing rule) and `rank_commands` on the calling thread; prints p50/p95 of the
+`filter_candidates` (with the worker's narrowing rule; it reuses nothing, so it measures every key) and `rank_commands` (`head = CMD_PAGE_ROWS`, as the worker) on the calling thread; prints p50/p95 of the
 total and the stage means. Not a pass bar: B1 is judged from 6.3.
 
 ### 6.7 `train`, `size`, `all`
@@ -592,7 +592,7 @@ Work top to bottom; within a row try the listed values one at a time.
 | ID | Flow | Setup | Verification | Teardown |
 |---|---|---|---|---|
 | IT-N-01 | Relevance end to end | Temp data dir; `generate(300, 6000, seed 3, anchor fixed)`; `relevance --seeds 2 --max-test-runs 200 --json out.json` | Exit 0; JSON parses; has `splits.holdout.cells` for 4 rankers x 4 lengths x slice `all`; for `recency` and `heuristic` `sd == 0`; `unreachable.all` between 0 and 1; `verdicts` has R1, R2, R3; a second run produces a byte-identical JSON apart from `date` | `remove_dir_all` |
-| IT-N-02 | Replay state equals a fresh load | Same data; a `Replayer` with every run applied versus `CommandIndex::load` at `now` = newest run + 1 for one (cwd, repo, session) | `rank_commands(.., None)` over all commands returns the same order of `db_id`s from both, for queries `""` and `g` | `remove_dir_all` |
+| IT-N-02 | Replay state equals a fresh load | Same data; a `Replayer` with every run applied versus `CommandIndex::load` at `now` = newest run + 1 for one (cwd, repo, session) | `rank_commands(.., usize::MAX, None)` over all commands returns the same order of `db_id`s from both, for queries `""` and `g` | `remove_dir_all` |
 | IT-N-03 | Agent extraction | Temp projects dir: `p1/s1.jsonl` (the TC-N-05 fixture), `p1/s1/subagents/agent-a9.jsonl` (two uses with `agentId` `a9`, timed between the main file's first two), a non-JSONL file | Runs from both files; `shell_session` values `agent:s1` and `agent:s1:a9`; rows in global time order with `prev_command_id` set inside one session only; `source = 'hook'`; the fixture files' mtimes unchanged | `remove_dir_all` |
 | IT-N-04 | Two-stage check | IT-N-01's data plus `retrain`; `twostage --queries 40` with `CMD_STAGE2_K` larger than the corpus | Overlap 1.0 and top-1 agreement 1.0 (no cut applies); exit 0 | `remove_dir_all` |
 | IT-N-05 | Real data dir is never written | Record size and mtime of every file in `get_default_data_dir()` (skip if it does not exist); run IT-N-01's commands | Unchanged afterwards | none |

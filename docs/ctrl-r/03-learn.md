@@ -365,12 +365,18 @@ gains the field `pub model_failed: bool` (false in every case but step 5's error
 
 ```rust
 pub(super) fn rank_commands(query: &str, candidates: &[CommandCandidate], index: &CommandIndex,
-                            ctx: &RankContext, model: Option<&CmdModel>) -> CommandRanking;
+                            ctx: &RankContext, head: usize, model: Option<&CmdModel>) -> CommandRanking;
 ```
+
+`head` is Phase B's ([02 section 7](02-browse.md#7-heuristic-ranking)): only
+`scores[..sorted]` are in rank order. Step 1 sorts at least
+`max(head, CMD_STAGE2_K)` rows, so stage 2 always takes its `k` rows from a
+sorted head; steps 7-8 keep `sorted` as it was (the tail after the head stays
+for `sort_rest`).
 
 | Step | Action |
 |---|---|
-| 1 | Heuristic for every candidate and the total-order sort of [02 section 7](02-browse.md#7-heuristic-ranking). Call the result `H` |
+| 1 | Heuristic for every candidate and the total-order sort of [02 section 7](02-browse.md#7-heuristic-ranking), exact for the first `max(head, CMD_STAGE2_K)` rows. Call the result `H` |
 | 2 | `model` is `None`: return `H` (`ml_score = None`, `ml_weight = 0.0`, `features` empty, stage times `None`, `stage2 = 0`) |
 | 3 | `k = min(CMD_STAGE2_K, H.len())`. Stage 2 is `H[..k]`; the tail `H[k..]` is final as it is |
 | 4 | Features for the `k` rows: `par_iter` + `fold`/`reduce` into per-chunk `Vec<f64>` recombined in order (the shape of [src/ranker.rs:517-543](../../src/ranker.rs)), giving one flat row-major `Vec<f64>` of `k * F` values. `query_lower` is computed once before the loop. Sequential when `k < 256` |
@@ -385,7 +391,7 @@ pub(super) fn rank_commands(query: &str, candidates: &[CommandCandidate], index:
 pub(super) struct Stage2<'a> { pub k: usize, pub ml_weight: f64,
     pub predict: &'a dyn Fn(&[f64], usize) -> anyhow::Result<Vec<f64>> }   // (flat features, F) -> one raw score per row
 pub(super) fn rank_with(query: &str, candidates: &[CommandCandidate], index: &CommandIndex,
-                        ctx: &RankContext, stage2: Option<Stage2<'_>>) -> CommandRanking;
+                        ctx: &RankContext, head: usize, stage2: Option<Stage2<'_>>) -> CommandRanking;
 ```
 
 `rank_commands` passes `Stage2 { k: CMD_STAGE2_K, ml_weight: model.ml_weight, predict: &|flat, f| model.predict(flat, f) }`.
@@ -503,7 +509,7 @@ Fixture `F1`: built with the `CommandIndex` mutators; `now = 1_000_000`; command
 | TC-L-14 | `from_parts` asserts | Unsorted `episodes`; a zero weight; `features.len()` mismatch | Each panics with its assert message | - |
 | TC-L-15 | blend table | `blend_examples` 0, 150, 300, 450, 600 | `ml_weight` 0.018, 0.119, 0.500, 0.881, 0.982 (+-1e-3) | - |
 | TC-L-16 | stats file | A `CmdModelStats` value | Serialises and parses back equal; `blend_examples` = `pick*4 + hook*1 + import*0.3` | - |
-| TC-L-17 | two-stage order | 6 candidates, `rank_with` with `Stage2 { k: 3, ml_weight: 1.0, predict: <stub returning raw scores that reverse the input order> }` | First 3 rows are the heuristic top 3 in reversed order; last 3 are heuristic ranks 4-6 unchanged with `ml_score = None` | `k >= len` -> all rows model-scored |
+| TC-L-17 | two-stage order | 6 candidates, `rank_with` with `head = usize::MAX` and `Stage2 { k: 3, ml_weight: 1.0, predict: <stub returning raw scores that reverse the input order> }` | First 3 rows are the heuristic top 3 in reversed order; last 3 are heuristic ranks 4-6 unchanged with `ml_score = None` | `k >= len` -> all rows model-scored |
 | TC-L-18 | pick then run | Timeline: runs A, B; pick of A in shell session `s` at t; run of A in `s` at t+5; run of A in `s` at t+400; run of A in session `u` at t+6 | The t+5 run is not eligible; the t+400 run and the session-`u` run are | - |
 
 ### 10.2 Integration tests

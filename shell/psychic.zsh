@@ -171,3 +171,35 @@ function __psychic_precmd() {
 \builtin autoload -Uz add-zsh-hook
 add-zsh-hook preexec __psychic_preexec
 add-zsh-hook precmd __psychic_precmd
+
+# =============================================================================
+# Ctrl-R: search command history in psychic
+# =============================================================================
+
+# Enter on a command replaces the line being edited with it; Escape leaves the
+# line alone. What is already typed becomes the search.
+__psychic_history_widget() {
+    \builtin local result
+    result="$(\command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
+        history --session="${__psychic_session}" --cwd="${PWD}" --query="${BUFFER}")"
+    if [[ -n "${result}" ]]; then
+        BUFFER="${result}"
+        CURSOR=${#BUFFER}
+    fi
+    \builtin zle reset-prompt
+}
+\builtin zle -N __psychic_history_widget
+
+# Bound to Ctrl-R only where history search is on and Ctrl-R still does what
+# zsh does by default. Set PSYCHIC_NO_CTRL_R before loading this to skip it;
+# bind the widget yourself with, e.g.,
+#   bindkey '^X^R' __psychic_history_widget
+if [[ -z "${PSYCHIC_NO_CTRL_R-}" ]] && __psychic_history_enabled; then
+    for __psychic_keymap in emacs viins; do
+        case "$(\builtin bindkey -M "${__psychic_keymap}" '^R' 2>/dev/null)" in
+            *history-incremental-search-backward|*redisplay|*undefined-key|'')
+                \builtin bindkey -M "${__psychic_keymap}" '^R' __psychic_history_widget ;;
+        esac
+    done
+    \builtin unset __psychic_keymap
+fi

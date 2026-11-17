@@ -20,7 +20,6 @@ pub(super) fn marker_path(data_dir: &Path) -> PathBuf {
 
 /// Whether the shell hooks record commands, by the same rule they use:
 /// `PSYCHIC_HISTORY` (`env`) of `1` or `0` wins, else the marker decides.
-#[allow(dead_code, reason = "the picker's hint (Phase B)")]
 pub(super) fn recording_enabled(data_dir: &Path, env: Option<&str>) -> bool {
     match env {
         Some("1") => true,
