@@ -123,6 +123,7 @@ selection --> println!(command) on stdout, exit 0 --> widget replaces the prompt
 | `events.rs` | Impression and pick logging | B | [02 section 10](02-browse.md#10-event-logging) |
 | `keys.rs` | `CmdAction`, `CMD_KEYMAP` | B | [02 section 9](02-browse.md#9-keys) |
 | `app.rs` | UI state, event loop, input handling | B | [02 section 8](02-browse.md#8-ui-thread) |
+| `terminal.rs` | The picker's terminal: set-up, and its restore on every way out (a guard, a panic hook, SIGTERM/SIGHUP/SIGINT) | B | [02 section 4](02-browse.md#4-picker-invocation), [02 section 15](02-browse.md#15-error-handling-matrix) |
 | `render.rs` | List, preview, debug pane, help overlay | B | [02 section 8.3](02-browse.md#83-layout-and-rows) |
 | `features.rs` | `CommandFeature`, `COMMAND_FEATURE_REGISTRY`, 25 features (23 at first) | C | [03 section 4](03-learn.md#4-features) |
 | `model.rs` | `CmdModel`: load checks, blend weight, prediction by walking the trees of `cmd_model.txt` in Rust | C | [03 section 7.1](03-learn.md#71-loading-the-model) |

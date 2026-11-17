@@ -209,6 +209,90 @@ fn it_b_12_enter_prints_the_pick_at_once_while_another_process_holds_the_write_l
     );
 }
 
+/// What `input::leave_tui` writes, in its order: keyboard flags popped,
+/// mouse capture off (its last sequence), main screen, cursor shown.
+const RESTORE: [&str; 4] = ["\x1b[<1u", "\x1b[?1000l", "\x1b[?1049l", "\x1b[?25h"];
+
+/// The picker on a pty with `env` added and stdout to a file, settled.
+fn start_picker(scratch: &Scratch, env: &[(&str, &str)]) -> Pty {
+    let mut command = Command::new(BINARY);
+    command
+        .env_clear()
+        .env("HOME", scratch.path("home"))
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("TERM", "xterm-256color")
+        .env("PSYCHIC_NO_RETRAIN", "1")
+        .envs(env.iter().copied())
+        .arg("--data-dir")
+        .arg(scratch.path("data"))
+        .args(["history", "--cwd", "/tmp"]);
+    let file = std::fs::File::create(scratch.path("out")).unwrap();
+    Pty::spawn_with_stdout(command, 30, 100, Some(file)).expect("the picker starts")
+}
+
+/// The terminal was given back after it was set up: every sequence of
+/// [`RESTORE`] after the last switch to the alternate screen, in order, and
+/// the pty in cooked mode. Returns where the restore ends in `terminal`.
+fn assert_restored(pty: &Pty, terminal: &str) -> usize {
+    let entered = terminal
+        .rfind("\x1b[?1049h")
+        .unwrap_or_else(|| panic!("the picker never set up the terminal:\n{terminal:?}"));
+    let mut at = entered;
+    for sequence in RESTORE {
+        at += terminal[at..]
+            .find(sequence)
+            .unwrap_or_else(|| panic!("{sequence:?} missing after set-up:\n{terminal:?}"));
+    }
+    assert!(pty.is_cooked(), "the terminal was left in raw mode");
+    at
+}
+
+#[test]
+fn e_b_20_a_panic_in_the_picker_gives_the_terminal_back_before_its_message() {
+    let scratch = Scratch::empty("picker", "panic");
+    seed(&scratch, "echo panic-one", 100, "/w");
+    let mut pty = start_picker(&scratch, &[("PSYCHIC_HISTORY_TEST_PANIC", "1")]);
+    let status = pty
+        .wait(SETTLE_LIMIT)
+        .unwrap_or_else(|| panic!("the picker did not exit:\n{}", pty.output()));
+    // Let the reader thread drain what the picker wrote last.
+    std::thread::sleep(QUIET);
+
+    assert_eq!(status.code(), Some(101), "a panic's exit status");
+    let terminal = pty.output();
+    let restored = assert_restored(&pty, &terminal);
+    let message = terminal
+        .find("PSYCHIC_HISTORY_TEST_PANIC is set")
+        .unwrap_or_else(|| panic!("no panic message:\n{terminal:?}"));
+    assert!(message > restored, "the message printed on the main screen");
+    assert_eq!(std::fs::read_to_string(scratch.path("out")).unwrap(), "");
+}
+
+#[test]
+fn e_b_21_a_termination_signal_gives_the_terminal_back_and_prints_nothing() {
+    use std::os::unix::process::ExitStatusExt;
+    for (tag, signal) in [("sigterm", libc::SIGTERM), ("sighup", libc::SIGHUP)] {
+        let scratch = Scratch::empty("picker", tag);
+        seed(&scratch, "echo signal-one", 100, "/w");
+        let mut pty = start_picker(&scratch, &[]);
+        settle(&pty, "the picker");
+        // SAFETY: a plain kill of the child this test started.
+        assert_eq!(unsafe { libc::kill(pty.pid(), signal) }, 0);
+        let status = pty
+            .wait(SETTLE_LIMIT)
+            .unwrap_or_else(|| panic!("{tag}: the picker did not exit:\n{}", pty.output()));
+        std::thread::sleep(QUIET);
+
+        assert_eq!(status.signal(), Some(signal), "{tag}: died of the signal");
+        assert_restored(&pty, &pty.output());
+        assert_eq!(
+            std::fs::read_to_string(scratch.path("out")).unwrap(),
+            "",
+            "{tag}: no pick"
+        );
+    }
+}
+
 #[test]
 fn it_b_07_the_query_never_reaches_app_log() {
     let scratch = Scratch::empty("picker", "no-query-in-log");

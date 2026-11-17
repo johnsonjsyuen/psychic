@@ -37,6 +37,7 @@ mod render;
 mod repo;
 pub mod store;
 mod template;
+mod terminal;
 mod track;
 mod train;
 mod tuning;

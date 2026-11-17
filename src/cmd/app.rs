@@ -12,19 +12,13 @@ use super::index::LoadParams;
 use super::keys::{self, CmdAction};
 use super::render;
 use super::store::CmdStore;
+use super::terminal::{self, PickerTerminal, TerminationSignals, Tui};
 use super::train::{self, CmdModelStats};
 use super::tuning::{CMD_PAGE_PREFETCH, CMD_TICK_MS};
 use super::worker::{self, CmdDetails, CmdRequest, CmdResponse, CmdRow, Scope};
 use super::{cli, privacy, repo};
-use anyhow::{Context, Result};
-use crossterm::event::{
-    Event, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
-    PushKeyboardEnhancementFlags,
-};
-use crossterm::execute;
-use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use anyhow::Result;
+use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,7 +31,22 @@ pub(super) enum CmdEvent {
     Input(Event),
     Worker(CmdResponse),
     Tick,
+    /// SIGTERM, SIGHUP or SIGINT arrived (E-B-21).
+    Terminate(std::os::raw::c_int),
 }
+
+/// How the event loop ended.
+enum Ended {
+    /// Enter (with the command) or Esc (without).
+    Pick(Option<Arc<str>>),
+    /// A termination signal: give the terminal back, print nothing, and die
+    /// of the signal.
+    Signal(std::os::raw::c_int),
+}
+
+/// Set in the environment, the picker panics in its first draw: how
+/// `tests/picker.rs` checks that a panic gives the terminal back (E-B-20).
+const TEST_PANIC_ENV: &str = "PSYCHIC_HISTORY_TEST_PANIC";
 
 impl From<Event> for CmdEvent {
     fn from(event: Event) -> Self {
@@ -475,58 +484,6 @@ fn log_once(logged: &mut bool, op: &str) {
     }
 }
 
-/// The picker's terminal. Buffered: a frame reaches the terminal as one
-/// write when ratatui flushes it, not one write per escape sequence (an
-/// unbuffered `/dev/tty` took about 6 ms of syscalls per redraw of the list).
-type Tui = Terminal<CrosstermBackend<std::io::BufWriter<std::fs::File>>>;
-
-/// Big enough for a full 40 x 120 frame of styled cells.
-const FRAME_BUFFER_BYTES: usize = 64 * 1024;
-
-/// Undo whatever part of the terminal set-up happened (E-B-03), on a
-/// terminal that never became a `Terminal`.
-fn undo_setup(tty: &mut std::fs::File) {
-    use crossterm::cursor::Show;
-    use crossterm::event::{DisableMouseCapture, PopKeyboardEnhancementFlags};
-    use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        tty,
-        PopKeyboardEnhancementFlags,
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        Show
-    );
-}
-
-/// Raw mode, alternate screen, mouse, key disambiguation: the sequence of
-/// file mode, so `input::leave_tui` undoes it exactly.
-fn enter_terminal() -> Result<Tui> {
-    let mut tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .context("no terminal to draw on (/dev/tty)")?;
-    let mut cleanup = tty
-        .try_clone()
-        .context("no terminal to draw on (/dev/tty)")?;
-    enable_raw_mode().context("could not set up the terminal")?;
-    let set_up = (|| -> Result<Tui> {
-        execute!(tty, EnterAlternateScreen)?;
-        execute!(tty, crossterm::event::EnableMouseCapture)?;
-        execute!(
-            tty,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )?;
-        let tty = std::io::BufWriter::with_capacity(FRAME_BUFFER_BYTES, tty);
-        Ok(Terminal::new(CrosstermBackend::new(tty))?)
-    })();
-    if set_up.is_err() {
-        undo_setup(&mut cleanup);
-    }
-    set_up.context("could not set up the terminal")
-}
-
 /// Stop and join the worker. `false` if it had panicked.
 fn stop_worker(worker_tx: &Sender<CmdRequest>, handle: JoinHandle<()>) -> bool {
     let _ = worker_tx.send(CmdRequest::Shutdown);
@@ -577,8 +534,15 @@ pub(super) fn run(data_dir: &Path, args: &cli::HistoryArgs) -> Result<()> {
             return Err(error);
         }
     };
-    let mut terminal = match enter_terminal() {
-        Ok(terminal) => terminal,
+    // From here on, every way out gives the terminal back (E-B-20, E-B-21).
+    terminal::restore_on_panic();
+    let signal_tx = event_tx.clone();
+    let signals = TerminationSignals::watch(move |signal| {
+        let _ = signal_tx.send(CmdEvent::Terminate(signal));
+    });
+    let set_up = signals.and_then(|signals| Ok((signals, PickerTerminal::enter()?)));
+    let (_signals, mut terminal) = match set_up {
+        Ok(set_up) => set_up,
         Err(error) => {
             stop_worker(&worker_tx, worker_handle);
             input.shutdown();
@@ -622,6 +586,9 @@ pub(super) fn run(data_dir: &Path, args: &cli::HistoryArgs) -> Result<()> {
     );
 
     // 7. The event loop.
+    if std::env::var_os(TEST_PANIC_ENV).is_some() {
+        terminal.draw(|_| panic!("{TEST_PANIC_ENV} is set"))?;
+    }
     let result = event_loop(&mut terminal, &mut app, &event_rx, &worker_handle, data_dir);
 
     // 8. Give the terminal back and print first: the worker may be busy
@@ -629,16 +596,20 @@ pub(super) fn run(data_dir: &Path, args: &cli::HistoryArgs) -> Result<()> {
     // it does. Then ask it to stop; it is joined only if already done, as
     // the process is about to exit anyway.
     input.shutdown();
-    crate::input::leave_tui(&mut terminal)?;
+    terminal.leave()?;
     let printed = match result {
-        Ok(Some(text)) => {
+        Ok(Ended::Signal(signal)) => {
+            log::info!("the picker got signal {}; nothing is printed", signal);
+            terminal::die_of(signal);
+        }
+        Ok(Ended::Pick(Some(text))) => {
             use std::io::Write;
             let mut out = std::io::stdout().lock();
             writeln!(out, "{}", text)
                 .and_then(|()| out.flush())
                 .map_err(anyhow::Error::from)
         }
-        Ok(None) => Ok(()),
+        Ok(Ended::Pick(None)) => Ok(()),
         Err(error) => Err(error),
     };
     let _ = worker_tx.send(CmdRequest::Shutdown);
@@ -658,7 +629,7 @@ fn event_loop(
     event_rx: &Receiver<CmdEvent>,
     worker: &JoinHandle<()>,
     data_dir: &Path,
-) -> Result<Option<Arc<str>>> {
+) -> Result<Ended> {
     let (mut first_render, mut first_results, mut first_full_render) = (false, false, false);
     // When the query whose results arrived was sent: the next draw shows them.
     let mut results_to_draw: Option<Instant> = None;
@@ -688,7 +659,7 @@ fn event_loop(
         app.request_after_draw();
 
         let Ok(event) = event_rx.recv() else {
-            return Ok(None); // every sender is gone: nothing more can happen
+            return Ok(Ended::Pick(None)); // every sender is gone: nothing more can happen
         };
         match event {
             CmdEvent::Worker(response) => {
@@ -708,9 +679,10 @@ fn event_loop(
                 }
             }
             CmdEvent::Tick => app.on_tick(jiff::Timestamp::now().as_second()),
+            CmdEvent::Terminate(signal) => return Ok(Ended::Signal(signal)),
             CmdEvent::Input(Event::Key(key)) => {
                 if let Flow::Exit(text) = app.on_key(key) {
-                    return Ok(text);
+                    return Ok(Ended::Pick(text));
                 }
             }
             CmdEvent::Input(Event::Mouse(mouse)) => app.on_mouse(mouse),

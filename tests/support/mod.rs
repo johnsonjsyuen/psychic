@@ -13,6 +13,8 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -166,6 +168,39 @@ impl Pty {
             std::thread::sleep(Duration::from_millis(20));
         }
         false
+    }
+
+    /// The child's process id, to send it a signal.
+    pub fn pid(&self) -> libc::pid_t {
+        libc::pid_t::try_from(self.child.id()).expect("a pid fits in pid_t")
+    }
+
+    /// Whether the terminal is in canonical (cooked) mode with echo, as a
+    /// shell expects to find it; `false` when a program left it raw. Read
+    /// from the slave side, through its name: Linux keeps a separate
+    /// termios for the master.
+    pub fn is_cooked(&self) -> bool {
+        let mut name = [0 as libc::c_char; 128];
+        // SAFETY: the buffer is valid for its length; the master is open.
+        let found =
+            unsafe { libc::ptsname_r(self.master.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+        assert_eq!(found, 0, "the pty has a slave name");
+        // SAFETY: ptsname_r wrote a NUL-terminated string.
+        let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(std::ffi::OsStr::from_bytes(name.to_bytes()))
+            .expect("the slave opens");
+        // SAFETY: termios is plain data; tcgetattr fills it.
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid descriptor and out-pointer.
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut termios) },
+            0
+        );
+        termios.c_lflag & (libc::ICANON | libc::ECHO) == (libc::ICANON | libc::ECHO)
     }
 
     /// How many bytes the child has written so far.

@@ -2789,6 +2789,7 @@ New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
 | `cmd/features.rs` | The 23 command features: `COMMAND_FEATURE_REGISTRY`, `compute_all` (serving and training share it) |
 | `cmd/train.rs` | The replay that builds the training set, the fit, `cmd_model.txt`/`cmd_model_stats.json`, the lock, the detached retrain |
 | `cmd/app.rs` | The picker's UI thread: start-up, event loop, keys, pick output |
+| `cmd/terminal.rs` | The picker's terminal, given back on every way out: a drop guard, a panic hook that restores before the message prints, and SIGTERM/SIGHUP/SIGINT turned into an event that leaves, restores and dies of the signal |
 | `cmd/render.rs` | List, preview, debug pane, help overlay (pure: no I/O, no clock) |
 | `cmd/keys.rs` | `CmdAction`, `CMD_KEYMAP` (its own table, not `keymap::KEYMAP`) |
 | `cmd/events.rs` | Impression and pick logging into `command_events` |
