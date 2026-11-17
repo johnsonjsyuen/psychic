@@ -1,6 +1,6 @@
 //! The picker's worker thread (`docs/ctrl-r/02-browse.md` section 6).
 //!
-//! It owns the [`CommandIndex`], the [`RankContext`], one fuzzy matcher, a
+//! It owns the [`CommandIndex`], the [`RankContext`], a
 //! [`CmdStore`] connection and, once trained, the command model. The UI
 //! thread asks with [`CmdRequest`]s and is answered with [`CmdResponse`]s on
 //! its own event channel. No SQL runs per keystroke: a query is a filter
@@ -17,9 +17,7 @@ use super::rank::{
 };
 use super::store::{CmdStore, DirUse, PrecededBy};
 use super::train::CmdModelStats;
-use super::tuning::{CMD_PAGE_ROWS, CMD_PAR_FILTER_MIN};
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
+use super::tuning::{CMD_PAGE_ROWS, CMD_PAR_FILTER_MIN, CMD_RECENCY_RANK_CAP};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -145,7 +143,9 @@ pub(super) struct CmdRow {
     pub heuristic_parts: HeuristicParts,
     pub ml_score: Option<f64>,
     pub ml_weight: f64,
-    pub fuzzy_score: i64,
+    /// Skim's score: the `fuzzy_score` feature, `None` unless the model
+    /// scored the row.
+    pub fuzzy_score: Option<i64>,
     /// Registry order; empty when no model scored the row.
     pub features: Vec<f64>,
 }
@@ -180,26 +180,18 @@ where
 // Filter
 // ---------------------------------------------------------------------------
 
-/// Whether the filter may start from the previous matches: the query grew
-/// (a text that matches the longer query also matches its prefix) and the
-/// scope stayed.
-pub(super) fn narrowing_applies(
-    query: &str,
-    scope: Scope,
-    last_query: &str,
-    last_scope: Scope,
-) -> bool {
-    !query.is_empty()
-        && !last_query.is_empty()
-        && query.starts_with(last_query)
-        && scope == last_scope
+/// Whether the filter may start from the matches of `last_query`: the
+/// query grew (a text that holds the longer query in order holds its
+/// prefix). Matching happens in scope `All`, so the scope plays no part.
+pub(super) fn narrowing_applies(query: &str, last_query: &str) -> bool {
+    !query.is_empty() && !last_query.is_empty() && query.starts_with(last_query)
 }
 
 /// The single characters whose matches the worker computes while idle: what
 /// a search starts with. An upper-case letter is a case-sensitive query of
 /// its own, and digits and punctuation rarely start one; they are not
 /// seeded. (At 50,000 commands the seeds hold about 530,000 candidates,
-/// 8.5 MB.) They are computed in the order of how many commands start with
+/// 4.2 MB.) They are computed in the order of how many commands start with
 /// each ([`seed_order`]), so the likeliest first letter is ready first.
 const SEED_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
 
@@ -222,51 +214,74 @@ fn seed_order(index: &CommandIndex) -> Vec<u8> {
 /// outputs are joined in order.
 const FILTER_CHUNK: usize = 1024;
 
-/// The commands that match `query` in `scope`, in ascending idx order.
+/// Commands tested per idle step while a seed is computed: a key pressed
+/// meanwhile waits for at most this many (about 0.1-0.3 ms at 50,000).
+const SEED_SLICE: usize = 8 * FILTER_CHUNK;
+
+/// Whether command `idx` belongs to `scope`.
+pub(super) fn in_scope(index: &CommandIndex, ctx: &RankContext, scope: Scope, idx: u32) -> bool {
+    match scope {
+        Scope::All => true,
+        Scope::Directory => index.dir_stat(idx, ctx.dir).is_some(),
+        Scope::Repo => index.runs_in_repo(idx, ctx.repo) > 0,
+        Scope::Session => index.session_commands.contains(&idx),
+    }
+}
+
+/// The commands that match `query` in `scope`, in ascending idx order,
+/// each with fzf's score (0 for the empty query).
 /// `base`: the idx list to test, ascending; `None` = every entry.
 ///
 /// Each command is tested by its byte classes first (one array, no text
-/// read), then its scope, then whether its text holds the query's bytes in
-/// order, and only then scored: the prefilter rejects only what the scorer
-/// would ([`fuzzy::Pattern::may_match`]).
+/// read), then its scope, then whether its text holds each term's bytes in
+/// order, and only then matched and scored by fzf: the prefilter rejects
+/// only what fzf would ([`fuzzy::Pattern::may_match`]).
 pub(super) fn filter_candidates(
     index: &CommandIndex,
     ctx: &RankContext,
-    matcher: &SkimMatcherV2,
     query: &str,
     scope: Scope,
     base: Option<&[u32]>,
 ) -> Vec<CommandCandidate> {
     let pattern = fuzzy::Pattern::new(query);
+    match base {
+        None => {
+            let all = u32::try_from(index.entries.len()).expect("fewer than 2^32 commands");
+            filter_where(index, ctx, pattern.as_ref(), scope, all as usize, |at| {
+                at as u32
+            })
+        }
+        Some(base) => filter_where(index, ctx, pattern.as_ref(), scope, base.len(), |at| {
+            base[at]
+        }),
+    }
+}
+
+/// The filter over the `size` commands `idx_at(0..size)` (ascending).
+fn filter_where(
+    index: &CommandIndex,
+    ctx: &RankContext,
+    pattern: Option<&fuzzy::Pattern>,
+    scope: Scope,
+    size: usize,
+    idx_at: impl Fn(usize) -> u32 + Sync,
+) -> Vec<CommandCandidate> {
     let classes = index.filter_classes();
     let test = |idx: u32| -> Option<CommandCandidate> {
         if classes[idx as usize] & fuzzy::LIVE == 0 {
             return None; // deleted
         }
-        let in_scope = match scope {
-            Scope::All => true,
-            Scope::Directory => index.dir_stat(idx, ctx.dir).is_some(),
-            Scope::Repo => index.runs_in_repo(idx, ctx.repo) > 0,
-            Scope::Session => index.session_commands.contains(&idx),
-        };
-        if !in_scope {
+        if !in_scope(index, ctx, scope, idx) {
             return None;
         }
-        let fuzzy_score = match &pattern {
+        let fzf = match pattern {
             None => 0,
             Some(pattern) => {
-                let text = &index.entries[idx as usize].text;
-                if !pattern.may_match(classes[idx as usize], text) {
-                    return None;
-                }
-                pattern.score(matcher, text)?
+                pattern.test(classes[idx as usize], &index.entries[idx as usize].text)?
             }
         };
-        Some(CommandCandidate { idx, fuzzy_score })
+        Some(CommandCandidate { idx, fzf })
     };
-    let all = u32::try_from(index.entries.len()).expect("fewer than 2^32 commands");
-    let size = base.map_or(all as usize, <[u32]>::len);
-    let idx_at = |at: usize| base.map_or(at as u32, |base| base[at]);
     let pass = |from: usize, to: usize| -> Vec<CommandCandidate> {
         (from..to).filter_map(|at| test(idx_at(at))).collect()
     };
@@ -292,7 +307,7 @@ pub(in crate::cmd) fn replay_filter(
     queries: impl IntoIterator<Item = String>,
     mut each: impl FnMut(&CommandIndex, &RankContext, &str, &[CommandCandidate]),
 ) {
-    let mut worker = Worker::new(index, ctx, None, SkimMatcherV2::default(), None);
+    let mut worker = Worker::new(index, ctx, None, None);
     while worker.has_idle_work() {
         worker.idle_step();
     }
@@ -385,7 +400,6 @@ fn push_superseding(queue: &mut Vec<CmdRequest>, request: CmdRequest) {
 struct Worker {
     index: CommandIndex,
     ctx: RankContext,
-    matcher: SkimMatcherV2,
     store: Option<CmdStore>,
     /// Loaded once at start and never reloaded (ADR-11); dropped for good
     /// after a failed prediction (E-L-07).
@@ -401,6 +415,8 @@ struct Worker {
     seeds: Vec<Matches>,
     /// The order the seeds are computed in; empty until the first idle step.
     seed_order: Vec<u8>,
+    /// The seed being computed, part of the way through the commands.
+    seeding: Option<Seeding>,
     // What `GetRows` and `Delete` refer to.
     current_query: String,
     current_scope: Scope,
@@ -411,16 +427,28 @@ struct Worker {
     empty_rankings: Vec<(Scope, Arc<CommandRanking>)>,
 }
 
-/// What one non-empty query matched in one scope.
+/// What one non-empty query matched, in scope `All`.
 struct Matches {
     query: String,
-    scope: Scope,
+    candidates: Vec<CommandCandidate>,
+}
+
+/// A seed being computed, one slice of the commands per idle step.
+struct Seeding {
+    query: String,
+    pattern: fuzzy::Pattern,
+    /// The first command not tested yet.
+    next: usize,
     candidates: Vec<CommandCandidate>,
 }
 
 /// The result of one filter pass.
 struct Filtered {
     candidates: Vec<CommandCandidate>,
+    /// In a scope narrower than `All`, with a model loaded: the newest
+    /// commands matching the query in every scope, which the model's
+    /// `recency_rank` counts among (`rank::newest_of`).
+    all_newest: Option<Vec<(i64, i64)>>,
     /// How many commands were tested: 0 when an earlier result was reused.
     base_size: usize,
     narrowed: bool,
@@ -432,20 +460,19 @@ impl Worker {
         index: CommandIndex,
         ctx: RankContext,
         store: Option<CmdStore>,
-        matcher: SkimMatcherV2,
         model: Option<CmdModel>,
     ) -> Self {
         let live = index.entries.iter().filter(|e| !e.deleted).count();
         Worker {
             index,
             ctx,
-            matcher,
             store,
             model,
             live,
             trail: Vec::new(),
             seeds: Vec::new(),
             seed_order: Vec::new(),
+            seeding: None,
             current_query: String::new(),
             current_scope: Scope::All,
             current_query_id: 0,
@@ -461,44 +488,74 @@ impl Worker {
         }
     }
 
-    /// The filter. A query typed earlier in this run of typing (deleting
-    /// back to it, even through the empty query) reuses its matches; a longer one starts from the matches
-    /// of its longest prefix seen (narrowing); anything else tests every
-    /// command. Both give exactly what testing every command would.
+    /// The filter: the commands matching `query` in every scope (below),
+    /// then those of `scope`. Matching in scope `All` first lets one trail
+    /// and the seeds serve every scope (Tab keeps them), and gives the
+    /// model's `recency_rank` the commands training counts it among.
     fn filter(&mut self, query: &str, scope: Scope) -> Filtered {
         if query.is_empty() {
             // Every command, nothing to match: no trail to use or extend,
             // and the one there stays for typing the same letters again.
+            let candidates = filter_candidates(&self.index, &self.ctx, query, scope, None);
+            let all_newest = (scope != Scope::All && self.model.is_some()).then(|| {
+                let live = self.index.entries.iter().filter(|e| !e.deleted);
+                rank::newest_of(live.map(|e| (e.last_run_at, e.db_id)), CMD_RECENCY_RANK_CAP)
+            });
             return Filtered {
-                candidates: filter_candidates(
-                    &self.index,
-                    &self.ctx,
-                    &self.matcher,
-                    query,
-                    scope,
-                    None,
-                ),
+                candidates,
+                all_newest,
                 base_size: self.index.entries.len(),
                 narrowed: false,
                 reused: false,
             };
         }
+        let matched = self.match_everywhere(query);
+        if scope == Scope::All {
+            return matched;
+        }
+        let entries = &self.index.entries;
+        let all_newest = self.model.is_some().then(|| {
+            rank::newest_of(
+                matched.candidates.iter().map(|c| {
+                    let entry = &entries[c.idx as usize];
+                    (entry.last_run_at, entry.db_id)
+                }),
+                CMD_RECENCY_RANK_CAP,
+            )
+        });
+        let candidates = matched
+            .candidates
+            .into_iter()
+            .filter(|c| in_scope(&self.index, &self.ctx, scope, c.idx))
+            .collect();
+        Filtered {
+            candidates,
+            all_newest,
+            ..matched
+        }
+    }
+
+    /// The commands matching `query` in scope `All`. A query typed earlier
+    /// in this run of typing (deleting back to it, even through the empty
+    /// query) reuses its matches; a longer one starts from the matches of
+    /// its longest prefix seen (narrowing), or of the seed of its first
+    /// character; anything else tests every command. All give exactly what
+    /// testing every command would.
+    fn match_everywhere(&mut self, query: &str) -> Filtered {
         while let Some(last) = self.trail.last() {
-            if narrowing_applies(query, scope, &last.query, last.scope) {
+            if narrowing_applies(query, &last.query) {
                 break;
             }
             self.trail.pop();
         }
         if self.trail.is_empty()
-            && scope == Scope::All
             && let Some(seed) = self
                 .seeds
                 .iter()
-                .find(|seed| query.starts_with(seed.query.as_str()))
+                .find(|seed| narrowing_applies(query, &seed.query))
         {
             self.trail.push(Matches {
                 query: seed.query.clone(),
-                scope: seed.scope,
                 candidates: seed.candidates.clone(),
             });
         }
@@ -507,6 +564,7 @@ impl Worker {
         {
             return Filtered {
                 candidates: last.candidates.clone(),
+                all_newest: None,
                 base_size: 0,
                 narrowed: false,
                 reused: true,
@@ -517,21 +575,15 @@ impl Worker {
             .last()
             .map(|last| last.candidates.iter().map(|c| c.idx).collect());
         let base_size = base.as_ref().map_or(self.index.entries.len(), Vec::len);
-        let candidates = filter_candidates(
-            &self.index,
-            &self.ctx,
-            &self.matcher,
-            query,
-            scope,
-            base.as_deref(),
-        );
+        let candidates =
+            filter_candidates(&self.index, &self.ctx, query, Scope::All, base.as_deref());
         self.trail.push(Matches {
             query: query.to_string(),
-            scope,
             candidates: candidates.clone(),
         });
         Filtered {
             candidates,
+            all_newest: None,
             base_size,
             narrowed: base.is_some(),
             reused: false,
@@ -542,6 +594,7 @@ impl Worker {
     fn forget_narrowing(&mut self) {
         self.trail.clear();
         self.seeds.clear();
+        self.seeding = None;
         self.empty_rankings.clear();
     }
 
@@ -550,32 +603,49 @@ impl Worker {
         self.seeds.len() < SEED_CHARS.len()
     }
 
-    /// One slice of the work done while no request waits: the matches of
-    /// the next character of [`seed_order`] not yet seeded. One slice is one
-    /// filter pass over every command, so a request arriving meanwhile
-    /// waits at most that (04 section 6.6 reports its time as the length-1
-    /// filter).
+    /// One slice of the work done while no request waits: the next
+    /// `SEED_SLICE` commands of the seed being computed (the next character
+    /// of [`seed_order`] not yet seeded). A request that arrives meanwhile
+    /// waits at most one slice, not a pass over every command.
     fn idle_step(&mut self) {
         if self.seed_order.is_empty() {
             self.seed_order = seed_order(&self.index);
         }
-        let Some(&next) = self.seed_order.get(self.seeds.len()) else {
-            return;
+        let mut seeding = match self.seeding.take() {
+            Some(seeding) => seeding,
+            None => {
+                let Some(&next) = self.seed_order.get(self.seeds.len()) else {
+                    return;
+                };
+                let query = char::from(next).to_string();
+                Seeding {
+                    pattern: fuzzy::Pattern::new(&query).expect("one character"),
+                    query,
+                    next: 0,
+                    candidates: Vec::new(),
+                }
+            }
         };
-        let query = char::from(next).to_string();
-        let candidates = filter_candidates(
+        let (from, end) = (seeding.next, self.index.entries.len());
+        let to = (from + SEED_SLICE).min(end);
+        let slice = filter_where(
             &self.index,
             &self.ctx,
-            &self.matcher,
-            &query,
+            Some(&seeding.pattern),
             Scope::All,
-            None,
+            to - from,
+            |at| (from + at) as u32,
         );
-        self.seeds.push(Matches {
-            query,
-            scope: Scope::All,
-            candidates,
-        });
+        seeding.candidates.extend(slice);
+        seeding.next = to;
+        if to == end {
+            self.seeds.push(Matches {
+                query: seeding.query,
+                candidates: seeding.candidates,
+            });
+        } else {
+            self.seeding = Some(seeding);
+        }
     }
 
     /// The row at `rank` of the current ranking.
@@ -645,6 +715,7 @@ impl Worker {
                 self.current = ranking;
                 let filtered = Filtered {
                     candidates: Vec::new(),
+                    all_newest: None,
                     base_size: 0,
                     narrowed: false,
                     reused: true,
@@ -655,13 +726,14 @@ impl Worker {
                 let filter_started = Instant::now();
                 let filtered = self.filter(&query, scope);
                 let filter_ms = filter_started.elapsed().as_secs_f64() * 1000.0;
-                let ranking = rank::rank_commands(
+                let ranking = rank::rank_scoped(
                     &query,
                     &filtered.candidates,
                     &self.index,
                     &self.ctx,
                     CMD_PAGE_ROWS,
                     self.model.as_ref(),
+                    filtered.all_newest.as_deref(),
                 );
                 if ranking.model_failed {
                     log::warn!("command model prediction failed; using the heuristic");
@@ -863,19 +935,14 @@ fn run<T: From<CmdResponse>>(
     rx: &Receiver<CmdRequest>,
     event_tx: &Sender<T>,
 ) {
-    // The rayon threads start, and each builds its matcher scratch space,
+    // The rayon threads start, and each builds its matchers' scratch space,
     // while the index loads: not inside the load's own parallel part, and
     // not inside the first query. The model loads on this thread meanwhile,
     // so it costs the first results nothing unless it is slower than the
     // index (about 4 ms against 30).
-    let matcher = SkimMatcherV2::default();
     let load_started = Instant::now();
     let (loaded, model) = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            rayon::broadcast(|_| {
-                let _ = matcher.fuzzy_match("warm up", "wu");
-            })
-        });
+        scope.spawn(|| rayon::broadcast(|_| fuzzy::warm_up()));
         let index = scope.spawn(|| load(data_dir, &params));
         let model = load_model(data_dir);
         let loaded = index
@@ -899,7 +966,7 @@ fn run<T: From<CmdResponse>>(
     };
     let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
     let model_stats = model.as_ref().map(|model| model.stats.clone());
-    let mut worker = Worker::new(index, ctx, Some(store), matcher, model);
+    let mut worker = Worker::new(index, ctx, Some(store), model);
 
     let commands = worker.live;
     if event_tx
@@ -968,19 +1035,18 @@ mod tests {
         // Not `cargo test`: its g...s is a fuzzy match for `gs`.
         let mut index = index_of(&["git status", "cargo build", "ls"]);
         let ctx = context(NOW);
-        let matcher = SkimMatcherV2::default();
-        let found = filter_candidates(&index, &ctx, &matcher, "gs", Scope::All, None);
+        let found = filter_candidates(&index, &ctx, "gs", Scope::All, None);
         assert_eq!(texts_of(&index, &found), ["git status"]);
-        assert!(found[0].fuzzy_score > 0);
+        assert!(found[0].fzf > 0);
 
-        let all = filter_candidates(&index, &ctx, &matcher, "", Scope::All, None);
+        let all = filter_candidates(&index, &ctx, "", Scope::All, None);
         assert_eq!(all.len(), 3);
-        assert!(all.iter().all(|c| c.fuzzy_score == 0));
+        assert!(all.iter().all(|c| c.fzf == 0));
 
         index.remove(0);
-        assert!(filter_candidates(&index, &ctx, &matcher, "gs", Scope::All, None).is_empty());
+        assert!(filter_candidates(&index, &ctx, "gs", Scope::All, None).is_empty());
         assert_eq!(
-            filter_candidates(&index, &ctx, &matcher, "", Scope::All, None).len(),
+            filter_candidates(&index, &ctx, "", Scope::All, None).len(),
             2
         );
     }
@@ -989,7 +1055,7 @@ mod tests {
     fn tc_b_07_narrowing_starts_from_the_previous_matches() {
         let index = index_of(&["git status", "grep it", "ls"]);
         let ctx = context(NOW);
-        let mut worker = Worker::new(index, ctx, None, SkimMatcherV2::default(), None);
+        let mut worker = Worker::new(index, ctx, None, None);
 
         let g = worker.filter("g", Scope::All);
         assert!(!g.narrowed);
@@ -1002,25 +1068,30 @@ mod tests {
         assert_eq!(x.base_size, 3);
 
         // The narrowed result equals a fresh one.
-        let fresh = filter_candidates(
-            &worker.index,
-            &worker.ctx,
-            &worker.matcher,
-            "gi",
-            Scope::All,
-            None,
-        );
+        let fresh = filter_candidates(&worker.index, &worker.ctx, "gi", Scope::All, None);
         assert_eq!(gi.candidates, fresh);
 
-        // A scope change between calls disables narrowing.
+        // Matching happens in scope All, so a scope change keeps the
+        // trail: the session's matches of "gi" narrow from "g"'s, and are
+        // the session's commands among them.
+        worker.index.session_commands.insert(0);
         worker.filter("g", Scope::All);
-        assert!(!worker.filter("gi", Scope::Session).narrowed);
+        let in_session = worker.filter("gi", Scope::Session);
+        assert!(in_session.narrowed);
+        assert_eq!(
+            texts_of(&worker.index, &in_session.candidates),
+            ["git status"]
+        );
+        assert_eq!(
+            in_session.candidates,
+            filter_candidates(&worker.index, &worker.ctx, "gi", Scope::Session, None)
+        );
     }
 
     #[test]
     fn deleting_back_to_an_earlier_query_reuses_its_matches() {
         let index = index_of(&["git status", "grep it", "ls"]);
-        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default(), None);
+        let mut worker = Worker::new(index, context(NOW), None, None);
         let g = worker.filter("g", Scope::All);
         let gi = worker.filter("gi", Scope::All);
         assert!(gi.narrowed);
@@ -1032,8 +1103,10 @@ mod tests {
         let all = worker.filter("", Scope::All);
         assert_eq!((all.candidates.len(), all.reused), (3, false));
         assert!(worker.filter("g", Scope::All).reused);
-        // Not in another scope, and not after a delete.
-        assert!(!worker.filter("g", Scope::Session).reused);
+        // In another scope too (its own commands among them); not after a
+        // delete.
+        let session = worker.filter("g", Scope::Session);
+        assert!(session.reused && session.candidates.is_empty());
         worker.filter("g", Scope::All);
         worker.forget_narrowing();
         assert!(!worker.filter("g", Scope::All).reused);
@@ -1042,19 +1115,12 @@ mod tests {
         let gr = worker.filter("gr", Scope::All);
         assert!(gr.narrowed);
         assert_eq!(gr.base_size, g.candidates.len());
-        let fresh = filter_candidates(
-            &worker.index,
-            &worker.ctx,
-            &worker.matcher,
-            "gr",
-            Scope::All,
-            None,
-        );
+        let fresh = filter_candidates(&worker.index, &worker.ctx, "gr", Scope::All, None);
         assert_eq!(gr.candidates, fresh);
         // So does an empty query on either side.
-        assert!(!narrowing_applies("g", Scope::All, "", Scope::All));
-        assert!(!narrowing_applies("", Scope::All, "g", Scope::All));
-        assert!(narrowing_applies("gi", Scope::Repo, "g", Scope::Repo));
+        assert!(!narrowing_applies("g", ""));
+        assert!(!narrowing_applies("", "g"));
+        assert!(narrowing_applies("gi", "g"));
     }
 
     #[test]
@@ -1070,12 +1136,8 @@ mod tests {
         let mut ctx = context(NOW);
         ctx.dir = Some(dir);
         ctx.repo = Some(repo);
-        let matcher = SkimMatcherV2::default();
         let run = |ctx: &RankContext, scope| {
-            texts_of(
-                &index,
-                &filter_candidates(&index, ctx, &matcher, "", scope, None),
-            )
+            texts_of(&index, &filter_candidates(&index, ctx, "", scope, None))
         };
         assert_eq!(run(&ctx, Scope::Directory), ["a"]);
         assert_eq!(run(&ctx, Scope::Repo), ["b"]);
@@ -1106,10 +1168,9 @@ mod tests {
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let index = index_of(&refs);
         let ctx = context(NOW);
-        let matcher = SkimMatcherV2::default();
-        let parallel = filter_candidates(&index, &ctx, &matcher, "1", Scope::All, None);
+        let parallel = filter_candidates(&index, &ctx, "1", Scope::All, None);
         let small: Vec<u32> = (0..100).collect();
-        let sequential = filter_candidates(&index, &ctx, &matcher, "1", Scope::All, Some(&small));
+        let sequential = filter_candidates(&index, &ctx, "1", Scope::All, Some(&small));
         assert!(parallel.windows(2).all(|w| w[0].idx < w[1].idx));
         assert_eq!(&parallel[..sequential.len()], &sequential[..]);
     }
@@ -1444,7 +1505,7 @@ mod tests {
     fn fixture_worker(data_dir: &Path, model: Option<CmdModel>) -> Worker {
         let store = CmdStore::open(data_dir).unwrap();
         let (index, ctx) = CommandIndex::load(&store, &fixture_params()).unwrap();
-        Worker::new(index, ctx, Some(store), SkimMatcherV2::default(), model)
+        Worker::new(index, ctx, Some(store), model)
     }
 
     fn query(worker: &mut Worker, text: &str, query_id: u64) -> Vec<CmdRow> {
@@ -1518,6 +1579,60 @@ mod tests {
             }
         }
         assert!(reordered > 0, "the model changed some order");
+    }
+
+    #[test]
+    fn a_scope_counts_recency_rank_among_every_matching_command() {
+        // Training counts newer matching commands over all commands; a
+        // scope's rows must be scored the same way, not among the scope's.
+        let dir = TempDir::new("worker-scoped-recency");
+        trained_fixture(&dir.0);
+        let mut worker = fixture_worker(&dir.0, CmdModel::load(&dir.0));
+        assert!(worker.model.is_some());
+        let column = crate::cmd::features::command_feature_names()
+            .iter()
+            .position(|name| *name == "recency_rank")
+            .unwrap();
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        let mut differs = 0;
+        let key = |index: &CommandIndex, idx: u32| {
+            let entry = &index.entries[idx as usize];
+            (entry.last_run_at, entry.db_id)
+        };
+        for (i, text) in ["", "g", "m", "c", "ls"].iter().enumerate() {
+            let everywhere = filter_candidates(&worker.index, &worker.ctx, text, Scope::All, None);
+            let newest = rank::newest_of(
+                everywhere.iter().map(|c| key(&worker.index, c.idx)),
+                CMD_RECENCY_RANK_CAP,
+            );
+            assert!(worker.handle(
+                CmdRequest::UpdateQuery {
+                    query: text.to_string(),
+                    query_id: 2 + i as u64,
+                    scope: Scope::Directory,
+                },
+                &event_tx
+            ));
+            let CmdResponse::QueryUpdated { rows, .. } = next(&event_rx) else {
+                panic!("QueryUpdated");
+            };
+            assert!(!rows.is_empty(), "{text:?} has rows in the directory");
+            let in_scope =
+                filter_candidates(&worker.index, &worker.ctx, text, Scope::Directory, None);
+            let scoped_newest = rank::newest_of(
+                in_scope.iter().map(|c| key(&worker.index, c.idx)),
+                CMD_RECENCY_RANK_CAP,
+            );
+            for row in rows.iter().filter(|row| !row.features.is_empty()) {
+                let idx = worker.index.idx_of(row.command_id).unwrap();
+                let expected = rank::recency_rank(&newest, key(&worker.index, idx));
+                assert_eq!(row.features[column], f64::from(expected), "{text:?}");
+                if expected != rank::recency_rank(&scoped_newest, key(&worker.index, idx)) {
+                    differs += 1;
+                }
+            }
+        }
+        assert!(differs > 0, "the scope's own count would differ somewhere");
     }
 
     #[test]
@@ -1623,7 +1738,7 @@ mod tests {
     fn e_b_07_a_failed_delete_keeps_the_command_and_says_so() {
         let mut index = index_of(&["a", "b"]);
         index.record_run(0, NOW - 1, None, None, Some(0), None);
-        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default(), None);
+        let mut worker = Worker::new(index, context(NOW), None, None);
         let (event_tx, event_rx) = mpsc::channel::<Event>();
         worker.current_query = String::new();
         assert!(worker.handle(
@@ -1650,7 +1765,7 @@ mod tests {
         for i in 0..refs.len() as u32 {
             index.record_run(i, NOW - i64::from(i) * 7, None, None, Some(0), None);
         }
-        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default(), None);
+        let mut worker = Worker::new(index, context(NOW), None, None);
         let (event_tx, event_rx) = mpsc::channel::<Event>();
         let ask = |worker: &mut Worker, query: &str, query_id: u64| {
             worker.handle(
@@ -1705,13 +1820,7 @@ mod tests {
     fn e_b_08_details_that_cannot_be_read_are_empty() {
         let store = CmdStore::in_memory();
         crate::cmd::store::test_support::execute(&store, "DROP TABLE command_runs");
-        let worker = Worker::new(
-            index_of(&["a"]),
-            context(NOW),
-            Some(store),
-            SkimMatcherV2::default(),
-            None,
-        );
+        let worker = Worker::new(index_of(&["a"]), context(NOW), Some(store), None);
         let details = worker.details(1);
         assert_eq!(
             (
@@ -1727,15 +1836,14 @@ mod tests {
     fn e_b_14_any_unicode_query_is_matched_or_not_without_failing() {
         let index = index_of(&["echo 日本語", "ls 🦀", "plain"]);
         let ctx = context(NOW);
-        let matcher = SkimMatcherV2::default();
         for query in ["日本", "🦀", "\u{0}", "é", "\x1b[", "ﬁ"] {
-            let found = filter_candidates(&index, &ctx, &matcher, query, Scope::All, None);
+            let found = filter_candidates(&index, &ctx, query, Scope::All, None);
             assert!(found.len() <= 3, "{query:?}");
         }
         assert_eq!(
             texts_of(
                 &index,
-                &filter_candidates(&index, &ctx, &matcher, "日本", Scope::All, None)
+                &filter_candidates(&index, &ctx, "日本", Scope::All, None)
             ),
             ["echo 日本語"]
         );
@@ -1746,7 +1854,7 @@ mod tests {
         let texts: Vec<String> = (0..CMD_PAGE_ROWS + 30).map(|i| format!("c{i}")).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let index = index_of(&refs);
-        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default(), None);
+        let mut worker = Worker::new(index, context(NOW), None, None);
         let (event_tx, event_rx) = mpsc::channel::<Event>();
         worker.handle(update(5), &event_tx);
         let _ = next(&event_rx);
@@ -1809,25 +1917,28 @@ mod tests {
     }
 
     /// The filter before the prefilter and the chunked pool: every live,
-    /// in-scope command through the matcher, in idx order.
+    /// in-scope command through Skim's matcher, scored by fzf, in idx order.
     fn plain_filter(
         index: &CommandIndex,
         query: &str,
         in_scope: impl Fn(u32) -> bool,
         base: Option<&[u32]>,
     ) -> Vec<CommandCandidate> {
-        let matcher = SkimMatcherV2::default();
+        use fuzzy_matcher::FuzzyMatcher;
+        let skim = fuzzy_matcher::skim::SkimMatcherV2::default();
+        let fzf = crate::cmd::fzf::FzfQuery::new(query);
         let all: Vec<u32> = (0..index.entries.len() as u32).collect();
         base.unwrap_or(&all)
             .iter()
             .filter(|&&idx| !index.entries[idx as usize].deleted && in_scope(idx))
             .filter_map(|&idx| {
-                let fuzzy_score = if query.is_empty() {
-                    0
-                } else {
-                    matcher.fuzzy_match(&index.entries[idx as usize].text, query)?
-                };
-                Some(CommandCandidate { idx, fuzzy_score })
+                let text = &index.entries[idx as usize].text;
+                if query.is_empty() {
+                    return Some(CommandCandidate { idx, fzf: 0 });
+                }
+                skim.fuzzy_match(text, query)?;
+                let fzf = fzf.score(text).unwrap_or(crate::cmd::rank::NO_FZF_MATCH);
+                Some(CommandCandidate { idx, fzf })
             })
             .collect()
     }
@@ -1838,7 +1949,7 @@ mod tests {
         use rand::{Rng, SeedableRng};
         const PIECES: &[&str] = &[
             "git", "Git", "st", "a", "b", "-", " ", "/", "\\", "é", "É", "☃", "_", "1", "ls", "^",
-            ";", "K", "\u{0}",
+            ";", "K", "\u{0}", "\u{212A}", "İ",
         ];
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let texts: Vec<String> = (0..commands)
@@ -1864,22 +1975,42 @@ mod tests {
         let commands = 3 * CMD_PAR_FILTER_MIN + 17; // parallel, several chunks
         let index = random_index(11, commands);
         let ctx = context(NOW);
-        let matcher = SkimMatcherV2::default();
         let queries = [
-            "", "g", "G", "gi", "git", "gs", "a b", "é", "É", "☃", "\\", "^", "1", "-", "zz",
-            "git st", "Kg", "ab/",
+            "",
+            "g",
+            "G",
+            "gi",
+            "git",
+            "gs",
+            "a b",
+            "é",
+            "É",
+            "☃",
+            "\\",
+            "^",
+            "1",
+            "-",
+            "zz",
+            "git st",
+            "Kg",
+            "ab/",
+            "st git",
+            "  ",
+            "a\\ b",
+            "k",
+            "Kelvin \u{212A}",
         ];
         let narrow: Vec<u32> = (0..commands as u32).filter(|i| i % 5 != 0).collect();
         let small: Vec<u32> = (0..100).collect(); // sequential
         for query in queries {
             for base in [None, Some(narrow.as_slice()), Some(small.as_slice())] {
                 assert_eq!(
-                    filter_candidates(&index, &ctx, &matcher, query, Scope::All, base),
+                    filter_candidates(&index, &ctx, query, Scope::All, base),
                     plain_filter(&index, query, |_| true, base),
                     "{query:?}"
                 );
                 assert_eq!(
-                    filter_candidates(&index, &ctx, &matcher, query, Scope::Session, base),
+                    filter_candidates(&index, &ctx, query, Scope::Session, base),
                     plain_filter(
                         &index,
                         query,
@@ -1890,6 +2021,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_seed_is_computed_a_slice_at_a_time_and_a_query_can_come_between() {
+        let commands = 2 * SEED_SLICE + 100;
+        let index = random_index(14, commands);
+        let mut worker = Worker::new(index, context(NOW), None, None);
+        // Three steps per seed: two full slices and the rest.
+        worker.idle_step();
+        assert!(worker.seeds.is_empty());
+        assert_eq!(worker.seeding.as_ref().map(|s| s.next), Some(SEED_SLICE));
+        // A query between two slices is answered in full, and leaves the
+        // seed being computed where it was.
+        let fresh = filter_candidates(&worker.index, &worker.ctx, "gi", Scope::All, None);
+        assert_eq!(worker.filter("gi", Scope::All).candidates, fresh);
+        assert_eq!(worker.seeding.as_ref().map(|s| s.next), Some(SEED_SLICE));
+        worker.idle_step();
+        worker.idle_step();
+        assert_eq!(worker.seeds.len(), 1);
+        assert!(worker.seeding.is_none());
+        let first = char::from(worker.seed_order[0]).to_string();
+        assert_eq!(
+            worker.seeds[0].candidates,
+            filter_candidates(&worker.index, &worker.ctx, &first, Scope::All, None)
+        );
+        // A delete drops the seed in progress too.
+        worker.idle_step();
+        assert!(worker.seeding.is_some());
+        worker.forget_narrowing();
+        assert!(worker.seeding.is_none() && worker.seeds.is_empty());
     }
 
     #[test]
@@ -1905,20 +2066,13 @@ mod tests {
     #[test]
     fn seeded_first_letters_answer_like_a_fresh_filter() {
         let index = random_index(12, CMD_PAR_FILTER_MIN + 5);
-        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default(), None);
+        let mut worker = Worker::new(index, context(NOW), None, None);
         while worker.has_idle_work() {
             worker.idle_step();
         }
         assert_eq!(worker.seeds.len(), SEED_CHARS.len());
         let fresh = |worker: &Worker, query: &str| {
-            filter_candidates(
-                &worker.index,
-                &worker.ctx,
-                &worker.matcher,
-                query,
-                Scope::All,
-                None,
-            )
+            filter_candidates(&worker.index, &worker.ctx, query, Scope::All, None)
         };
         // A seeded letter is reused; a longer query narrows from it.
         let g = worker.filter("g", Scope::All);
@@ -1933,10 +2087,17 @@ mod tests {
         let st = worker.filter("st", Scope::All);
         assert!(st.narrowed);
         assert_eq!(st.candidates, fresh(&worker, "st"));
-        // Not seeded: an upper-case letter, another scope.
+        // Not seeded: an upper-case letter. Another scope uses the seed and
+        // keeps its own commands.
         worker.filter("", Scope::All);
         assert!(!worker.filter("G", Scope::All).reused);
-        assert!(!worker.filter("g", Scope::Session).reused);
+        worker.filter("", Scope::All);
+        let session = worker.filter("g", Scope::Session);
+        assert!(session.reused);
+        assert_eq!(
+            session.candidates,
+            filter_candidates(&worker.index, &worker.ctx, "g", Scope::Session, None)
+        );
         // A delete forgets the seeds; they are computed again, without it.
         // (What `delete` does once the database has agreed.)
         worker.index.remove(1);
@@ -1999,7 +2160,7 @@ mod tests {
                 let at = NOW - i64::from((idx * 7919) % 100_000);
                 index.record_run(idx, at, None, None, Some(0), None);
             }
-            let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default(), None);
+            let mut worker = Worker::new(index, context(NOW), None, None);
             while seeded && worker.has_idle_work() {
                 worker.idle_step();
             }
@@ -2018,5 +2179,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn skims_rule_decides_the_match_and_fzf_scores_it() {
+        let index = index_of(&["git status", "status git", "gits", "cargo test"]);
+        let ctx = context(NOW);
+        let idxs = |query: &str| -> Vec<u32> {
+            filter_candidates(&index, &ctx, query, Scope::All, None)
+                .iter()
+                .map(|c| c.idx)
+                .collect()
+        };
+        // The whole query in order, its spaces too.
+        assert_eq!(idxs("git st"), [0]);
+        assert_eq!(idxs("st git"), [1]);
+        assert_eq!(idxs("gs"), [0, 2, 3]);
+        // The score the ranking reads is fzf's, from this one pass.
+        let found = filter_candidates(&index, &ctx, "gs", Scope::All, None);
+        let fzf = crate::cmd::fzf::FzfQuery::new("gs");
+        assert!(
+            found
+                .iter()
+                .all(|c| Some(c.fzf) == fzf.score(&index.entries[c.idx as usize].text))
+        );
     }
 }

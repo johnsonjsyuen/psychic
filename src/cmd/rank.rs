@@ -3,14 +3,16 @@
 //! model stage on top of it (`03-learn.md` section 7).
 //!
 //! The cold-start order ("the heuristic") is fzf's Ctrl-R order: fzf's match
-//! score under `--scheme=history` first ([`super::fzf`]), ties newest first,
-//! and newest first for an empty query. Two stages: the heuristic orders
+//! score under `--scheme=history` first ([`super::fzf`], computed once, by
+//! the filter that decided the match), ties newest first, and newest first
+//! for an empty query. Two stages: the heuristic orders
 //! every candidate; the model re-scores only the first `CMD_STAGE2_K` of
 //! that order, blends its score with the heuristic by the file-mode tanh
 //! weight, and re-sorts them. Rows past the cut keep their heuristic order
 //! below the model-scored ones.
 
 use super::features::{COMMAND_FEATURE_REGISTRY, CommandFeatureInputs, compute_all};
+use super::fuzzy;
 use super::fzf::FzfQuery;
 use super::index::{CommandIndex, RankContext};
 use super::model::CmdModel;
@@ -24,11 +26,12 @@ use std::time::Instant;
 /// From this many stage-2 rows the features are computed on the rayon pool.
 const PAR_FEATURES_MIN: usize = 256;
 
-/// A command that matched the query.
+/// A command that matched the query, with fzf's score for it (0 for the
+/// empty query).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct CommandCandidate {
     pub idx: u32,
-    pub fuzzy_score: i64,
+    pub fzf: i32,
 }
 
 /// What the heuristic orders by.
@@ -36,13 +39,13 @@ pub(super) struct CommandCandidate {
 pub(super) struct HeuristicParts {
     /// `1 / (1 + age / CMD_H_RECENCY_SCALE_SECS)`, in (0, 1]: decides ties.
     pub recency: f64,
-    /// fzf's score for the query (0 for an empty one); `NO_FZF_MATCH` when
-    /// fzf would not match a command the filter let through.
+    /// fzf's score for the query (0 for an empty one).
     pub fzf: i32,
 }
 
-/// The fzf score of a candidate fzf itself would not match (the filter's
-/// matcher and fzf differ on a few texts, 02 section 7): below every match.
+/// The `fzf_score` feature of a command fzf does not match: below every
+/// match. Serving never sees one (fzf decides the match); training can, for
+/// a logged impression of a command that no longer matches its query.
 pub(super) const NO_FZF_MATCH: i32 = -1;
 
 /// One ranked command.
@@ -55,7 +58,9 @@ pub(super) struct CommandScore {
     pub parts: HeuristicParts,
     pub ml_score: Option<f64>,
     pub ml_weight: f64,
-    pub fuzzy_score: i64,
+    /// Skim's score (the `fuzzy_score` feature), for the rows the model
+    /// scored; `None` for the others.
+    pub fuzzy_score: Option<i64>,
 }
 
 /// Time spent in each stage. The model stages are `None` (and `stage2` 0)
@@ -231,8 +236,24 @@ pub(super) fn rank_commands(
     head: usize,
     model: Option<&CmdModel>,
 ) -> CommandRanking {
+    rank_scoped(query, candidates, index, ctx, head, model, None)
+}
+
+/// [`rank_commands`] for the candidates of a scope narrower than every
+/// command. `all_newest` is [`newest_of`] the commands matching `query` in
+/// every scope, which training's `recency_rank` counts among; `None` means
+/// the candidates are all of them.
+pub(super) fn rank_scoped(
+    query: &str,
+    candidates: &[CommandCandidate],
+    index: &CommandIndex,
+    ctx: &RankContext,
+    head: usize,
+    model: Option<&CmdModel>,
+    all_newest: Option<&[(i64, i64)]>,
+) -> CommandRanking {
     match model {
-        None => rank_with(query, candidates, index, ctx, head, None),
+        None => rank_stages(query, candidates, index, ctx, head, None, all_newest),
         Some(model) => {
             let predict = |flat: &[f64], num_features: usize| model.predict(flat, num_features);
             let stage2 = Stage2 {
@@ -240,7 +261,15 @@ pub(super) fn rank_commands(
                 ml_weight: model.ml_weight,
                 predict: &predict,
             };
-            rank_with(query, candidates, index, ctx, head, Some(stage2))
+            rank_stages(
+                query,
+                candidates,
+                index,
+                ctx,
+                head,
+                Some(stage2),
+                all_newest,
+            )
         }
     }
 }
@@ -255,19 +284,27 @@ pub(super) fn rank_with(
     head: usize,
     stage2: Option<Stage2<'_>>,
 ) -> CommandRanking {
+    rank_stages(query, candidates, index, ctx, head, stage2, None)
+}
+
+fn rank_stages(
+    query: &str,
+    candidates: &[CommandCandidate],
+    index: &CommandIndex,
+    ctx: &RankContext,
+    head: usize,
+    stage2: Option<Stage2<'_>>,
+    all_newest: Option<&[(i64, i64)]>,
+) -> CommandRanking {
     // Stage 2 takes the heuristic's top k as a set: it sorts them itself.
     let select = stage2.as_ref().map_or(head, |s| head.max(s.k));
-    let (mut ranking, newest) = rank_heuristic(
-        query,
-        candidates,
-        index,
-        ctx,
-        select,
-        head,
-        stage2.is_some(),
-    );
+    // The model's recency_rank counts among the candidates, unless they
+    // are a scope's: then among every matching command (`all_newest`).
+    let newest_here = stage2.is_some() && all_newest.is_none();
+    let (mut ranking, newest) = rank_heuristic(candidates, index, ctx, select, head, newest_here);
     if let Some(stage2) = stage2 {
-        apply_model(query, index, ctx, &stage2, &newest, &mut ranking);
+        let newest = all_newest.unwrap_or(&newest);
+        apply_model(query, index, ctx, &stage2, newest, &mut ranking);
     }
     ranking
 }
@@ -293,13 +330,17 @@ fn apply_model(
     let started = Instant::now();
     let query_lower = query.to_lowercase();
     let mut flat = vec![0.0; k * num_features];
-    let fill = |(row, score): (&mut [f64], &CommandScore)| {
+    // Skim's score is a feature only: computed for these rows alone.
+    let skim = fuzzy::skim();
+    let fill = |(row, score): (&mut [f64], &CommandScore)| -> i64 {
+        let entry = &index.entries[score.idx as usize];
+        let fuzzy_score = fuzzy::skim_score(skim, query, &entry.text);
         let inputs = CommandFeatureInputs {
             query,
             query_lower: &query_lower,
             idx: score.idx,
-            entry: &index.entries[score.idx as usize],
-            fuzzy_score: score.fuzzy_score,
+            entry,
+            fuzzy_score,
             fzf_score: score.parts.fzf,
             recency_rank: {
                 let entry = &index.entries[score.idx as usize];
@@ -309,15 +350,17 @@ fn apply_model(
             ctx,
         };
         compute_all(&inputs, row);
+        fuzzy_score
     };
     let head = &ranking.scores[..k];
-    if k >= PAR_FEATURES_MIN {
+    let skim: Vec<i64> = if k >= PAR_FEATURES_MIN {
         flat.par_chunks_mut(num_features)
             .zip(head.par_iter())
-            .for_each(fill);
+            .map(fill)
+            .collect()
     } else {
-        flat.chunks_mut(num_features).zip(head).for_each(fill);
-    }
+        flat.chunks_mut(num_features).zip(head).map(fill).collect()
+    };
     let features_ms = ms_since(started);
 
     let started = Instant::now();
@@ -334,11 +377,12 @@ fn apply_model(
     let w = stage2.ml_weight;
     let head = &mut ranking.scores[..k];
     let mut keys: Vec<SortKey> = Vec::with_capacity(k);
-    for (at, (score, raw)) in head.iter_mut().zip(raw).enumerate() {
+    for (at, ((score, raw), fuzzy_score)) in head.iter_mut().zip(raw).zip(skim).enumerate() {
         let ml = crate::ranker::logistic(raw);
         score.score = (1.0 - w) * score.heuristic + w * ml;
         score.ml_score = Some(ml);
         score.ml_weight = w;
+        score.fuzzy_score = Some(fuzzy_score);
         keys.push(sort_key(index, score.score, score.idx, at as u32));
     }
     let sort_started = Instant::now();
@@ -382,8 +426,7 @@ fn ms_since(started: Instant) -> f64 {
 /// Rank `candidates` for `query` by the heuristic alone: ordered by
 /// [`rank_order`], the first `head` (or all, if fewer) exactly and the rest
 /// after them unsorted ([`CommandRanking::sort_rest`] sorts them). Matching
-/// happened in the filter; the query here only gives each candidate its fzf
-/// score.
+/// and fzf's score both come from the filter; nothing is matched here.
 ///
 /// A screen shows a few dozen rows, so sorting 50,000 to show them is most
 /// of the cost of an empty query: the head is selected in linear time and
@@ -393,7 +436,6 @@ fn ms_since(started: Instant) -> f64 {
 /// `select` (at least `head`) is how many rows from the top are guaranteed
 /// to be `scores[..select]` as a set: the model stage takes them from there.
 fn rank_heuristic(
-    query: &str,
     candidates: &[CommandCandidate],
     index: &CommandIndex,
     ctx: &RankContext,
@@ -407,12 +449,8 @@ fn rank_heuristic(
         "fewer than 2^32 candidates"
     );
     let started = Instant::now();
-    let fzf = FzfQuery::new(query);
     let parallel = candidates.len() >= CMD_PAR_FILTER_MIN;
-    let part = |c: &CommandCandidate| {
-        let score = fzf_score(&fzf, &index.entries[c.idx as usize].text);
-        heuristic(index, ctx, c.idx, score)
-    };
+    let part = |c: &CommandCandidate| heuristic(index, ctx, c.idx, c.fzf);
     let parts: Vec<HeuristicParts> = if parallel {
         candidates.par_iter().map(part).collect()
     } else {
@@ -469,7 +507,7 @@ fn rank_heuristic(
             parts: parts[at],
             ml_score: None,
             ml_weight: 0.0,
-            fuzzy_score: candidates[at].fuzzy_score,
+            fuzzy_score: None,
         }
     };
     let scores: Vec<CommandScore> = if parallel {
@@ -504,10 +542,21 @@ mod tests {
     }
 
     fn candidate(idx: u32) -> CommandCandidate {
-        CommandCandidate {
-            idx,
-            fuzzy_score: 0,
-        }
+        CommandCandidate { idx, fzf: 0 }
+    }
+
+    /// The candidates `idxs` with fzf's score for `query`, as the filter
+    /// passes them.
+    fn scored(index: &CommandIndex, query: &str, idxs: &[u32]) -> Vec<CommandCandidate> {
+        let fzf = FzfQuery::new(query);
+        idxs.iter()
+            .map(|&idx| CommandCandidate {
+                idx,
+                fzf: fzf
+                    .score(&index.entries[idx as usize].text)
+                    .expect("a match"),
+            })
+            .collect()
     }
 
     fn order(
@@ -550,10 +599,11 @@ mod tests {
         index.record_run(1, NOW - 60, None, None, Some(0), None);
         index.record_run(2, NOW - 1, None, None, Some(0), None);
         let ctx = context(NOW);
-        let all: Vec<CommandCandidate> = (0..3).map(candidate).collect();
+        let all = scored(&index, "gi", &[0, 1, 2]);
         assert_eq!(order(&index, &ctx, "gi", &all), [2, 1, 3]);
         // No query: newest first.
-        assert_eq!(order(&index, &ctx, "", &all), [3, 2, 1]);
+        let unscored: Vec<CommandCandidate> = (0..3).map(candidate).collect();
+        assert_eq!(order(&index, &ctx, "", &unscored), [3, 2, 1]);
         let ranking = rank_commands("gi", &all, &index, &ctx, usize::MAX, None);
         let fzf: Vec<i32> = ranking.scores.iter().map(|s| s.parts.fzf).collect();
         assert_eq!(fzf[0], fzf[1]);
@@ -613,34 +663,35 @@ mod tests {
             parts: HeuristicParts::default(),
             ml_score: None,
             ml_weight: 0.0,
-            fuzzy_score: 0,
+            fuzzy_score: None,
         };
         assert_eq!(rank_order(&index, &score(0), &score(1)), Ordering::Less);
     }
 
     #[test]
-    fn tc_b_05_a_candidate_fzf_does_not_match_ranks_below_every_match() {
-        // The filter's matcher and fzf can disagree (02 section 7); a
-        // candidate fzf rejects gets NO_FZF_MATCH, below any match.
-        let mut index = index_of(&["abc", "zz top"]);
+    fn tc_b_05_the_score_is_the_filters_not_computed_again() {
+        // The filter decided the match and gave each candidate fzf's score;
+        // the ranking orders by that score as given, even where it is not
+        // the text's (here swapped on purpose).
+        let mut index = index_of(&["zz top", "abc zz"]);
         index.record_run(0, NOW - 1, None, None, Some(0), None);
         index.record_run(1, NOW - 100, None, None, Some(0), None);
         let ctx = context(NOW);
-        let both = [candidate(0), candidate(1)];
-        let ranking = rank_commands("zz", &both, &index, &ctx, usize::MAX, None);
+        let given = [
+            CommandCandidate { idx: 0, fzf: 30 },
+            CommandCandidate { idx: 1, fzf: 60 },
+        ];
+        let ranking = rank_commands("zz", &given, &index, &ctx, usize::MAX, None);
         let fzf: Vec<(u32, i32)> = ranking
             .scores
             .iter()
             .map(|s| (s.idx, s.parts.fzf))
             .collect();
-        assert_eq!(fzf[0].0, 1);
-        assert_eq!(fzf[1], (0, NO_FZF_MATCH));
-        assert!(
-            ranking
-                .scores
-                .iter()
-                .all(|s| s.ml_score.is_none() && s.ml_weight == 0.0 && s.score == s.heuristic)
-        );
+        assert_eq!(fzf, [(1, 60), (0, 30)]);
+        assert!(ranking.scores.iter().all(|s| s.ml_score.is_none()
+            && s.ml_weight == 0.0
+            && s.score == s.heuristic
+            && s.fuzzy_score.is_none()));
         assert!(ranking.features.is_empty() && ranking.features_of(0).is_empty());
         assert_eq!(ranking.timings.stage2, 0);
         assert_eq!(ranking.timings.features_ms, None);

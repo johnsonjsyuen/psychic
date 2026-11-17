@@ -294,7 +294,11 @@ fn draw_debug(f: &mut Frame, area: Rect, app: &CmdApp) {
         lines.push(field("  recency", format!("{:.4}", parts.recency)));
         lines.push(field("ml_score", optional(row.ml_score, 4)));
         lines.push(field("ml_weight", format!("{:.2}", row.ml_weight)));
-        lines.push(field("fuzzy_score", row.fuzzy_score.to_string()));
+        lines.push(field(
+            "fuzzy_score",
+            row.fuzzy_score
+                .map_or_else(|| "-".to_string(), |s| s.to_string()),
+        ));
         if !row.features.is_empty() {
             for (feature, value) in COMMAND_FEATURE_REGISTRY.iter().zip(&row.features) {
                 let value = match feature.feature_type() {

@@ -721,7 +721,7 @@ pub(super) mod test_support {
             heuristic_parts: HeuristicParts::default(),
             ml_score: None,
             ml_weight: 0.0,
-            fuzzy_score: 0,
+            fuzzy_score: None,
             features: Vec::new(),
         }
     }

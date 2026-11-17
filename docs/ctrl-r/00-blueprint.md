@@ -118,7 +118,7 @@ selection --> println!(command) on stdout, exit 0 --> widget replaces the prompt
 | `index.rs` | `CommandIndex`: in-memory statistics, filled from SQL or by replay | B | [02 section 5](02-browse.md#5-commandindex) |
 | `rank.rs` | `CommandCandidate`, heuristic, `rank_commands`, two-stage, blend | B, C | [02 section 7](02-browse.md#7-heuristic-ranking), [03 section 7](03-learn.md#7-serving-two-stage-rank-and-blend) |
 | `worker.rs` | Worker thread, requests/responses, filter, narrowing, TIMING line | B | [02 section 6](02-browse.md#6-worker) |
-| `fuzzy.rs` | The filter's per-command test: byte-class prefilter, then the one scorer call | B (perf) | [02 section 6.3](02-browse.md#63-filter) |
+| `fuzzy.rs` | The filter's per-command test, one pass: byte-class mask, in-order byte scan (Skim's rule, Skim itself only on non-ASCII texts), fzf's score; the same test for training's replay; Skim's score for the `fuzzy_score` feature | B (perf) | [02 section 6.3](02-browse.md#63-filter) |
 | `events.rs` | Impression and pick logging | B | [02 section 10](02-browse.md#10-event-logging) |
 | `keys.rs` | `CmdAction`, `CMD_KEYMAP` | B | [02 section 9](02-browse.md#9-keys) |
 | `app.rs` | UI state, event loop, input handling | B | [02 section 8](02-browse.md#8-ui-thread) |
@@ -163,7 +163,7 @@ Not edited: `src/keymap.rs`, `src/help.rs`, `src/render.rs`, `src/app.rs`,
 | Rust, in the existing binary | One install, one data dir, shared LightGBM link; a second binary doubles release work |
 | SQLite, same `events.db` | Same connection setup and pragmas ([src/db.rs:207-216](../../src/db.rs)), plus `mmap_size` on the picker's start-up readers only ([02 section 5.2](02-browse.md#52-load-picker-start)); one file to protect, back up and purge |
 | LightGBM LambdaRank, same parameters as files | Already linked and measured ([src/training/mod.rs:177-199](../../src/training/mod.rs)); parameter changes are a benchmark-driven tuning step, not a starting point. Serving walks the trained trees in Rust (ADR-21) |
-| `fuzzy-matcher` SkimMatcherV2 | Already the file matcher ([src/search_worker.rs:808](../../src/search_worker.rs)); one definition of "matches" for filter, features, training and benchmark |
+| `fuzzy-matcher` SkimMatcherV2 | Already the file matcher ([src/search_worker.rs:808](../../src/search_worker.rs)); its rule is the one definition of "matches" for filter, training and benchmark (on ASCII texts decided by an equivalent byte scan, `fuzzy.rs`), and its score is the `fuzzy_score` feature; the order is fzf's score ([02 section 7](02-browse.md#7-heuristic-ranking)) |
 | rayon | Already a dependency; the 50,000-row filter needs it for B1 |
 | No new crate | Glob matching, FNV hashing and pty test plumbing are each under 60 lines; `regex` was removed upstream in `7b99679` and is not re-added |
 | Python only in `bench/history.py` | The pty harness is Python ([bench/harness.py:83-97](../../bench/harness.py)); relevance benchmarking is Rust for train/serve parity |

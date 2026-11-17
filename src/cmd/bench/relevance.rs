@@ -17,21 +17,19 @@
 //! No command or query text leaves this module: counts, shares and ranks.
 
 use super::super::corpus::splitmix64;
-use super::super::features::command_feature_specs;
-use super::super::fzf::FzfQuery;
+use super::super::fuzzy;
 use super::super::index::{CommandIndex, RankContext};
 use super::super::model::CmdModel;
-use super::super::rank::{CommandCandidate, fzf_score, rank_commands};
+use super::super::rank::{CommandCandidate, rank_commands};
 use super::super::store::{CmdStore, RunRecord, Source};
 use super::super::train::{
     BuildOptions, CmdModelStats, ReplayInput, Replayer, Step, Timeline, build_training_set,
-    fragment_query,
+    fit_command_model, fragment_query,
 };
 use super::super::tuning::{CMD_STAGE2_K, CMD_TRAIN_MAX_RUN_GROUPS, CMD_TRAIN_MIN_GROUPS};
 use super::super::worker::{Scope, filter_candidates};
 use super::CorpusStats;
 use anyhow::{Context, Result};
-use fuzzy_matcher::skim::SkimMatcherV2;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Value, json};
 use std::cmp::Ordering;
@@ -244,66 +242,59 @@ pub(super) fn slices_of(facts: &LookupFacts) -> u8 {
 // The two baselines (section 5.3)
 // ---------------------------------------------------------------------------
 
+/// Something ranked by a baseline: it names a command.
+pub(super) trait Ranked {
+    fn idx(&self) -> u32;
+}
+
+impl Ranked for CommandCandidate {
+    fn idx(&self) -> u32 {
+        self.idx
+    }
+}
+
+/// A candidate with Skim's score, for the `fzf_scored` row.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SkimScored {
+    pub idx: u32,
+    /// `fuzzy::skim_score`: 0 where Skim does not match a command fzf did.
+    pub skim: i64,
+}
+
+impl Ranked for SkimScored {
+    fn idx(&self) -> u32 {
+        self.idx
+    }
+}
+
 /// `recency`: newest last run first, then the larger database id.
-pub(super) fn recency_order(
-    index: &CommandIndex,
-    a: &CommandCandidate,
-    b: &CommandCandidate,
-) -> Ordering {
+pub(super) fn recency_order<T: Ranked>(index: &CommandIndex, a: &T, b: &T) -> Ordering {
     let (ea, eb) = (
-        &index.entries[a.idx as usize],
-        &index.entries[b.idx as usize],
+        &index.entries[a.idx() as usize],
+        &index.entries[b.idx() as usize],
     );
     eb.last_run_at
         .cmp(&ea.last_run_at)
         .then(eb.db_id.cmp(&ea.db_id))
 }
 
-/// `fzf_scored`: the higher fuzzy score first, then as `recency`.
-pub(super) fn fzf_scored_order(
-    index: &CommandIndex,
-    a: &CommandCandidate,
-    b: &CommandCandidate,
-) -> Ordering {
-    b.fuzzy_score
-        .cmp(&a.fuzzy_score)
-        .then_with(|| recency_order(index, a, b))
+/// `fzf_scored`: the higher Skim score first, then as `recency`.
+pub(super) fn fzf_scored_order(index: &CommandIndex, a: &SkimScored, b: &SkimScored) -> Ordering {
+    b.skim.cmp(&a.skim).then_with(|| recency_order(index, a, b))
 }
 
-/// `fzf`: fzf's score under `--scheme=history` first (`fzf::FzfQuery`, a
-/// candidate fzf rejects last), then as `recency`. 1-based rank of `target`.
-fn fzf_rank(
-    index: &CommandIndex,
-    candidates: &[CommandCandidate],
-    query: &str,
-    target: u32,
-) -> u32 {
-    let fzf = FzfQuery::new(query);
-    let score = |c: &CommandCandidate| fzf_score(&fzf, &index.entries[c.idx as usize].text);
-    let Some(t) = candidates.iter().find(|c| c.idx == target) else {
-        return NOT_MATCHED;
-    };
-    let target_score = score(t);
-    1 + candidates
-        .iter()
-        .filter(|c| {
-            score(c)
-                .cmp(&target_score)
-                .reverse()
-                .then_with(|| recency_order(index, c, t))
-                == Ordering::Less
-        })
-        .count() as u32
+/// `fzf`: fzf's score under `--scheme=history` first (the filter's, which
+/// every candidate carries), then as `recency`. 1-based rank of `target`.
+fn fzf_rank(index: &CommandIndex, candidates: &[CommandCandidate], target: u32) -> u32 {
+    rank_by(candidates, target, |a, b| {
+        b.fzf.cmp(&a.fzf).then_with(|| recency_order(index, a, b))
+    })
 }
 
 /// 1-based rank of `target` among `candidates` under a total `order`: one
 /// more than the number that come before it. `NOT_MATCHED` if it is absent.
-fn rank_by(
-    candidates: &[CommandCandidate],
-    target: u32,
-    order: impl Fn(&CommandCandidate, &CommandCandidate) -> Ordering,
-) -> u32 {
-    let Some(t) = candidates.iter().find(|c| c.idx == target) else {
+fn rank_by<T: Ranked>(candidates: &[T], target: u32, order: impl Fn(&T, &T) -> Ordering) -> u32 {
+    let Some(t) = candidates.iter().find(|c| c.idx() == target) else {
         return NOT_MATCHED;
     };
     1 + candidates
@@ -741,7 +732,7 @@ fn train_seed(input: &ReplayInput, cut: i64, seed: u64, shuffle_labels: bool) ->
     let fit = if built.counts.groups() < CMD_TRAIN_MIN_GROUPS {
         Ok(None)
     } else {
-        match crate::training::fit_seeded(&built.set, &command_feature_specs(), seed as u32) {
+        match fit_command_model(&built.set, seed) {
             Ok(fitted) => {
                 let stats = CmdModelStats::from_fit(
                     &fitted,
@@ -872,17 +863,23 @@ fn position(scores: &[super::super::rank::CommandScore], target: u32) -> u32 {
 /// Rank one lookup with every ranker.
 fn rank_lookup(
     replayer: &Replayer,
-    matcher: &SkimMatcherV2,
     models: &[CmdModel],
     ctx: &RankContext,
     query: &str,
     target: u32,
 ) -> LookupRanks {
     let index = &replayer.index;
-    let candidates = filter_candidates(index, ctx, matcher, query, Scope::All, None);
+    let candidates = filter_candidates(index, ctx, query, Scope::All, None);
     let recency = rank_by(&candidates, target, |a, b| recency_order(index, a, b));
-    let fzf_scored = rank_by(&candidates, target, |a, b| fzf_scored_order(index, a, b));
-    let fzf = fzf_rank(index, &candidates, query, target);
+    let skim: Vec<SkimScored> = candidates
+        .iter()
+        .map(|c| SkimScored {
+            idx: c.idx,
+            skim: fuzzy::skim_score(fuzzy::skim(), query, &index.entries[c.idx as usize].text),
+        })
+        .collect();
+    let fzf_scored = rank_by(&skim, target, |a, b| fzf_scored_order(index, a, b));
+    let fzf = fzf_rank(index, &candidates, target);
     let heuristic = position(
         &rank_commands(query, &candidates, index, ctx, usize::MAX, None).scores,
         target,
@@ -915,7 +912,6 @@ fn replay_window(
     end: Option<i64>,
     sampled: &FxHashSet<i64>,
 ) -> Ranks {
-    let matcher = SkimMatcherV2::default();
     let mut ranks = Ranks::default();
     // shell session -> its newest command id, from the runs before the cut.
     let mut session_last: FxHashMap<&str, i64> = FxHashMap::default();
@@ -965,7 +961,7 @@ fn replay_window(
                     let Some(query) = make_query(style, &text, len, run.id) else {
                         continue;
                     };
-                    let measured = rank_lookup(&replayer, &matcher, models, &ctx, &query, target);
+                    let measured = rank_lookup(&replayer, models, &ctx, &query, target);
                     if measured.recency == NOT_MATCHED {
                         ranks.not_matched += 1;
                     }

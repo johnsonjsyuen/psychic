@@ -54,7 +54,7 @@ Reused as they are, with no edit:
 | `input::leave_tui` | [src/input.rs:706-716](../../src/input.rs) | Restoring the terminal |
 | `path_display::{printable, truncate_to_width, display_width, get_time_ago}` | [src/path_display.rs:59](../../src/path_display.rs), [:21](../../src/path_display.rs), [:12](../../src/path_display.rs), [:263](../../src/path_display.rs) | Row and preview text |
 | `keymap::{Chord, Trigger, describe_trigger}` | [src/keymap.rs:83](../../src/keymap.rs), [:91](../../src/keymap.rs), [:513](../../src/keymap.rs) | Key table types and key names |
-| `fuzzy_matcher::skim::SkimMatcherV2` | as [src/search_worker.rs:808](../../src/search_worker.rs) | Filter |
+| `fuzzy_matcher::skim::SkimMatcherV2` | as [src/search_worker.rs:808](../../src/search_worker.rs) | Which commands match, on non-ASCII texts (section 6.3); the model's `fuzzy_score` |
 | `crate::PROCESS_START` | [src/main.rs:99](../../src/main.rs) | Zero point of every startup timing (`crate::PROCESS_START.elapsed()`) |
 | The fern logger installed by `main` | [src/main.rs:229-265](../../src/main.rs) | `app.log`, TIMING lines |
 
@@ -207,7 +207,7 @@ the same as one full scan's; then the R2-R8 rows are applied. An in-memory
 store (tests), which another connection would see empty, reads everything on
 `store`, in order. Rows of R2-R8 whose command is missing from R1 (recorded
 or deleted between the reads) are skipped. The worker starts the rayon pool
-and warms the matcher (section 6.2, step 2) on another thread while the load
+and warms the matchers (section 6.2, step 2) on another thread while the load
 runs.
 
 | Query | Fills |
@@ -237,8 +237,8 @@ in every query. `ctx.now = p.now`.
 
 ## 6. Worker
 
-`src/cmd/worker.rs`. One thread; owns the `CommandIndex`, the `RankContext`, one
-`SkimMatcherV2`, a `CmdStore` connection, and (Phase C) the model.
+`src/cmd/worker.rs`. One thread; owns the `CommandIndex`, the `RankContext`,
+a `CmdStore` connection, and (Phase C) the model.
 
 ### 6.1 Protocol
 
@@ -266,7 +266,7 @@ pub(super) struct CmdRow {
     pub command_id: i64, pub text: Arc<str>, pub last_run_at: i64,
     pub run_count: u32, pub pick_count: u32, pub runs_here: u32, pub last_exit_code: Option<i32>,
     pub score: f64, pub heuristic: f64, pub heuristic_parts: HeuristicParts,
-    pub ml_score: Option<f64>, pub ml_weight: f64, pub fuzzy_score: i64,
+    pub ml_score: Option<f64>, pub ml_weight: f64, pub fuzzy_score: Option<i64>,   // Skim's score: only for model-scored rows
     pub features: Vec<f64>,                              // registry order; empty when no model scored the row
 }
 pub(super) struct CmdDetails { pub command_id: i64, pub dirs: Vec<DirUse>, pub preceded_by: Vec<PrecededBy> }
@@ -284,17 +284,18 @@ pub(super) fn spawn<T>(data_dir: &Path, params: LoadParams, event_tx: Sender<T>)
 1a. (Phase C) The index load of step 1 runs on a scoped thread while this
    thread loads the command model ([03 section 7.1](03-learn.md#71-loading-the-model)).
 2. On a scoped thread, while step 1 runs:
-   `rayon::broadcast(|_| { let _ = matcher.fuzzy_match("warm up", "wu"); })` - the
-   rayon pool starts, and every rayon thread creates its matcher scratch space,
-   off the load's critical path and not inside the first query.
+   `rayon::broadcast(|_| fuzzy::warm_up())` - the rayon pool starts, and
+   every rayon thread creates fzf's and Skim's scratch space (and the one
+   `static` Skim matcher is created), off the load's critical path and not
+   inside the first query.
 3. Send `Loaded`. (`CommandIndex::load` has logged `TIMING {"op":"cmd_index_stages","readers":N,"context_ms":..,"read_ms":..,"pushed_ms":..,"applied_ms":..}`:
    when R2-R8, all reads, the entries' move into the index and the
    application of R2-R8 ended, in ms from the load's start.) Log `TIMING {"op":"cmd_index_load","ms":..,"commands":N}` and
    `TIMING {"op":"cmd_worker_ready","ms":<since PROCESS_START>}`.
 4. Loop: `rx.recv()`, then drain with `try_recv` into a queue applying the
    supersession rule; process the queue in order. While seeds (section 6.3)
-   remain to be computed, `try_recv` instead, computing one seed whenever
-   nothing is waiting.
+   remain to be computed, `try_recv` instead, computing one slice of a seed
+   whenever nothing is waiting.
 
 Supersession rule (same as `drain_requests`, [src/search_worker.rs:1508-1534](../../src/search_worker.rs)):
 when the request being queued is an `UpdateQuery` and the last request already
@@ -310,31 +311,90 @@ The matching itself is a free function, so the benchmark can call it without a w
 
 ```rust
 /// `base`: the idx list to test, ascending; `None` = every entry.
-pub(super) fn filter_candidates(index: &CommandIndex, ctx: &RankContext, matcher: &SkimMatcherV2,
+pub(super) fn filter_candidates(index: &CommandIndex, ctx: &RankContext,
                                 query: &str, scope: Scope, base: Option<&[u32]>) -> Vec<CommandCandidate>;
+pub(super) fn in_scope(index: &CommandIndex, ctx: &RankContext, scope: Scope, idx: u32) -> bool;   // the table below
 ```
 
+**Which commands match, and the score they carry.** A command matches a
+non-empty query by **Skim's rule** (`SkimMatcherV2`, `fuzzy-matcher`
+0.3.7, the matcher the model's features were built on): the whole query,
+spaces included, is a subsequence of the text, ASCII case ignored unless
+the query has an ASCII upper-case letter (Skim folds ASCII case only,
+`skim.rs`). Each match carries **fzf's score** (section 7.1), which is what
+the ranking orders by; nothing scores a candidate a second time
+(`CommandCandidate { idx, fzf }`). Every Skim match is an fzf match: each
+space-separated fzf term lies inside the whole query's alignment, and a term
+fzf treats as case-sensitive was matched exactly. The one exception is a
+query with a non-ASCII upper-case letter and ASCII lower-case ones (fzf's
+smart case then compares case, Skim's does not); such a command keeps
+`fzf = NO_FZF_MATCH`, below every other match. fzf's own matching (terms in
+any order, a trailing space ignored) was measured as the filter and
+rejected: the training sets it implies cost the model 0.012 top-1 at two
+characters and tripled the seed spread (results.md, 2026-11-17 merge
+entry).
+
+The per-command test (`src/cmd/fuzzy.rs`, `Pattern::test`), one pass:
+
+1. `filter_classes[idx]` (the entry's `classes`, a 64-bit mask: `a`-`z`
+   case-folded, `0`-`9`, common punctuation, one bit for the rest, one for
+   any byte of a multi-byte character, plus `LIVE`) must hold every class
+   bit of the query and `LIVE`; most texts are rejected without being read.
+2. The text must hold the query's bytes in order (ASCII case folded unless
+   case-sensitive). On an ASCII text this *is* Skim's match, so Skim's
+   dynamic program never runs. On any other text it is only necessary, and
+   `SkimMatcherV2::fuzzy_match` decides.
+3. `FzfQuery::score` (built once per pass) gives the score.
+
+Tests: `the_test_matches_exactly_what_skim_does_and_scores_like_fzf`
+(300,000 random texts and queries over colliding ASCII and multi-byte
+characters), `ascii_texts_never_need_skim`, and
+`the_filter_returns_exactly_what_matching_every_command_does` (every live,
+in-scope command through Skim, scored by fzf, against the filter with the
+prefilter, the chunked pool and narrowed bases).
+
 The worker wraps it in `fn filter(&mut self, query: &str, scope: Scope) -> Filtered`
-(the candidates, the base-set size, `narrowed`, `reused`), which owns the
-narrowing state, a *trail*: the matches (`Vec<CommandCandidate>`) of the
-non-empty query being typed and of its prefixes typed before it, each entry's
-query a prefix of the next one's, all in one scope. It decides the base set with
-`pub(super) fn narrowing_applies(query: &str, scope: Scope, last_query: &str, last_scope: Scope) -> bool`
-(the "Base set" rule below; also used by the benchmark's `latency`), and holds,
-separately, `current_query`, `current_scope`, `current_query_id` (what `Delete`
-and `GetRows` refer to):
+(the candidates, `all_newest` (below), the base-set size, `narrowed`,
+`reused`). **Matching happens in scope `All`; a scope then keeps its own
+commands** (`in_scope`, in idx order). So the narrowing state serves every
+scope, Tab keeps it, and the model's `recency_rank` can count among every
+matching command, as training does: for a scope other than `All`, with a
+model loaded, `Filtered.all_newest` is `rank::newest_of` the `All` matches
+(for the empty query, of every live command), passed to
+`rank::rank_scoped` (section 7.2). The state is a *trail*: the matches
+(`Vec<CommandCandidate>`, scope `All`) of the non-empty query being typed
+and of its prefixes typed before it, each entry's query a prefix of the
+next one's. The base set is decided with
+`pub(super) fn narrowing_applies(query: &str, last_query: &str) -> bool`
+(the "Base set" rule below; also used by the benchmark's `latency`). The
+worker holds, separately, `current_query`, `current_scope`,
+`current_query_id` (what `Delete` and `GetRows` refer to):
 
 | Step | Rule |
 |---|---|
-| Empty query | Every idx; the trail is neither used nor changed (typing the same letters again after clearing reuses it) |
-| Trail | Drop entries from its end until the last one satisfies `narrowing_applies(query, scope, entry.query, entry.scope)`, that is `!query.is_empty() && !entry.query.is_empty() && query.starts_with(&entry.query) && scope == entry.scope` |
-| Reuse | If the trail's last entry has exactly this query: its candidates are the result (`reused = true`, base-set size 0, no matching). Deleting back to a query typed before costs no filter |
-| Base set | Otherwise the last entry's idx list (`narrowed = true`), or every idx `0..entries.len()` when the trail is empty. (A text that matches a longer query matches its prefix, so narrowing loses nothing) |
-| Per idx | Skip when `filter_classes[idx]` lacks `LIVE` (deleted). Skip when out of scope (below). Empty query: keep with `fuzzy_score = 0`. Otherwise the prefilter, then the scorer (`src/cmd/fuzzy.rs`, below): rejected or `None` drops the row, `Some(s)` keeps it with `fuzzy_score = s` |
+| Empty query | Every live idx of the scope, `fzf = 0`; the trail is neither used nor changed (typing the same letters again after clearing reuses it) |
+| Trail | Drop entries from its end until the last one satisfies `narrowing_applies(query, entry.query)`, that is `!query.is_empty() && !entry.query.is_empty() && query.starts_with(&entry.query)` |
+| Seed | If the trail is then empty and a seed's query (below) satisfies `narrowing_applies(query, seed.query)`, the seed starts the trail |
+| Reuse | If the trail's last entry has exactly this query: its candidates are the result (`reused = true`, base-set size 0, no matching). Deleting back to a query typed before costs no filter, in any scope |
+| Base set | Otherwise the last entry's idx list (`narrowed = true`), or every idx `0..entries.len()` when the trail is empty. (A text that holds a longer query in order holds its prefix, so narrowing loses nothing) |
+| Per idx | Skip when `filter_classes[idx]` lacks `LIVE` (deleted). Then the test above (scope `All`) |
 | Parallelism | When the query is non-empty and the base set has at least `CMD_PAR_FILTER_MIN` entries, the base set is cut into chunks of `FILTER_CHUNK` (1,024, `worker.rs`), one rayon task each with its own output vector, joined in order; a plain loop otherwise (with no query there is nothing to match, and a pass over 50,000 entries costs less than waking the pool). Output order is ascending idx in both cases |
-| Seeds | While no request waits, the worker computes, one per loop turn, the matches in scope `All` of each single character of `SEED_CHARS` (`a`-`z`; an upper-case letter is a case-sensitive query of its own, and a digit or punctuation rarely starts a search; at 50,000 commands the 26 seeds hold about 530,000 candidates, 8.5 MB), in the order of how many commands start with each letter. When the trail is empty and the scope is `All`, a query starting with a seeded character starts the trail from that seed: typing the first letter is a reuse and the second narrows from it. `Delete` clears the seeds (they are computed again). One slice is one filter pass over every command, so a request that arrives meanwhile waits at most that |
-| Afterwards | A non-empty query that was not reused is pushed onto the trail with its result (a seed that starts the trail is pushed even when it is the answer, see Seeds). `Delete` clears the trail (not `current_query`/`current_scope`) |
+| Afterwards | A non-empty query that was not reused is pushed onto the trail with its `All` result. Then the scope's commands are kept. `Delete` clears the trail (not `current_query`/`current_scope`) |
 | Empty-query cache | The worker keeps the `CommandRanking` of the empty query per scope (`empty_rankings`, shared `Arc`s): asking for it again skips filter and ranking (`reused = true`, stage times 0). `Delete` clears it. When a page needs the rest sorted, the cache's handle is taken out first so `sort_rest` runs in place, and the sorted ranking is cached |
+
+**Seeds.** While no request waits, the worker computes the `All` matches
+of each single character of `SEED_CHARS` (`a`-`z`; an upper-case letter is
+a case-sensitive query of its own, and a digit or punctuation rarely starts
+a search; at 50,000 commands the 26 seeds hold about 530,000 candidates,
+4.2 MB), in the order of how many commands start with each letter. A seed
+is computed a slice at a time: one loop turn tests the next `SEED_SLICE`
+(8,192, `worker.rs`) commands of it (`Seeding { query, pattern, next,
+candidates }`), and a request that arrives meanwhile is answered before
+the next slice, so it waits for at most one slice (about 0.1-0.3 ms at
+50,000 commands), not a pass over every command. Typing the first letter of
+a search is then a reuse and the second narrows from it, in every scope.
+`Delete` clears the seeds and the seed in progress (they are computed
+again).
 
 | Scope | Row is in scope when |
 |---|---|
@@ -343,36 +403,21 @@ and `GetRows` refer to):
 | `Repo` | `index.runs_in_repo(idx, ctx.repo) > 0` |
 | `Session` | `index.session_commands.contains(&idx)` |
 
-**Which commands match is decided here, by the filter's matcher**
-(`SkimMatcherV2`: the whole query, spaces included, as one subsequence,
-smart case on ASCII upper-case letters). fzf's score (section 7.1) is
-computed afterwards, only to order what this filter kept; a kept command
-fzf would reject gets `NO_FZF_MATCH`.
+A seed holds exactly the candidates a fresh pass would, and the ranking is
+a function of the candidates, so a seeded query ranks as an unseeded one,
+with or without a model (test `seeded_letters_rank_like_unseeded_ones`; at
+the merge of the speed work, the `--dump` digests (04 section 6.6) of a
+build with seeding switched off were byte-equal on the interactive,
+repetitive and 243-command perf DBs, with the pinned model and without
+one). Test `a_seed_is_computed_a_slice_at_a_time_and_a_query_can_come_between`
+covers the slices.
 
-The per-command test (`src/cmd/fuzzy.rs`, `Pattern`): a text can match only
-if it holds every byte of the query in order (ASCII case folded unless the
-query has an ASCII upper-case letter, the matcher's smart case; Skim folds
-ASCII case only, `fuzzy-matcher` 0.3.7 `skim.rs`). It is
-checked in two steps: `filter_classes[idx]` must hold every class bit of the
-query (64 bits: `a`-`z` case-folded, `0`-`9`, common punctuation, one bit for
-the rest, one for any non-ASCII byte), which rejects most texts without
-reading them; then the bytes are scanned in order. Only then is the scorer
-called: `SkimMatcherV2::fuzzy_match`, unchanged. This holds for any matcher
-that pairs each query character with an equal text character in order, so
-the prefilter only ever rejects what the scorer would; the candidates and
-scores are exactly those of matching every command (test
-`the_filter_returns_exactly_what_matching_every_command_does`, and digests
-of the 50,000-command key cycle through the worker's own filter, seeds included,
-04 section 6.6 `--dump`). A seed holds exactly the candidates a fresh pass
-would, and the ranking is a function of the candidates, so a seeded query
-ranks as an unseeded one, with or without a model (test
-`seeded_letters_rank_like_unseeded_ones`; the `--dump` digests of a build
-with seeding switched off were byte-equal on the interactive, repetitive
-and 243-command perf DBs, with the pinned model and without one).
-
-The closure captures `&CommandIndex`, `&RankContext`, `&SkimMatcherV2` and the
-prepared query: nothing lazily initialised, no lock, no allocation other than the output
-([docs/how-it-works.md:1205-1207](../how-it-works.md)).
+The closure captures `&CommandIndex`, `&RankContext` and the prepared
+`Pattern`: nothing lazily initialised, no lock, no allocation other than the
+output ([docs/how-it-works.md:1205-1207](../how-it-works.md)). (Skim's
+matcher, needed only for non-ASCII texts and for the model's
+`fuzzy_score`, is one `static` resolved before the loop; its scratch
+space is warmed on every rayon thread at start, section 6.2.)
 
 ### 6.4 Handling each request
 
@@ -447,35 +492,48 @@ Not adopted, with the reason:
 
 | fzf behaviour | Why not |
 |---|---|
-| Latin-script normalisation (`é` matches `e`; on by default, `--literal` turns it off) | The candidate filter (`worker::filter_candidates`, Skim's matcher) does not normalise, so a normalised query would not reach those commands anyway. A command fzf would match only through normalisation scores as fzf with `--literal` |
-| Extended-search operators: `'exact`, `^prefix`, `suffix$`, `!negation`, `|` (OR) | They change which commands match, and matching is the filter's, in `worker.rs` (section 6.3), which keeps Skim's semantics. Every term here is a fuzzy term matched literally. Recommendation in [results.md](results.md) |
+| Latin-script normalisation (`é` matches `e`; on by default, `--literal` turns it off) | The candidate filter (section 6.3, Skim's rule) does not normalise, so a normalised query would not reach those commands anyway; the score is fzf's with `--literal` |
+| Extended-search operators: `'exact`, `^prefix`, `suffix$`, `!negation`, `|` (OR), and fzf's matching itself (terms in any order, a trailing space ignored) | They change which commands match, and matching is the filter's, which keeps Skim's rule (section 6.3): fzf's matching as the filter was measured and cost the model 0.012 top-1 at two characters (results.md, 2026-11-17 merge entry). Every term here is a fuzzy term matched literally |
 | `--tiebreak=index` as an option | `--scheme=history` already has no tiebreak criterion; the newest-first input order is the tiebreak |
 
-The filter and fzf agree on which commands match a one-term query: both
-match the query's characters in order, smart-case. They can differ on (a)
-accented letters (fzf normalises, the filter does not) and (b) multi-term
-queries, where the filter matches the whole query, spaces included, as one
-subsequence, so its matches are a subset of fzf's. A candidate fzf would not
-match gets the score `NO_FZF_MATCH = -1`, below every match (unreachable for
-(b), reachable in principle for (a)).
+The filter (section 6.3) decides which commands match, by Skim's rule, and
+computes this score in the same pass; `rank.rs` never scores again. Every
+command the filter keeps is an fzf match (Skim's matches are a subset of
+fzf's: a multi-term query's terms all lie inside the whole query's
+alignment), except for a query whose smart case differs between the two (a
+non-ASCII upper-case letter: fzf compares case, Skim does not); such a
+command gets `NO_FZF_MATCH = -1`, below every match. Normalisation is not
+adopted (above), so accented letters do not differ.
+
+**Speed (2026-11-17, at the merge with the speed work).** An ASCII text is
+read as bytes, with fzf's own ASCII classes, never decoded into `char`s; a
+non-ASCII text is decoded once per call. A one-character term skips V2's
+matrix: its score is the best `16 + 2 * bonus` over its occurrences, which
+is what V2 returns for it, and the scan stops at the largest bonus
+possible. Tests `ascii_texts_read_as_bytes_score_as_decoded_ones` (bytes
+against chars, both schemes, both cases) and
+`the_one_character_path_scores_as_the_full_v2`; the 333-query check below
+was re-run on this code, identical.
 
 Checked against the fzf 0.74.5 release binary (`fzf --filter=QUERY
 --scheme=history`, empty `FZF_DEFAULT_OPTS`): the orders of 333 queries
 (substrings, scattered subsequences, multi-term, smart-case) over 3,504
-synthetic command lines were identical; the only differences, before the one
-line with accented letters was removed, came from normalisation. fzf's own
+synthetic command lines were identical (again after the byte path, 333 of
+333); the only differences, before the one line with accented letters was
+removed, came from normalisation. fzf's own
 `algo_test.go` score vectors (default scheme) pass for V1 and V2. Fixed
 vectors from the binary are TC-B-22.
 
 ### 7.2 Types and the value
 
 ```rust
-pub(super) struct CommandCandidate { pub idx: u32, pub fuzzy_score: i64 }   // from the filter (Skim's score, kept for the debug pane and the model)
+pub(super) struct CommandCandidate { pub idx: u32, pub fzf: i32 }   // from the filter: a match (Skim's rule) and fzf's score for it (0 for the empty query)
 pub(super) struct HeuristicParts { pub recency: f64, pub fzf: i32 }
 pub(super) const NO_FZF_MATCH: i32 = -1;
 pub(super) struct CommandScore {
     pub idx: u32, pub score: f64, pub heuristic: f64, pub parts: HeuristicParts,
-    pub ml_score: Option<f64>, pub ml_weight: f64, pub fuzzy_score: i64,
+    pub ml_score: Option<f64>, pub ml_weight: f64,
+    pub fuzzy_score: Option<i64>,    // Skim's score, computed in the model stage for its rows only
 }
 pub(super) struct CmdRankTimings { pub heuristic_ms: f64, pub features_ms: Option<f64>, pub predict_ms: Option<f64>, pub blend_ms: Option<f64>, pub stage2: usize }
 pub(super) struct CommandRanking {
@@ -493,11 +551,13 @@ impl CommandRanking {
 
 pub(super) struct FzfQuery { .. }                              // src/cmd/fzf.rs
 impl FzfQuery { pub(super) fn new(query: &str) -> Self; pub(super) fn score(&self, text: &str) -> Option<i32>; }
-pub(super) fn fzf_score(query: &FzfQuery, text: &str) -> i32;  // score, or NO_FZF_MATCH
+pub(super) fn fzf_score(query: &FzfQuery, text: &str) -> i32;  // score, or NO_FZF_MATCH (training's pick rows)
 pub(super) fn heuristic(index: &CommandIndex, ctx: &RankContext, idx: u32, fzf: i32) -> HeuristicParts;
 pub(super) fn combine(parts: &HeuristicParts, lo: i32, hi: i32) -> f64;
 pub(super) fn rank_commands(query: &str, candidates: &[CommandCandidate], index: &CommandIndex, ctx: &RankContext,
-                            head: usize) -> CommandRanking;
+                            head: usize, model: Option<&CmdModel>) -> CommandRanking;   // = rank_scoped(.., None)
+pub(super) fn rank_scoped(query: &str, candidates: &[CommandCandidate], index: &CommandIndex, ctx: &RankContext,
+                          head: usize, model: Option<&CmdModel>, all_newest: Option<&[(i64, i64)]>) -> CommandRanking;
 pub(super) fn rank_order(index: &CommandIndex, a: &CommandScore, b: &CommandScore) -> std::cmp::Ordering;   // the total order below
 ```
 
@@ -505,7 +565,7 @@ For candidate `c` with entry `e`:
 
 | Term | Formula | Range |
 |---|---|---|
-| `fzf` | `fzf_score(FzfQuery::new(query), e.text)`; 0 for an empty query | integer, usually 16-400 |
+| `fzf` | `c.fzf`, computed by the filter (section 6.3); 0 for an empty query | integer, usually 16-400 |
 | `recency` | `1 / (1 + max(0, now - e.last_run_at) / CMD_H_RECENCY_SCALE_SECS)` | (0, 1] |
 | `heuristic` | `(fzf - lo + recency) / (hi - lo + 1)`, `lo..=hi` the range of `fzf` among this call's candidates | (0, 1] |
 
@@ -515,8 +575,8 @@ value exists so that the model stage has a heuristic to blend with
 ([03 section 7.3](03-learn.md#73-blend)). Equal values (the same score and a
 recency equal in `f64`) fall to `last_run_at` and `db_id`.
 
-`rank_commands` in this phase: build the `FzfQuery` once; compute the parts
-for every candidate (rayon `par_iter` from `CMD_PAR_FILTER_MIN`
+`rank_commands` in this phase: compute the parts from each candidate's
+`fzf` (no matching, no scoring) (rayon `par_iter` from `CMD_PAR_FILTER_MIN`
 candidates); `lo`, `hi`; `score = heuristic`, `ml_score = None`,
 `ml_weight = 0.0`, `features` empty; order by the total order **`score`
 descending (`f64::total_cmp`), then `last_run_at` descending, then `db_id`
@@ -527,7 +587,12 @@ descending** - exactly for the first `head` rows, `sorted = min(head, len)`:
 candidate (`score`, `last_run_at`, `db_id`, position); the `CommandScore`s
 are built once, in key order, afterwards. The worker passes
 `head = CMD_PAGE_ROWS`; a caller that needs the full order (the benchmark's
-relevance mode) passes `usize::MAX`, or calls `sort_rest`.
+relevance mode) passes `usize::MAX`, or calls `sort_rest`. `rank_scoped`
+is the same with `all_newest`: for the candidates of a narrower scope, the
+newest commands matching in every scope, which the model stage's
+`recency_rank` counts among instead of the candidates
+([03 section 4](03-learn.md#4-features), feature 25); the worker passes it
+(section 6.3).
 
 What psychic's own signals add on top of fzf, without a model: nothing.
 Six were measured as tie-breakers inside equal fzf scores (all-time runs at
@@ -664,7 +729,7 @@ Preview pane for the selected row, top to bottom:
 | blank line, `Usually after` | Up to 3 `PrecededBy`: template, `<runs> times`. Omitted when empty |
 
 Debug pane (Ctrl-O), for the selected row: `score`, `heuristic`, its two
-`heuristic_parts` (`fzf`, `recency`), `ml_score`, `ml_weight`, `fuzzy_score`; then one line per
+`heuristic_parts` (`fzf`, `recency`), `ml_score`, `ml_weight`, `fuzzy_score` (`-` when the model did not score the row); then one line per
 feature `name = value` when `features` is non-empty (names from
 [03 section 4](03-learn.md#4-features)), else `model: none`; then model stats
 (Phase C, [03 section 7.4](03-learn.md#74-what-the-debug-pane-shows)); then
@@ -902,7 +967,7 @@ Targets B1-B3, B5. The decisions that make them reachable:
 | First letters precomputed | The matches of each single lower-case letter are computed while the worker is idle after start-up (section 6.3, seeds), so the first letter of a search, a scan of every command, costs no filter |
 | Narrowing and reuse | Typing a longer query re-matches only the matches of its longest prefix typed before; deleting back to a query typed before reuses its matches; the empty query's ranking is kept per scope until a delete (section 6.3) |
 | Sort only what is shown | `select_nth` + sort of the first `CMD_PAGE_ROWS` 32-byte keys; the rest is sorted only when a page reaches it (section 7) |
-| No cold global in the parallel loop | One matcher, warmed on every rayon thread at start (section 6.2, step 2); the registry of Phase C is a `static` array, not a `Lazy` |
+| No cold global in the parallel loop | fzf's and Skim's scratch space warmed on every rayon thread at start (section 6.2, step 2); the Skim `static` resolved before the loop; the registry of Phase C is a `static` array, not a `Lazy` |
 | No per-row allocation on the query path | `Arc<str>` texts; the model-scored rows' features in one buffer of the ranking, not a vector per row; `CmdRow`s built only for the 200 sent |
 | One log write per query, after the send | Section 6.5 |
 | Render is pure | `draw(&mut Frame, &CmdApp)`; time-ago uses `list_clock`; `~` uses `app.home` |
@@ -1004,9 +1069,9 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 | TC-B-02 | `rank_commands` fzf order | `git status` (7,200 s ago), `tig git` (60 s), `grep -i x` (1 s); query `gi` | `tig git`, `git status`, `grep -i x` (equal scores newest first, then the scattered match); empty query: newest first | - |
 | TC-B-03 | `combine` | parts (recency 1.0, fzf 10) and (1e-9, 11) with `lo = 10`, `hi = 11` | the second is higher; (0.5, 11) gives 0.75; never above 1 | - |
 | TC-B-04 | `rank_commands` tie-break | Two commands, identical stats, `db_id` 5 and 9 | 9 before 5 | Same `score`, different `last_run_at` -> newer first |
-| TC-B-05 | `rank_commands`, fzf rejects | `abc` (1 s ago) and `zz top` (100 s ago) passed as candidates of `zz` | `zz top` first, `abc` has `fzf = NO_FZF_MATCH`; no model fields set | - |
-| TC-B-06 | `filter` | Texts `git status`, `cargo build`, `ls`; query `gs` (not `cargo test`: its `g`...`s` is a fuzzy match) | Only `git status` | Empty query keeps all 3 with `fuzzy_score = 0`; a `deleted` entry is never returned |
-| TC-B-07 | `filter` narrowing | Queries `g` then `gi` then `x` on 3 texts | Second call's base-set size equals the first call's match count; the third call's base set is all entries | Scope change between calls disables narrowing; result of narrowed `gi` equals un-narrowed `gi` |
+| TC-B-05 | `rank_commands` takes the filter's score | `zz top` (1 s ago, `fzf` 30) and `abc zz` (100 s ago, `fzf` 60) passed as candidates of `zz` | `abc zz` first: the order follows the given scores, nothing is scored again; no model fields set, `fuzzy_score` `None` | - |
+| TC-B-06 | `filter` | Texts `git status`, `cargo build`, `ls`; query `gs` (not `cargo test`: its `g`...`s` is a fuzzy match) | Only `git status` | Empty query keeps all 3 with `fzf = 0`; a `deleted` entry is never returned |
+| TC-B-07 | `filter` narrowing | Queries `g` then `gi` then `x` on 3 texts | Second call's base-set size equals the first call's match count; the third call's base set is all entries | A scope change keeps the trail (matching is in scope `All`): `gi` in Session after `g` narrows and equals a fresh Session filter; result of narrowed `gi` equals un-narrowed `gi` |
 | TC-B-08 | `filter` scopes | A run here only, B in repo only, C in session only, D none | `Directory` -> [A]; `Repo` -> [B]; `Session` -> [C]; `All` -> 4 | `ctx.dir = None` with `Directory` -> empty |
 | TC-B-09 | supersession | Queue `UpdateQuery(1)`, `UpdateQuery(2)`, `Details`, `UpdateQuery(3)`, `UpdateQuery(4)` drained in that order | Processed: `UpdateQuery(2)`, `Details`, `UpdateQuery(4)` | A single request passes through unchanged; `Details(1)`, `Details(2)`, `GetRows`, `Details(3)` -> `GetRows`, `Details(3)` |
 | TC-B-10 | stale responses | `shown_query_id = 5`; deliver `QueryUpdated(4)`, then `(6)`; `Rows(5, ..)` | 4 ignored, 6 applied (selection reset to 0), `Rows(5)` ignored | `Rows` with `start != rows.len()` ignored |
@@ -1017,11 +1082,16 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 | TC-B-15 | `CommandIndex` windows | `run_times = [now-4000, now-3000, now-10]` | `runs_in_window(.., 3600) = 2`, `(.., 60) = 1`, `(.., 5) = 0` | A run exactly at `now - secs` is excluded; at `now` included |
 | TC-B-16 | `record_run` ordering | Runs at 300 (exit 0), 100 (exit 1), 200 (exit NULL) | `run_times = [100, 200, 300]`, `last_exit_code = Some(0)`, `last_fail_at = 100` | - |
 | TC-B-17 | TIMING shape | A `CmdQueryTimings` with known numbers -> `to_json()` | Exactly the keys of section 6.5 (with `reused`); `features_ms` is `null`; contains no string value but `op` | - |
-| TC-B-18 | filter reuse | Queries `g`, `gi`, `g`, `""`, `g`; then `g` in another scope; then a delete | The second `g` is `reused` (base set 0, same candidates), also after `""`; not in another scope or after `forget_narrowing`; `gr` after `gi` narrows from `g` and equals a fresh filter | - |
+| TC-B-18 | filter reuse | Queries `g`, `gi`, `g`, `""`, `g`; then `g` in another scope; then a delete | The second `g` is `reused` (base set 0, same candidates), also after `""` and in another scope (its own commands among them); not after `forget_narrowing`; `gr` after `gi` narrows from `g` and equals a fresh filter | - |
 | TC-B-19 | partial order | 2,500 commands, `head` in {0, 1, 200, len-1} | `scores[..head]` equal the full order's head; the rest holds the same commands; after `sort_rest` the whole order equals the full one | - |
 | TC-B-20 | empty-query cache | `""`, `c1`, `""` on 230 commands; `GetRows` past 200; delete | The second `""` answers with the same `Arc` (no ranking); the page past the head is in rank order and the cache holds the sorted copy; a delete empties the cache | - |
 | TC-B-22 | `fzf.rs` | fzf's `TestFuzzyMatch` vectors (default scheme, V1 and V2, 20 matches and 3 non-matches); the history scheme on `git status` / `tig git` / `tig/git` for `gi`; extended-search splitting and smart case; a 60,000-character text; 17 queries over a 12-line list | The scores of fzf's tests; equal history-scheme scores (48 each), default 10 > 9; the V1 fallback's score; the orders the fzf 0.74.5 binary printed (`src/cmd/fzf/expected.rs`) | An ignored test writes this module's orders for a list and queries, to diff against `fzf --filter` (section 7.1) |
 | TC-B-21 | id split | `split_ids` of `1..=10` in 4, `5..=6` in 4, `i64::MIN..=i64::MAX` in 4 | `[1-3, 4-6, 7-9, 10]`; `[5, 6]`; 4 contiguous parts covering both ends | - |
+| TC-B-23 | match and score in one pass (`fuzzy.rs`) | 300,000 random texts and queries over ASCII case pairs, shared mask bits, multi-byte characters (the Kelvin sign, `İ`, `é`), spaces and backslashes; 200,000 ASCII-only pairs | `Pattern::test` keeps exactly what `SkimMatcherV2` matches, with fzf's score; on ASCII texts the byte scan alone equals Skim | A non-ASCII upper-case query letter: fzf may not match, `NO_FZF_MATCH` |
+| TC-B-24 | fzf's byte path (`fzf.rs`) | 100,000 random ASCII texts and patterns, both schemes, both cases; 50,000 one-character patterns | Byte and `char` paths give the same scores; the one-character path equals full V2 | Non-ASCII text decoded; a non-ASCII term matches no ASCII text |
+| TC-B-25 | seeds in slices | `2 * SEED_SLICE + 100` commands | One idle step tests one slice; a query between slices is answered in full and leaves the seed where it was; three steps finish it, equal to a fresh filter; a delete drops the seed in progress | - |
+| TC-B-26 | a scope's `recency_rank` | Trained fixture, scope Directory, queries `""`, `g`, `m`, `c`, `ls` | Every model-scored row's `recency_rank` counts newer commands among the `All` matches; at least one differs from a count among the scope's | - |
+| TC-B-27 | seeded and unseeded rankings | 2,005 random commands; queries `g` ... `a b`, with and without a stub model | Candidates and every score bit-equal | - |
 
 ### 14.2 Integration tests
 
@@ -1059,7 +1129,7 @@ and `tests/picker.rs` ([01 section 15.3](01-record.md#153-shell-level-tests-test
 | E-B-11 | cwd unknown (no `--cwd`, no `$PWD`, `current_dir` fails) | all three absent | `cwd = ""`, `ctx.dir = None`, `repo_root = None` | Directory terms are 0; `Directory`/`Repo` scopes empty | `log::warn!` |
 | E-B-12 | Terminal narrower than 20 columns or shorter than 5 rows | `f.area()` | Draw only the input box | - | None |
 | E-B-13 | Command text contains control or escape characters | - | `path_display::printable` in rows and preview | - | None |
-| E-B-14 | Query contains characters invalid for the matcher (any Unicode) | - | Passed through; `fuzzy_match` returns `None` or a score | - | None |
+| E-B-14 | Query contains characters invalid for the matcher (any Unicode) | - | Passed through; the filter keeps or drops the command (section 6.3) | - | None |
 | E-B-15 | The picker binary fails or is killed under the widget | Non-zero exit / empty stdout | zsh, fish: buffer untouched, prompt repainted. bash: `\|\| return` leaves `READLINE_LINE` untouched | - | None |
 | E-B-16 | `psychic` not on PATH under the widget | zsh, bash: shell error "command not found" on the terminal. fish: `command -q` fails | Buffer untouched; fish prints nothing | - | None |
 | E-B-17 | Recording is off and nothing is recorded | `total_commands == 0 && !recording_on` | The two-line hint of section 8.3 | Esc/Enter exit 0 | None |

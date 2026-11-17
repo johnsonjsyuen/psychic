@@ -122,7 +122,7 @@ Type N = Numeric, B = Binary. Mono: `+` Increasing, `-` Decreasing, blank none.
 
 | # | Name | Type | Mono | Formula | Value when unknown |
 |---|---|---|---|---|---|
-| 1 | `fuzzy_score` | N | + | `fuzzy_score as f64` | `0.0` when `query` is empty |
+| 1 | `fuzzy_score` | N | + | `fuzzy_score as f64`: Skim's score of the text for the query (`fuzzy::skim_score`). The filter no longer runs Skim on ASCII texts ([02 section 6.3](02-browse.md#63-filter)), so serving computes it in the model stage for the stage-2 rows only, and training per row | `0.0` when `query` is empty |
 | 2 | `command_starts_with_query` | B | | `1.0` if `query` non-empty and `e.text_lower.starts_with(query_lower)` | `0.0` |
 | 3 | `word_starts_with_query` | B | | `1.0` if `query` non-empty and any `e.text_lower.split_whitespace()` word starts with `query_lower` | `0.0` |
 | 4 | `picks_for_this_query` | N | + | `index.picks_for_query(query, idx, now, P30)` | `0.0` |
@@ -145,8 +145,8 @@ Type N = Numeric, B = Binary. Mono: `+` Increasing, `-` Decreasing, blank none.
 | 21 | `last_exit_nonzero` | B | | `1.0` if `e.last_exit_code` is `Some(n)` with `n != 0` | `0.0` |
 | 22 | `command_length` | N | | `e.chars` | - |
 | 23 | `argument_count` | N | | `e.words.saturating_sub(1)` | `0.0` |
-| 24 | `fzf_score` | N | + | `inputs.fzf_score`: fzf's score of the text for the query under `--scheme=history` ([02 section 7.1](02-browse.md#71-fzfs-score-srccmdfzfrs)); serving takes it from the heuristic's parts, training computes it with the same `rank::fzf_score` | `0.0` for the empty query; `-1.0` (`NO_FZF_MATCH`) when fzf does not match |
-| 25 | `recency_rank` | N | | `inputs.recency_rank`: how many commands matching the query (the candidates, for serving; the commands `newest_matching` finds, for training) have a newer `(last_run_at, db_id)`, at most `CMD_RECENCY_RANK_CAP`. Serving takes the `CMD_RECENCY_RANK_CAP` newest candidates in the heuristic's pass (`rank::newest_of`, one pass over the sort keys, no allocation per candidate); training walks the replay's recency order until it has that many matches (`train::newest_matching`); IT-N-02 checks both give the same list (in scope `All`). Known skew: in the picker's Directory, Repository and Session scopes the candidates are the scope's, so the count is lower than training (which counts all matching commands) ever saw; the worker would have to pass the scope or the all-scope count to fix it (`worker.rs`, left to the merge with the speed work) | - |
+| 24 | `fzf_score` | N | + | `inputs.fzf_score`: fzf's score of the text for the query under `--scheme=history` ([02 section 7.1](02-browse.md#71-fzfs-score-srccmdfzfrs)); serving takes it from the candidate, which the filter scored, and training from the same match (`fuzzy::Query::matches`); pick rows use `rank::fzf_score` | `0.0` for the empty query; `-1.0` (`NO_FZF_MATCH`) when fzf does not match |
+| 25 | `recency_rank` | N | | `inputs.recency_rank`: how many commands matching the query in any scope have a newer `(last_run_at, db_id)`, at most `CMD_RECENCY_RANK_CAP`. Serving takes the `CMD_RECENCY_RANK_CAP` newest candidates in the heuristic's pass (`rank::newest_of`, one pass over the sort keys, no allocation per candidate) in scope `All`; in the Directory, Repository and Session scopes the worker passes `rank::newest_of` the `All` matches instead (`rank_scoped`, [02 section 6.3](02-browse.md#63-filter)), so the count is the one training saw (fixed 2026-11-17; before, a scope's candidates were counted). Training walks the replay's recency order until it has that many matches (`train::newest_matching`); IT-N-02 checks both give the same list, TC-B-26 the scoped case | - |
 
 Features 24 on were added on 2026-11-17 (results.md). Feature 24 sits
 beside feature 1 rather than replacing it: measured both ways, see results.md.
@@ -214,11 +214,11 @@ For each run, **before** `apply_run`:
 | Query length | `r = splitmix64(seed ^ (run.id as u64)) % 100`; length 0 if `r < 40`, 1 if `r < 60`, 2 if `r < 80`, else 3 (the cumulative `CMD_TRAIN_QLEN_MIX`) |
 | Query | `training_query`: with `d = splitmix64(seed ^ run.id ^ FRAGMENT_SALT)`, a non-empty length and `d % 100 < CMD_TRAIN_FRAGMENT_SHARE`, the fragment `fragment_query(text, length, d >> 8)` (the definition the relevance benchmark's fragment style uses, [04 section 5.2](04-bench.md#52-protocol), with another salt) when there is one; otherwise the first `length` characters (`chars().take(length)`) of the positive's text, the whole text if it is shorter |
 | Context | `ctx = replayer.context(run.started_at, run.cwd, run.repo_root, Some(&run.shell_session))` |
-| "Matches" | Empty query: every command. Otherwise `matcher.fuzzy_match(&entry.text, query).is_some()` with one `SkimMatcherV2` owned by the builder |
+| "Matches" | Exactly as the picker's filter ([02 section 6.3](02-browse.md#63-filter)): `fuzzy::Query::new(query).matches(index, idx)`, which is `Some(fzf score)` for a live command matching by Skim's rule (the byte prefilter, Skim itself only on non-ASCII texts), every live command for the empty query |
 | Recent negatives | From `recent_distinct()`: skip the positive and deleted entries; examine at most `CMD_TRAIN_RECENT_SCAN` of the rest; keep those that match, up to `CMD_TRAIN_RECENT_NEGATIVES` (0 since 2026-11-17: none; see below) |
 | Random negatives | The pool: for the empty query the first `CMD_STAGE2_K` of `recent_distinct()` (serving's model sees only the `CMD_STAGE2_K` newest then, as stage 1 is newest first), otherwise every entry. `state = splitmix64(seed ^ (run.id as u64) ^ 0x9E37_79B9_7F4A_7C15)`; repeat at most `CMD_TRAIN_RANDOM_TRIES` times: `state = splitmix64(state)`, `cand = pool[state % pool.len()]`; keep `cand` if it is not the positive, not deleted, not already chosen (recent or random), and matches; stop at `CMD_TRAIN_RANDOM_NEGATIVES` |
 | Skip | No negative found, or the positive does not match its own query (a prefix of its text always matches; the rule only makes the function total): no group |
-| Rows | The positive (label 1) and the negatives (label 0), **ordered by idx ascending**; each row = `compute_all` with that candidate's own fuzzy score for the query (0 for the empty query) |
+| Rows | The positive (label 1) and the negatives (label 0), **ordered by idx ascending**; each row = `compute_all` with that candidate's fzf score from the match and its Skim score (`fuzzy::skim_score`, 0 for the empty query) |
 | Weight | `CMD_HOOK_WEIGHT` or `CMD_IMPORT_WEIGHT` by `run.source`, on every row of the group |
 | Timestamp | `run.started_at` on every row |
 
@@ -254,7 +254,7 @@ The table from "Context" down is one function, so tests can fix the query:
 
 ```rust
 /// `None` when no negative is found. Does not touch the replayer.
-fn build_run_group(replayer: &Replayer, matcher: &SkimMatcherV2, run: &RunRecord, query: &str, seed: u64) -> Option<Group>;
+fn build_run_group(replayer: &Replayer, run: &RunRecord, query: &str, seed: u64) -> Option<Group>;
 struct Group { rows: Vec<GroupRow /* idx, label, features */>, weight: f64, timestamp: i64 }
 ```
 
@@ -269,7 +269,7 @@ impressions of the episode are the negatives):
 | Label | 1 when the impression's `command_id` equals the pick's, else 0 |
 | Skip | No row has label 1, or no row has label 0 |
 | Context | `replayer.context(pick.timestamp, pick.cwd, pick.repo_root, pick.shell_session)` for every row: the whole episode is scored at the moment of the pick |
-| Fuzzy score | `matcher.fuzzy_match(text, impression.query)`, 0 when the query is empty or there is no match |
+| Scores | `fuzzy::skim_score` for feature 1 (0 when the query is empty or Skim does not match); `rank::fzf_score` for feature 24 (`NO_FZF_MATCH` when fzf does not match: an impression logged by a build that matched differently) |
 | Weight | `CMD_PICK_WEIGHT` |
 | Timestamp | `pick.timestamp` |
 | Afterwards | `replayer.commit_pick(&episode)` |
@@ -324,7 +324,7 @@ pub(super) enum RetrainOutcome { Trained(Box<CmdModelStats>), NotEnoughData { gr
 | 2 | `CmdStore::open`; `counts()` (for step 6); `ReplayInput::read` (the connection is closed once read) |
 | 3 | `build_training_set(&input, &BuildOptions { seed, max_run_groups: CMD_TRAIN_MAX_RUN_GROUPS, until: None })` |
 | 4 | Total groups `< CMD_TRAIN_MIN_GROUPS` -> `NotEnoughData`; no file is written or removed |
-| 5 | `crate::training::fit_seeded(&set, &command_feature_specs(), seed as u32)`. An `Err` whose message starts with `every split needs rows` -> `NotEnoughData`; any other `Err` propagates |
+| 5 | `train::fit_command_model(&set, seed)` = `crate::training::fit_seeded(&set, &command_feature_specs(), seed as u32)` (the relevance benchmark fits through it too). An `Err` whose message starts with `every split needs rows` -> `NotEnoughData`; any other `Err` propagates |
 | 6 | `write_unless_shrunk`: write the model text and `serde_json::to_string_pretty(&stats)` beside their targets as `<name>.<pid>.pending`; unless the history shrank since step 2 (fewer commands or runs in `CmdStore::counts`; E-L-15), rename them into place, `cmd_model.txt` first, then `cmd_model_stats.json` (the write-then-rename of `training::atomic_write`, with the check between); `privacy::tighten_permissions(data_dir)`; check once more |
 | 7 | Report: `quiet == false` -> print to stdout; `quiet == true` -> append to `data_dir/"training.log"` under `\n=== Command model training run at <local time> ===` (format as [src/ranker.rs:880-895](../../src/ranker.rs)). An `Err` from any step is logged (`log::error!`) and, under `quiet`, appended the same way as `Training failed: <error>`, then returned (E-L-03) |
 

@@ -15,7 +15,6 @@ use super::super::train::{ReplayInput, replay};
 use super::super::tuning::{CMD_PAGE_ROWS, CMD_STAGE2_K};
 use super::super::worker::{Scope, filter_candidates, narrowing_applies, replay_filter};
 use anyhow::{Context, Result, bail};
-use fuzzy_matcher::skim::SkimMatcherV2;
 use serde::Deserialize;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
@@ -100,7 +99,6 @@ pub(super) fn twostage(data_dir: &Path, queries: usize, out: &mut dyn Write) -> 
     let replayer = replay(&input, None);
     let index = &replayer.index;
     let now = input.runs.last().expect("not empty").started_at + 1;
-    let matcher = SkimMatcherV2::default();
     let predict = |flat: &[f64], width: usize| model.predict(flat, width);
 
     let first = (input.runs.len() as f64 * 0.8).floor() as usize;
@@ -125,7 +123,7 @@ pub(super) fn twostage(data_dir: &Path, queries: usize, out: &mut dyn Write) -> 
             run.repo_root.as_deref(),
             Some(&run.shell_session),
         );
-        let candidates = filter_candidates(index, &ctx, &matcher, &query, Scope::All, None);
+        let candidates = filter_candidates(index, &ctx, &query, Scope::All, None);
         if candidates.is_empty() {
             skipped += 1;
             continue;
@@ -259,7 +257,7 @@ pub(super) struct LatencyOptions {
 }
 
 /// One dump line: the key's number, query length, matches, a digest of the
-/// candidates (idx, fuzzy score) in order, how many rows are sorted, and a
+/// candidates (idx, fzf score) in order, how many rows are sorted, and a
 /// digest of every score in ranking order.
 fn dump_line(
     key: usize,
@@ -269,7 +267,7 @@ fn dump_line(
 ) -> String {
     let mut matched = DefaultHasher::new();
     for c in candidates {
-        (c.idx, c.fuzzy_score).hash(&mut matched);
+        (c.idx, c.fzf).hash(&mut matched);
     }
     let mut ranked = DefaultHasher::new();
     for s in &ranking.scores {
@@ -321,7 +319,6 @@ pub(super) fn latency(
     let started = Instant::now();
     let model = CmdModel::load(data_dir);
     let model_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let matcher = SkimMatcherV2::default();
 
     // One cycle first, not recorded: it warms the thread pool and the caches
     // as the picker's first query and start-up do.
@@ -336,11 +333,9 @@ pub(super) fn latency(
         }
         let started = Instant::now();
         // The worker's narrowing rule; nothing earlier is reused.
-        let base: Option<Vec<u32>> =
-            narrowing_applies(&query, Scope::All, &previous_query, Scope::All)
-                .then(|| previous.iter().map(|c| c.idx).collect());
-        let candidates =
-            filter_candidates(&index, &ctx, &matcher, &query, Scope::All, base.as_deref());
+        let base: Option<Vec<u32>> = narrowing_applies(&query, &previous_query)
+            .then(|| previous.iter().map(|c| c.idx).collect());
+        let candidates = filter_candidates(&index, &ctx, &query, Scope::All, base.as_deref());
         let filter = started.elapsed().as_secs_f64() * 1000.0;
         let ranking = rank_commands(
             &query,

@@ -629,7 +629,7 @@ stage takes about twice as long after 170 ms, on one thread as on the pool).
 `--now` ranks as of a fixed second; `--dump` replays the same keys (warm-up
 cycle included) through the worker's own filter (all seeds computed first,
 then its trail, reuse and narrowing) and the worker's ranking, and writes per
-key the query length, the match count, a digest of the candidates (idx, fuzzy
+key the query length, the match count, a digest of the candidates (idx, fzf
 score) in order, the sorted-row count and a digest of every score in ranking
 order (ids and numbers only; std's `DefaultHasher`, so compare builds of one
 Rust toolchain): two builds rank identically when their dumps are

@@ -153,8 +153,7 @@ fn tc_l_09_a_run_does_not_see_itself() {
     replayer.apply_run(&run(1, 1, T0));
     replayer.apply_run(&run(2, 2, T0 + 100));
     let third = run(3, 1, T0 + 200);
-    let matcher = SkimMatcherV2::default();
-    let group = build_run_group(&replayer, &matcher, &third, "", 42).unwrap();
+    let group = build_run_group(&replayer, &third, "", 42).unwrap();
     let positive = group.rows.iter().find(|row| row.label == 1.0).unwrap();
     assert_eq!(positive.features[feature("runs_last_hour")], 1.0);
     assert_eq!(
@@ -185,8 +184,7 @@ fn tc_l_11_negatives_are_random_and_rows_are_in_idx_order() {
         replayer.apply_run(&run(id, id, T0 + id));
     }
     let again = run(41, 1, T0 + 100);
-    let matcher = SkimMatcherV2::default();
-    let group = build_run_group(&replayer, &matcher, &again, "", 42).unwrap();
+    let group = build_run_group(&replayer, &again, "", 42).unwrap();
 
     let idxs: Vec<u32> = group.rows.iter().map(|row| row.idx).collect();
     assert_eq!(group.rows.len(), 31);
@@ -215,7 +213,7 @@ fn tc_l_11_negatives_are_random_and_rows_are_in_idx_order() {
     for id in 1..=3 {
         replayer.apply_run(&run(id, id, T0 + id));
     }
-    assert!(build_run_group(&replayer, &matcher, &run(4, 1, T0 + 10), "zz", 42).is_none());
+    assert!(build_run_group(&replayer, &run(4, 1, T0 + 10), "zz", 42).is_none());
 }
 
 #[test]
@@ -224,8 +222,7 @@ fn a_command_that_does_not_match_its_own_query_makes_no_group() {
     let mut replayer = Replayer::new(&commands);
     replayer.apply_run(&run(1, 1, T0));
     replayer.apply_run(&run(2, 2, T0 + 1));
-    let matcher = SkimMatcherV2::default();
-    assert!(build_run_group(&replayer, &matcher, &run(3, 1, T0 + 2), "xq", 42).is_none());
+    assert!(build_run_group(&replayer, &run(3, 1, T0 + 2), "xq", 42).is_none());
 }
 
 #[test]
@@ -710,18 +707,14 @@ fn it_l_01_serving_and_replay_compute_the_same_features() {
         "the session has runs"
     );
 
-    let matcher = SkimMatcherV2::default();
     let mut compared = 0;
     for entry in &served.entries {
         let replay_idx = replayer.knows(entry.db_id).unwrap();
         let served_idx = served.idx_of(entry.db_id).unwrap();
         for query in ["", "g"] {
-            let score = if query.is_empty() {
-                0
-            } else {
-                matcher.fuzzy_match(&entry.text, query).unwrap_or(0)
-            };
-            let newest = newest_matching(&replayer, &matcher, query);
+            let score =
+                crate::cmd::rank::fzf_score(&crate::cmd::fzf::FzfQuery::new(query), &entry.text);
+            let newest = newest_matching(&replayer, query);
             let a = feature_row(&served, &served_ctx, query, &newest, served_idx, score);
             let b = feature_row(
                 &replayer.index,
@@ -1070,9 +1063,8 @@ fn empty_query_negatives_come_from_the_newest_that_serving_scores() {
     for id in 1..=total {
         replayer.apply_run(&run(id, id, T0 + id));
     }
-    let matcher = SkimMatcherV2::default();
     let again = run(total + 1, 1, T0 + total + 10);
-    let group = build_run_group(&replayer, &matcher, &again, "", 42).unwrap();
+    let group = build_run_group(&replayer, &again, "", 42).unwrap();
     let negatives: Vec<u32> = group
         .rows
         .iter()
@@ -1083,7 +1075,7 @@ fn empty_query_negatives_come_from_the_newest_that_serving_scores() {
     assert!(negatives.iter().all(|&idx| idx >= 100), "{negatives:?}");
     // A non-empty query draws from every matching command, old ones too.
     assert!((1..=10).any(|seed| {
-        let group = build_run_group(&replayer, &matcher, &again, "g", seed).unwrap();
+        let group = build_run_group(&replayer, &again, "g", seed).unwrap();
         group
             .rows
             .iter()

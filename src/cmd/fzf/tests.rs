@@ -16,11 +16,7 @@ fn term(pattern: &str, case_sensitive: bool, scheme: Scheme) -> Term {
     } else {
         pattern.to_lowercase()
     };
-    Term {
-        chars: chars.chars().collect(),
-        case_sensitive,
-        scheme,
-    }
+    Term::new(chars.chars().collect(), case_sensitive, scheme)
 }
 
 /// (V1, V2) scores of `pattern` in `text`.
@@ -32,13 +28,8 @@ fn both(
 ) -> (Option<i16>, Option<i16>) {
     let term = term(pattern, case_sensitive, scheme);
     let chars: Vec<char> = text.chars().collect();
-    let v1 = fuzzy_v1(&term, &chars);
-    let v2 = SCRATCH.with(|s| {
-        let s = &mut *s.borrow_mut();
-        s.text.clear();
-        s.text.extend(text.chars());
-        fuzzy_v2(&term, s)
-    });
+    let v1 = fuzzy_v1(&term, &term.chars, &chars);
+    let v2 = fuzzy_v2(&term, &term.chars, &chars, &mut Dp::default());
     (v1, v2)
 }
 
@@ -186,7 +177,7 @@ fn long_texts_fall_back_to_v1_like_fzf() {
     let chars: Vec<char> = text.chars().collect();
     assert_eq!(
         q.score(&text).map(|s| s as i16),
-        fuzzy_v1(&q.terms[0], &chars)
+        fuzzy_v1(&q.terms[0], &q.terms[0].chars, &chars)
     );
 }
 
@@ -200,7 +191,7 @@ fn negative_long_text_scores_tie_at_zero_like_fzf() {
     let q = FzfQuery::new("ab");
     let chars: Vec<char> = near.chars().collect();
     assert!(
-        fuzzy_v1(&q.terms[0], &chars).unwrap() < 0,
+        fuzzy_v1(&q.terms[0], &q.terms[0].chars, &chars).unwrap() < 0,
         "negative before the clamp"
     );
     assert_eq!(q.score(&far), Some(0));
@@ -271,4 +262,91 @@ fn bulk_order_for_comparison_with_the_binary() {
         out.push('\n');
     }
     std::fs::write(var("FZF_CHECK_OUT"), out).unwrap();
+}
+
+/// Random texts and patterns over characters that exercise every class:
+/// both cases, digits, delimiters, other punctuation, whitespace.
+fn random_ascii(rng: &mut rand::rngs::StdRng, alphabet: &[u8], max: usize) -> String {
+    use rand::Rng;
+    let len = rng.gen_range(0..=max);
+    (0..len)
+        .map(|_| char::from(alphabet[rng.gen_range(0..alphabet.len())]))
+        .collect()
+}
+
+#[test]
+fn ascii_texts_read_as_bytes_score_as_decoded_ones() {
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+    let alphabet = b"abgAGB01 /:-._|,;\t";
+    let mut matched = 0;
+    for _ in 0..100_000 {
+        let text = random_ascii(&mut rng, alphabet, 24);
+        let pattern = random_ascii(&mut rng, b"abgAG0 /-", 4);
+        for scheme in [HISTORY, DEFAULT] {
+            for case_sensitive in [false, true] {
+                let term = term(&pattern, case_sensitive, scheme);
+                let bytes = term.bytes.clone().expect("an ASCII pattern");
+                let chars: Vec<char> = text.chars().collect();
+                let by_char = term_score(&term, &term.chars, &chars, &mut Dp::default());
+                let by_byte = term_score(&term, &bytes, text.as_bytes(), &mut Dp::default());
+                assert_eq!(by_char, by_byte, "{text:?} {pattern:?}");
+                matched += usize::from(by_char.is_some());
+            }
+        }
+        let query = FzfQuery::new(&pattern);
+        // The query's own path (bytes for this ASCII text) against the
+        // decoded path, term by term.
+        let decoded: Option<i32> = query.terms.iter().try_fold(0i32, |total, term| {
+            let chars: Vec<char> = text.chars().collect();
+            Some(total + i32::from(term_score(term, &term.chars, &chars, &mut Dp::default())?))
+        });
+        assert_eq!(
+            query.score(&text),
+            decoded.map(|t| t.clamp(0, i32::from(u16::MAX)))
+        );
+    }
+    assert!(matched > 50_000, "{matched}");
+}
+
+#[test]
+fn the_one_character_path_scores_as_the_full_v2() {
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(6);
+    for _ in 0..50_000 {
+        let text = random_ascii(&mut rng, b"aAbg1 /:-_.,|", 30);
+        let pattern = random_ascii(&mut rng, b"aAg1/-", 1);
+        if pattern.is_empty() {
+            continue;
+        }
+        for scheme in [HISTORY, DEFAULT] {
+            for case_sensitive in [false, true] {
+                let term = term(&pattern, case_sensitive, scheme);
+                let chars: Vec<char> = text.chars().collect();
+                assert_eq!(
+                    single_v2(&term, term.chars[0], &chars),
+                    fuzzy_v2(&term, &term.chars, &chars, &mut Dp::default()),
+                    "{text:?} {pattern:?}"
+                );
+            }
+        }
+    }
+    // Non-ASCII texts take the decoded path, the fast path included.
+    let q = FzfQuery::new("é");
+    assert_eq!(q.score("café au lait"), Some(i32::from(SCORE_MATCH)));
+    assert_eq!(FzfQuery::new("É").score("café"), None);
+    assert_eq!(
+        FzfQuery::new("é").score("CAFÉ"),
+        Some(i32::from(SCORE_MATCH))
+    );
+    assert_eq!(FzfQuery::new("e").score("cafÉ"), None);
+}
+
+#[test]
+fn a_non_ascii_term_matches_no_ascii_text() {
+    assert_eq!(FzfQuery::new("é").score("cafe"), None);
+    assert_eq!(FzfQuery::new("git é").score("git status"), None);
+    // The Kelvin sign folds to an ASCII `k`: a non-ASCII text can match an
+    // ASCII query through folding.
+    assert!(FzfQuery::new("k").score("\u{212A}ubectl").is_some());
 }

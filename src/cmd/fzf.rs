@@ -32,14 +32,12 @@ const V2_MAX_CELLS: usize = 100 * 1024;
 /// fzf refuses V2 for longer patterns (16-bit overflow).
 const V2_MAX_PATTERN: usize = 1000;
 
-const DELIMITERS: &str = "/,:;|";
-
 /// The two bonuses fzf's `--scheme` changes (`Init` in `algo.go`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Scheme {
     /// A word after whitespace, and the start of the text.
     boundary_white: i16,
-    /// A word after one of `DELIMITERS`.
+    /// A word after one of the delimiters `/,:;|`.
     boundary_delimiter: i16,
 }
 
@@ -67,14 +65,7 @@ const INITIAL_CLASS: Class = Class::White;
 
 fn class_of(c: char) -> Class {
     if c.is_ascii() {
-        match c {
-            'a'..='z' => Class::Lower,
-            'A'..='Z' => Class::Upper,
-            '0'..='9' => Class::Number,
-            ' ' | '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' => Class::White,
-            _ if DELIMITERS.contains(c) => Class::Delimiter,
-            _ => Class::NonWord,
-        }
+        ASCII_CLASSES[c as usize]
     } else if c.is_lowercase() {
         Class::Lower
     } else if c.is_uppercase() {
@@ -89,6 +80,28 @@ fn class_of(c: char) -> Class {
         Class::NonWord
     }
 }
+
+const fn ascii_class(byte: u8) -> Class {
+    match byte {
+        b'a'..=b'z' => Class::Lower,
+        b'A'..=b'Z' => Class::Upper,
+        b'0'..=b'9' => Class::Number,
+        b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' => Class::White,
+        b'/' | b',' | b':' | b';' | b'|' => Class::Delimiter, // DELIMITERS
+        _ => Class::NonWord,
+    }
+}
+
+/// The class of each ASCII character (fzf's `asciiCharClasses`).
+const ASCII_CLASSES: [Class; 128] = {
+    let mut classes = [Class::NonWord; 128];
+    let mut byte = 0;
+    while byte < 128 {
+        classes[byte] = ascii_class(byte as u8);
+        byte += 1;
+    }
+    classes
+};
 
 /// `bonusFor`: the bonus of a character of `class` after one of `prev`.
 fn bonus_for(scheme: Scheme, prev: Class, class: Class) -> i16 {
@@ -112,6 +125,16 @@ fn bonus_for(scheme: Scheme, prev: Class, class: Class) -> i16 {
     }
 }
 
+/// The largest bonus `bonus_for` can give under `scheme`.
+fn max_bonus(scheme: Scheme) -> i16 {
+    scheme
+        .boundary_white
+        .max(scheme.boundary_delimiter)
+        .max(BONUS_BOUNDARY)
+        .max(BONUS_NON_WORD)
+        .max(BONUS_CAMEL_123)
+}
+
 /// `c` as a case-insensitive match compares it: lower case of an upper-case
 /// letter (a one-character mapping only, like Go's `unicode.To`).
 fn fold(c: char, class: Class) -> char {
@@ -128,12 +151,78 @@ fn fold(c: char, class: Class) -> char {
     }
 }
 
+/// One unit of a text as the matcher reads it: a byte of an ASCII text, or
+/// a `char`. The byte form gives the same classes and folding as the `char`
+/// form of the same ASCII character, without decoding the text.
+trait Unit: Copy + PartialEq {
+    fn class(self) -> Class;
+    /// The unit as a case-insensitive match compares it; `class` is
+    /// `self.class()`.
+    fn fold(self, class: Class) -> Self;
+}
+
+impl Unit for u8 {
+    #[inline]
+    fn class(self) -> Class {
+        ASCII_CLASSES[usize::from(self & 0x7F)]
+    }
+
+    #[inline]
+    fn fold(self, class: Class) -> Self {
+        if class == Class::Upper {
+            self.to_ascii_lowercase()
+        } else {
+            self
+        }
+    }
+}
+
+impl Unit for char {
+    #[inline]
+    fn class(self) -> Class {
+        class_of(self)
+    }
+
+    #[inline]
+    fn fold(self, class: Class) -> Self {
+        fold(self, class)
+    }
+}
+
 /// One space-separated term of a query.
 #[derive(Clone, Debug)]
 struct Term {
     chars: Vec<char>,
+    /// `chars` as bytes when every one is ASCII: the form an ASCII text is
+    /// matched with. `None` otherwise (such a term matches no ASCII text).
+    bytes: Option<Vec<u8>>,
     case_sensitive: bool,
     scheme: Scheme,
+}
+
+impl Term {
+    fn new(chars: Vec<char>, case_sensitive: bool, scheme: Scheme) -> Self {
+        let bytes = chars
+            .iter()
+            .all(char::is_ascii)
+            .then(|| chars.iter().map(|&c| c as u8).collect());
+        Term {
+            chars,
+            bytes,
+            case_sensitive,
+            scheme,
+        }
+    }
+
+    /// `text` unit as this term compares it with its own units.
+    #[inline]
+    fn view<U: Unit>(&self, raw: U, class: Class) -> U {
+        if self.case_sensitive {
+            raw
+        } else {
+            raw.fold(class)
+        }
+    }
 }
 
 /// A query as fzf's extended search splits it. Built once per keystroke.
@@ -165,41 +254,51 @@ impl FzfQuery {
                 let lower = token.to_lowercase();
                 let case_sensitive = token != lower;
                 let chars = if case_sensitive { token } else { lower };
-                Term {
-                    chars: chars.chars().collect(),
-                    case_sensitive,
-                    scheme,
-                }
+                Term::new(chars.chars().collect(), case_sensitive, scheme)
             })
             .collect();
         FzfQuery { terms }
     }
 
     /// The sum of the terms' scores, or `None` when a term does not match.
+    /// An ASCII text is read as bytes; any other is decoded once.
     pub(super) fn score(&self, text: &str) -> Option<i32> {
         if self.terms.is_empty() {
             return Some(0);
         }
-        SCRATCH.with(|scratch| {
-            let scratch = &mut *scratch.borrow_mut();
-            scratch.text.clear();
-            scratch.text.extend(text.chars());
-            let mut total = 0;
-            for term in &self.terms {
-                total += i32::from(term_score(term, scratch)?);
-            }
-            // fzf ranks by `util.AsUint16(score)`: a negative total (V1 on a
-            // long text with long gaps) ties at 0 with the input order.
-            Some(total.clamp(0, i32::from(u16::MAX)))
-        })
+        let total = if text.is_ascii() {
+            BYTES.with(|dp| {
+                let dp = &mut *dp.borrow_mut();
+                let mut total = 0;
+                for term in &self.terms {
+                    // A non-ASCII character equals no ASCII one, folded or not.
+                    let pattern = term.bytes.as_deref()?;
+                    total += i32::from(term_score(term, pattern, text.as_bytes(), dp)?);
+                }
+                Some(total)
+            })
+        } else {
+            CHARS.with(|dp| {
+                let (text_chars, dp) = &mut *dp.borrow_mut();
+                text_chars.clear();
+                text_chars.extend(text.chars());
+                let mut total = 0;
+                for term in &self.terms {
+                    total += i32::from(term_score(term, &term.chars, text_chars, dp)?);
+                }
+                Some(total)
+            })
+        }?;
+        // fzf ranks by `util.AsUint16(score)`: a negative total (V1 on a
+        // long text with long gaps) ties at 0 with the input order.
+        Some(total.clamp(0, i32::from(u16::MAX)))
     }
 }
 
-/// Buffers reused across calls on one thread: no allocation per candidate.
-#[derive(Default)]
-struct Scratch {
-    text: Vec<char>,
-    folded: Vec<char>,
+/// V2's buffers, reused across calls on one thread: no allocation per
+/// candidate.
+struct Dp<U> {
+    folded: Vec<U>,
     bonus: Vec<i16>,
     h0: Vec<i16>,
     c0: Vec<i16>,
@@ -208,13 +307,37 @@ struct Scratch {
     c: Vec<i16>,
 }
 
-thread_local! {
-    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
+impl<U> Default for Dp<U> {
+    fn default() -> Self {
+        Dp {
+            folded: Vec::new(),
+            bonus: Vec::new(),
+            h0: Vec::new(),
+            c0: Vec::new(),
+            first: Vec::new(),
+            h: Vec::new(),
+            c: Vec::new(),
+        }
+    }
 }
 
-fn term_score(term: &Term, s: &mut Scratch) -> Option<i16> {
-    let m = term.chars.len();
-    let n = s.text.len();
+thread_local! {
+    static BYTES: RefCell<Dp<u8>> = RefCell::new(Dp::default());
+    /// The decoded text, and the buffers.
+    static CHARS: RefCell<(Vec<char>, Dp<char>)> = RefCell::new((Vec::new(), Dp::default()));
+}
+
+/// Make sure this thread's buffers exist, so the first query does not
+/// create them (the worker calls it on every pool thread at start).
+pub(super) fn warm_up() {
+    let query = FzfQuery::new("wu");
+    let _ = query.score("warm up");
+    let _ = query.score("wärm up");
+}
+
+fn term_score<U: Unit>(term: &Term, pattern: &[U], text: &[U], dp: &mut Dp<U>) -> Option<i16> {
+    let m = pattern.len();
+    let n = text.len();
     if m == 0 {
         return Some(0);
     }
@@ -222,25 +345,46 @@ fn term_score(term: &Term, s: &mut Scratch) -> Option<i16> {
         return None;
     }
     if n * m > V2_MAX_CELLS || m > V2_MAX_PATTERN {
-        return fuzzy_v1(term, &s.text);
+        return fuzzy_v1(term, pattern, text);
     }
-    fuzzy_v2(term, s)
+    if m == 1 {
+        return single_v2(term, pattern[0], text);
+    }
+    fuzzy_v2(term, pattern, text, dp)
+}
+
+/// V2 for a one-character pattern, which fzf answers after its phase 2:
+/// the best of `SCORE_MATCH + 2 * bonus` over the occurrences. Stops at the
+/// largest bonus possible.
+fn single_v2<U: Unit>(term: &Term, p: U, text: &[U]) -> Option<i16> {
+    let ceiling = SCORE_MATCH + max_bonus(term.scheme) * BONUS_FIRST_CHAR_MULTIPLIER;
+    let mut best = None;
+    let mut prev_class = INITIAL_CLASS;
+    for &raw in text {
+        let class = raw.class();
+        if term.view(raw, class) == p {
+            let score = SCORE_MATCH
+                + bonus_for(term.scheme, prev_class, class) * BONUS_FIRST_CHAR_MULTIPLIER;
+            if best.is_none_or(|best| score > best) {
+                best = Some(score);
+                if score == ceiling {
+                    break;
+                }
+            }
+        }
+        prev_class = class;
+    }
+    best
 }
 
 /// Phase 1 of V2 (`asciiFuzzyIndex`): `(from, to)` such that every
 /// alignment lies in `text[from..to]` - from one before the first
 /// occurrence of the first pattern character to the last occurrence of the
 /// last one - or `None` when the pattern is not a subsequence.
-fn match_window(term: &Term, text: &[char]) -> Option<(usize, usize)> {
-    let equal = |c: char, p: char| {
-        if term.case_sensitive {
-            c == p
-        } else {
-            fold(c, class_of(c)) == p
-        }
-    };
+fn match_window<U: Unit>(term: &Term, pattern: &[U], text: &[U]) -> Option<(usize, usize)> {
+    let equal = |c: U, p: U| term.view(c, c.class()) == p;
     let (mut first, mut at, mut last) = (0, 0, 0);
-    for (pidx, &p) in term.chars.iter().enumerate() {
+    for (pidx, &p) in pattern.iter().enumerate() {
         at += text[at..].iter().position(|&c| equal(c, p))?;
         if pidx == 0 && at > 0 {
             first = at - 1;
@@ -248,7 +392,7 @@ fn match_window(term: &Term, text: &[char]) -> Option<(usize, usize)> {
         last = at;
         at += 1;
     }
-    let p = *term.chars.last().expect("a non-empty term");
+    let p = *pattern.last().expect("a non-empty term");
     let end = text[last + 1..]
         .iter()
         .rposition(|&c| equal(c, p))
@@ -258,9 +402,8 @@ fn match_window(term: &Term, text: &[char]) -> Option<(usize, usize)> {
 
 /// fzf's `FuzzyMatchV2`, score only: the best-scoring alignment by
 /// dynamic programming (a Smith-Waterman variant without omissions).
-fn fuzzy_v2(term: &Term, s: &mut Scratch) -> Option<i16> {
-    let (from, to) = match_window(term, &s.text)?;
-    let pattern = &term.chars;
+fn fuzzy_v2<U: Unit>(term: &Term, pattern: &[U], text: &[U], s: &mut Dp<U>) -> Option<i16> {
+    let (from, to) = match_window(term, pattern, text)?;
     let m = pattern.len();
     let width_all = to - from;
 
@@ -273,14 +416,10 @@ fn fuzzy_v2(term: &Term, s: &mut Scratch) -> Option<i16> {
     let (mut max_score, mut pidx, mut last_idx) = (0i16, 0usize, 0usize);
     let (pchar0, mut pchar) = (pattern[0], pattern[0]);
     let (mut prev_h0, mut prev_class, mut in_gap) = (0i16, INITIAL_CLASS, false);
-    for off in 0..width_all {
-        let raw = s.text[from + off];
-        let class = class_of(raw);
-        let c = if term.case_sensitive {
-            raw
-        } else {
-            fold(raw, class)
-        };
+    for &raw in &text[from..from + width_all] {
+        let off = s.folded.len();
+        let class = raw.class();
+        let c = term.view(raw, class);
         s.folded.push(c);
         let bonus = bonus_for(term.scheme, prev_class, class);
         s.bonus.push(bonus);
@@ -381,16 +520,9 @@ fn fuzzy_v2(term: &Term, s: &mut Scratch) -> Option<i16> {
 /// fzf's `FuzzyMatchV1` (the long-text fallback), score only: the first
 /// occurrence scanning forward, shortened scanning back, scored by
 /// `calculateScore`.
-fn fuzzy_v1(term: &Term, text: &[char]) -> Option<i16> {
-    match_window(term, text)?;
-    let pattern = &term.chars;
-    let folded = |c: char| {
-        if term.case_sensitive {
-            c
-        } else {
-            fold(c, class_of(c))
-        }
-    };
+fn fuzzy_v1<U: Unit>(term: &Term, pattern: &[U], text: &[U]) -> Option<i16> {
+    match_window(term, pattern, text)?;
+    let folded = |c: U| term.view(c, c.class());
     let mut pidx = 0;
     let mut start = None;
     let mut end = None;
@@ -415,27 +547,28 @@ fn fuzzy_v1(term: &Term, text: &[char]) -> Option<i16> {
             }
         }
     }
-    Some(calculate_score(term, text, start, end))
+    Some(calculate_score(term, pattern, text, start, end))
 }
 
 /// fzf's `calculateScore`: the score of the alignment that matches greedily
 /// within `text[start..end]`.
-fn calculate_score(term: &Term, text: &[char], start: usize, end: usize) -> i16 {
-    let pattern = &term.chars;
+fn calculate_score<U: Unit>(
+    term: &Term,
+    pattern: &[U],
+    text: &[U],
+    start: usize,
+    end: usize,
+) -> i16 {
     let (mut pidx, mut score, mut in_gap, mut consecutive, mut first_bonus) =
         (0usize, 0i32, false, 0, 0i16);
     let mut prev_class = if start > 0 {
-        class_of(text[start - 1])
+        text[start - 1].class()
     } else {
         INITIAL_CLASS
     };
     for &raw in &text[start..end] {
-        let class = class_of(raw);
-        let c = if term.case_sensitive {
-            raw
-        } else {
-            fold(raw, class)
-        };
+        let class = raw.class();
+        let c = term.view(raw, class);
         if pidx < pattern.len() && c == pattern[pidx] {
             score += i32::from(SCORE_MATCH);
             let mut bonus = bonus_for(term.scheme, prev_class, class);

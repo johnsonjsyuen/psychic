@@ -24,6 +24,7 @@ use super::features::{
     COMMAND_FEATURE_REGISTRY, CommandFeatureInputs, command_feature_names, command_feature_specs,
     compute_all,
 };
+use super::fuzzy;
 use super::fzf::FzfQuery;
 use super::index::{CommandIndex, RankContext};
 use super::rank::{fzf_score, recency_rank};
@@ -36,8 +37,6 @@ use super::tuning::{
     CMD_TRAIN_RECENT_SCAN,
 };
 use anyhow::{Context, Result};
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -418,11 +417,8 @@ struct Group {
 /// The `CMD_RECENCY_RANK_CAP` newest commands matching `query` as
 /// `(last_run_at, db_id)`, newest first: what serving's
 /// `CommandRanking::newest` holds for the same state and query.
-pub(super) fn newest_matching(
-    replayer: &Replayer,
-    matcher: &SkimMatcherV2,
-    query: &str,
-) -> Vec<(i64, i64)> {
+pub(super) fn newest_matching(replayer: &Replayer, query: &str) -> Vec<(i64, i64)> {
+    let matcher = fuzzy::Query::new(query);
     let index = &replayer.index;
     let mut found: Vec<(i64, i64)> = Vec::new();
     for idx in replayer.recent_distinct() {
@@ -434,8 +430,7 @@ pub(super) fn newest_matching(
         {
             break;
         }
-        if !entry.deleted && (query.is_empty() || matcher.fuzzy_match(&entry.text, query).is_some())
-        {
+        if matcher.matches(index, idx).is_some() {
             found.push((entry.last_run_at, entry.db_id));
         }
     }
@@ -445,14 +440,16 @@ pub(super) fn newest_matching(
 }
 
 /// The features of `idx` for `query` in `ctx`; `newest` is
-/// [`newest_matching`] for `query`.
+/// [`newest_matching`] for `query`, `fzf` fzf's score (`NO_FZF_MATCH` when
+/// it does not match). Skim's score is computed here, as serving computes it
+/// for the rows its model scores.
 fn feature_row(
     index: &CommandIndex,
     ctx: &RankContext,
     query: &str,
     newest: &[(i64, i64)],
     idx: u32,
-    fuzzy_score: i64,
+    fzf: i32,
 ) -> Vec<f64> {
     let query_lower = query.to_lowercase();
     let entry = &index.entries[idx as usize];
@@ -461,8 +458,8 @@ fn feature_row(
         query_lower: &query_lower,
         idx,
         entry,
-        fuzzy_score,
-        fzf_score: fzf_score(&FzfQuery::new(query), &entry.text),
+        fuzzy_score: fuzzy::skim_score(fuzzy::skim(), query, &entry.text),
+        fzf_score: fzf,
         recency_rank: recency_rank(newest, (entry.last_run_at, entry.db_id)),
         index,
         ctx,
@@ -539,13 +536,7 @@ fn source_weight(source: Source) -> f64 {
 /// commands that match, ordered by idx. `None` when the command never ran
 /// before, does not match its own query, or no negative is found. Does not
 /// touch the replayer.
-fn build_run_group(
-    replayer: &Replayer,
-    matcher: &SkimMatcherV2,
-    run: &RunRecord,
-    query: &str,
-    seed: u64,
-) -> Option<Group> {
+fn build_run_group(replayer: &Replayer, run: &RunRecord, query: &str, seed: u64) -> Option<Group> {
     let positive = replayer.knows(run.command_id)?;
     let index = &replayer.index;
     let ctx = replayer.context(
@@ -554,18 +545,14 @@ fn build_run_group(
         run.repo_root.as_deref(),
         Some(&run.shell_session),
     );
-    let fuzzy = |idx: u32| -> Option<i64> {
-        if query.is_empty() {
-            Some(0)
-        } else {
-            matcher.fuzzy_match(&index.entries[idx as usize].text, query)
-        }
-    };
+    // The picker's match: fzf's, through the same prefilter.
+    let matcher = fuzzy::Query::new(query);
+    let fuzzy = |idx: u32| matcher.matches(index, idx);
     let usable = |idx: u32| idx != positive && !index.entries[idx as usize].deleted;
     let positive_score = fuzzy(positive)?;
 
-    // (idx, fuzzy score) of each negative.
-    let mut negatives: Vec<(u32, i64)> = Vec::new();
+    // (idx, fzf score) of each negative.
+    let mut negatives: Vec<(u32, i32)> = Vec::new();
     for idx in replayer
         .recent_distinct()
         .filter(|&idx| usable(idx))
@@ -608,7 +595,7 @@ fn build_run_group(
 
     let mut members = negatives;
     members.push((positive, positive_score));
-    let newest = newest_matching(replayer, matcher, query);
+    let newest = newest_matching(replayer, query);
     // Not the positive first: tied scores would resolve in its favour.
     members.sort_unstable_by_key(|&(idx, _)| idx);
     let rows = members
@@ -630,11 +617,7 @@ fn build_run_group(
 /// picker process, each with its own query, labelled by whether it shows
 /// the picked command; the whole episode scored at the moment of the pick.
 /// `None` without both a positive and a negative row.
-fn build_pick_group(
-    replayer: &Replayer,
-    matcher: &SkimMatcherV2,
-    episode: &PickEpisode,
-) -> Option<Group> {
+fn build_pick_group(replayer: &Replayer, episode: &PickEpisode) -> Option<Group> {
     let pick = &episode.pick;
     let ctx = replayer.context(
         pick.timestamp,
@@ -649,7 +632,7 @@ fn build_pick_group(
         let query = impression.query.as_str();
         newest
             .entry(query)
-            .or_insert_with(|| newest_matching(replayer, matcher, query));
+            .or_insert_with(|| newest_matching(replayer, query));
     }
     let rows: Vec<GroupRow> = episode
         .impressions
@@ -657,13 +640,9 @@ fn build_pick_group(
         .filter_map(|impression| {
             let idx = replayer.knows(impression.command_id)?;
             let query = impression.query.as_str();
-            let score = if query.is_empty() {
-                0
-            } else {
-                matcher
-                    .fuzzy_match(&index.entries[idx as usize].text, query)
-                    .unwrap_or(0)
-            };
+            // An impression shows a command that matched when it was
+            // logged; NO_FZF_MATCH if it no longer does.
+            let score = fzf_score(&FzfQuery::new(query), &index.entries[idx as usize].text);
             Some(GroupRow {
                 idx,
                 label: if impression.command_id == pick.command_id {
@@ -829,6 +808,15 @@ pub(super) fn replay(input: &ReplayInput, until: Option<i64>) -> Replayer {
     replayer
 }
 
+/// The command model's fit: the shared one (`crate::training`). Training
+/// and the relevance benchmark both fit through here.
+pub(super) fn fit_command_model(
+    set: &crate::training::TrainingSet,
+    seed: u64,
+) -> Result<crate::training::Fitted> {
+    crate::training::fit_seeded(set, &command_feature_specs(), seed as u32)
+}
+
 /// The groups of a replay, in time order.
 struct Groups {
     groups: Vec<Group>,
@@ -838,7 +826,6 @@ struct Groups {
 
 fn build_groups(input: &ReplayInput, options: &BuildOptions) -> Groups {
     let first_grouped = eligible_runs(input, options.until).saturating_sub(options.max_run_groups);
-    let matcher = SkimMatcherV2::default();
     let mut replayer = Replayer::new(&input.commands);
     let mut groups = Vec::new();
     let mut counts = GroupCounts::default();
@@ -852,7 +839,7 @@ fn build_groups(input: &ReplayInput, options: &BuildOptions) -> Groups {
                     if ordinal >= first_grouped {
                         let text = &replayer.index.entries[idx as usize].text;
                         let query = training_query(options.seed, run.id, text);
-                        let group = build_run_group(&replayer, &matcher, run, &query, options.seed);
+                        let group = build_run_group(&replayer, run, &query, options.seed);
                         if let Some(group) = group {
                             match run.source {
                                 Source::Hook => counts.hook += 1,
@@ -868,7 +855,7 @@ fn build_groups(input: &ReplayInput, options: &BuildOptions) -> Groups {
             }
             Step::Event(event) => {
                 if let Some(episode) = replayer.apply_event(event) {
-                    if let Some(group) = build_pick_group(&replayer, &matcher, &episode) {
+                    if let Some(group) = build_pick_group(&replayer, &episode) {
                         counts.pick += 1;
                         counts.rows += group.rows.len();
                         groups.push(group);
@@ -1189,12 +1176,11 @@ fn train_and_write(data_dir: &Path, seed: u64, report: &Report) -> Result<Retrai
     if counts.groups() < CMD_TRAIN_MIN_GROUPS {
         return not_enough();
     }
-    let fitted =
-        match crate::training::fit_seeded(&built.set, &command_feature_specs(), seed as u32) {
-            Ok(fitted) => fitted,
-            Err(error) if is_not_enough_for_a_split(&error) => return not_enough(),
-            Err(error) => return Err(error),
-        };
+    let fitted = match fit_command_model(&built.set, seed) {
+        Ok(fitted) => fitted,
+        Err(error) if is_not_enough_for_a_split(&error) => return not_enough(),
+        Err(error) => return Err(error),
+    };
     drop(built);
 
     let seconds = started.elapsed().as_secs_f64();

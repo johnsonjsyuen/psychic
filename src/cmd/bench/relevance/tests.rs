@@ -335,7 +335,8 @@ fn tc_n_16_fragment_queries_start_a_later_word() {
 #[test]
 fn the_fzf_baseline_orders_by_fzf_score_then_newest() {
     // "gi": word starts in "git log" and "tig git" (equal under the history
-    // scheme), scattered in "grep -i"; "ls" does not match at all.
+    // scheme), scattered in "grep -i"; "ls" does not match at all, so the
+    // filter does not pass it.
     let mut index = CommandIndex::default();
     let texts = [
         ("git log", 10),
@@ -343,22 +344,18 @@ fn the_fzf_baseline_orders_by_fzf_score_then_newest() {
         ("grep -i", 40),
         ("ls", 50),
     ];
-    let mut candidates = Vec::new();
     for (i, &(text, last_run_at)) in texts.iter().enumerate() {
         let idx = index.add_command(i as i64 + 1, text);
         index.record_run(idx, last_run_at, None, None, Some(0), None);
-        candidates.push(CommandCandidate {
-            idx,
-            fuzzy_score: 0,
-        });
     }
-    let ranks: Vec<u32> = (0..4)
-        .map(|t| fzf_rank(&index, &candidates, "gi", t))
-        .collect();
-    assert_eq!(ranks, [2, 1, 3, 4]);
-    assert_eq!(fzf_rank(&index, &candidates[..2], "gi", 3), NOT_MATCHED);
+    let ctx = crate::cmd::index::test_support::context(100);
+    let candidates = filter_candidates(&index, &ctx, "gi", Scope::All, None);
+    let ranks: Vec<u32> = (0..4).map(|t| fzf_rank(&index, &candidates, t)).collect();
+    assert_eq!(ranks, [2, 1, 3, NOT_MATCHED]);
+    assert_eq!(fzf_rank(&index, &candidates[..1], 1), NOT_MATCHED);
     // No query: newest first.
-    assert_eq!(fzf_rank(&index, &candidates, "", 3), 1);
+    let all = filter_candidates(&index, &ctx, "", Scope::All, None);
+    assert_eq!(fzf_rank(&index, &all, 3), 1);
 }
 
 // --- TC-N-11: baselines -----------------------------------------------------------
@@ -368,13 +365,12 @@ fn tc_n_11_baseline_orders() {
     let mut index = CommandIndex::default();
     let data = [(10, 5), (30, 5), (20, 9)];
     let mut candidates = Vec::new();
-    for (i, &(last_run_at, fuzzy_score)) in data.iter().enumerate() {
+    for (i, &(last_run_at, skim)) in data.iter().enumerate() {
         let idx = index.add_command(i as i64 + 1, &format!("c{i}"));
         index.record_run(idx, last_run_at, None, None, Some(0), None);
-        candidates.push(CommandCandidate { idx, fuzzy_score });
+        candidates.push(SkimScored { idx, skim });
     }
-    let order = |candidates: &[CommandCandidate],
-                 cmp: &dyn Fn(&CommandCandidate, &CommandCandidate) -> Ordering| {
+    let order = |candidates: &[SkimScored], cmp: &dyn Fn(&SkimScored, &SkimScored) -> Ordering| {
         let mut sorted = candidates.to_vec();
         sorted.sort_by(|a, b| cmp(a, b));
         sorted.iter().map(|c| c.idx).collect::<Vec<_>>()
@@ -399,10 +395,7 @@ fn tc_n_11_baseline_orders() {
     // Equal last_run_at: the larger database id first.
     let tie = index.add_command(9, "c9");
     index.record_run(tie, 30, None, None, Some(0), None);
-    candidates.push(CommandCandidate {
-        idx: tie,
-        fuzzy_score: 5,
-    });
+    candidates.push(SkimScored { idx: tie, skim: 5 });
     assert_eq!(
         order(&candidates, &|a, b| recency_order(&index, a, b))[..2],
         [tie, 1]
@@ -460,7 +453,7 @@ fn training_at_a_cut_sees_nothing_after_it() {
             shuffle_labels: false,
         };
         let built = build_training_set(input, &options);
-        crate::training::fit_seeded(&built.set, &command_feature_specs(), 1)
+        crate::cmd::train::fit_command_model(&built.set, 1)
             .unwrap()
             .model
     };
@@ -481,8 +474,8 @@ fn shuffled_labels_change_which_rows_are_positive_but_not_how_many() {
     let real = build_training_set(&input, &options(false));
     let shuffled = build_training_set(&input, &options(true));
     assert_eq!(real.counts, shuffled.counts);
-    let real = crate::training::fit_seeded(&real.set, &command_feature_specs(), 1).unwrap();
-    let shuffled = crate::training::fit_seeded(&shuffled.set, &command_feature_specs(), 1).unwrap();
+    let real = crate::cmd::train::fit_command_model(&real.set, 1).unwrap();
+    let shuffled = crate::cmd::train::fit_command_model(&shuffled.set, 1).unwrap();
     assert_ne!(real.model, shuffled.model);
 }
 
@@ -626,10 +619,9 @@ fn it_n_02_replay_state_equals_a_fresh_load() {
     )
     .unwrap();
     let replay_ctx = replayer.context(now, Some(&cwd), repo.as_deref(), Some(&session));
-    let matcher = SkimMatcherV2::default();
     for query in ["", "g"] {
         let order = |index: &CommandIndex, ctx: &RankContext| -> Vec<i64> {
-            let candidates = filter_candidates(index, ctx, &matcher, query, Scope::All, None);
+            let candidates = filter_candidates(index, ctx, query, Scope::All, None);
             rank_commands(query, &candidates, index, ctx, usize::MAX, None)
                 .scores
                 .iter()
@@ -644,7 +636,7 @@ fn it_n_02_replay_state_equals_a_fresh_load() {
         // the replay's recency order) equal what serving computes from its
         // candidates.
         let newest = |index: &CommandIndex, ctx: &RankContext| {
-            let candidates = filter_candidates(index, ctx, &matcher, query, Scope::All, None);
+            let candidates = filter_candidates(index, ctx, query, Scope::All, None);
             crate::cmd::rank::newest_of(
                 candidates.iter().map(|c| {
                     let e = &index.entries[c.idx as usize];
@@ -657,7 +649,7 @@ fn it_n_02_replay_state_equals_a_fresh_load() {
         assert_eq!(served.len(), CMD_RECENCY_RANK_CAP);
         assert_eq!(newest(&replayer.index, &replay_ctx), served);
         assert_eq!(
-            crate::cmd::train::newest_matching(&replayer, &matcher, query),
+            crate::cmd::train::newest_matching(&replayer, query),
             served,
             "query {query:?}"
         );
@@ -667,7 +659,7 @@ fn it_n_02_replay_state_equals_a_fresh_load() {
             let query_lower = query.to_lowercase();
             let newest = newest(index, ctx);
             let mut rows: Vec<(i64, Vec<f64>)> =
-                filter_candidates(index, ctx, &matcher, query, Scope::All, None)
+                filter_candidates(index, ctx, query, Scope::All, None)
                     .iter()
                     .map(|c| {
                         let entry = &index.entries[c.idx as usize];
@@ -676,11 +668,12 @@ fn it_n_02_replay_state_equals_a_fresh_load() {
                             query_lower: &query_lower,
                             idx: c.idx,
                             entry,
-                            fuzzy_score: c.fuzzy_score,
-                            fzf_score: crate::cmd::rank::fzf_score(
-                                &crate::cmd::fzf::FzfQuery::new(query),
+                            fuzzy_score: crate::cmd::fuzzy::skim_score(
+                                crate::cmd::fuzzy::skim(),
+                                query,
                                 &entry.text,
                             ),
+                            fzf_score: c.fzf,
                             recency_rank: crate::cmd::rank::recency_rank(
                                 &newest,
                                 (entry.last_run_at, entry.db_id),
