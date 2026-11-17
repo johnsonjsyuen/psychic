@@ -28,14 +28,14 @@ use super::features::{
 use super::fuzzy;
 use super::fzf::FzfQuery;
 use super::index::{CommandIndex, RankContext};
-use super::rank::{fzf_score, recency_rank, stage2_rows};
+use super::rank::{CommandCandidate, fzf_score, recency_rank, stage2_rows};
 use super::store::{CmdStore, CommandRecord, EventRecord, RunRecord, Source};
 use super::tuning::{
     CMD_HOOK_WEIGHT, CMD_IMPORT_WEIGHT, CMD_MODEL_MAX_TREES, CMD_PICK_RUN_SECS, CMD_PICK_WEIGHT,
     CMD_RECENCY_RANK_CAP, CMD_RETRAIN_MIN_INTERVAL_SECS, CMD_TRAIN_FRAGMENT_SHARE,
     CMD_TRAIN_LOCK_STALE_SECS, CMD_TRAIN_MAX_RUN_GROUPS, CMD_TRAIN_MIN_GROUPS, CMD_TRAIN_QLEN_MIX,
     CMD_TRAIN_RANDOM_NEGATIVES, CMD_TRAIN_RANDOM_TRIES, CMD_TRAIN_RECENT_NEGATIVES,
-    CMD_TRAIN_RECENT_SCAN,
+    CMD_TRAIN_RECENT_SCAN, CMD_TRAIN_STAGE2_NEGATIVES,
 };
 use super::worker::{Scope, filter_candidates};
 use anyhow::{Context, Result};
@@ -566,25 +566,35 @@ fn build_run_group(replayer: &Replayer, run: &RunRecord, query: &str, seed: u64)
         }
     }
 
-    // The rows serving's model scores for this query (03 section 7.2:
-    // fzf's top CMD_STAGE2_K, then the directory's most-run matches), drawn
-    // uniformly: the model learns to order exactly the rows it will see.
+    // Most negatives come from the rows serving's model scores for this
+    // query (03 section 7.2: fzf's top CMD_STAGE2_K, then the directory's
+    // most-run matches), so the model learns to order the rows it will see;
+    // the rest from every match, so that it also knows the rows it never
+    // scores at serving time are rarely the answer (B8 compares it with a
+    // model that scores every match).
     let candidates = filter_candidates(index, &ctx, query, Scope::All, None);
     let pool = stage2_rows(&candidates, index, &ctx);
+    let recent = negatives.len();
     let mut state = splitmix64(seed ^ run.id as u64 ^ RANDOM_NEGATIVE_SALT);
-    let mut random = 0;
-    for _ in 0..CMD_TRAIN_RANDOM_TRIES {
-        if random == CMD_TRAIN_RANDOM_NEGATIVES || pool.is_empty() {
-            break;
+    // Up to `want` more negatives drawn uniformly from `from`.
+    let mut draw = |from: &[CommandCandidate], want: usize, negatives: &mut Vec<(u32, i32)>| {
+        let mut drawn = 0;
+        for _ in 0..CMD_TRAIN_RANDOM_TRIES {
+            if drawn == want || from.is_empty() {
+                break;
+            }
+            state = splitmix64(state);
+            let candidate = from[(state % from.len() as u64) as usize];
+            if !usable(candidate.idx) || negatives.iter().any(|&(idx, _)| idx == candidate.idx) {
+                continue;
+            }
+            negatives.push((candidate.idx, candidate.fzf));
+            drawn += 1;
         }
-        state = splitmix64(state);
-        let candidate = pool[(state % pool.len() as u64) as usize];
-        if !usable(candidate.idx) || negatives.iter().any(|&(idx, _)| idx == candidate.idx) {
-            continue;
-        }
-        negatives.push((candidate.idx, candidate.fzf));
-        random += 1;
-    }
+    };
+    draw(&pool, CMD_TRAIN_STAGE2_NEGATIVES, &mut negatives);
+    let rest = CMD_TRAIN_RANDOM_NEGATIVES - (negatives.len() - recent);
+    draw(&candidates, rest, &mut negatives);
     if negatives.is_empty() {
         return None;
     }

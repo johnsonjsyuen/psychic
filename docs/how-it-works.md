@@ -2957,9 +2957,10 @@ replaying everything recorded in time order into an empty `CommandIndex`
 through its mutators. Before each run is applied, a run of a command that ran
 before becomes a group: a synthetic query (the first 0, 1, 2 or 3 characters
 of its text, 40/20/20/20%, chosen by a seeded splitmix64 hash of the run id),
-the command as the positive, and 30 random negatives drawn from the rows
+the command as the positive, and 30 random negatives: 20 from the rows
 serving's model would score for that query there (fzf's top 2,000 and the
-directory's 100 most-run matches, `rank::stage2_rows`), each row's 25
+directory's 100 most-run matches, `rank::stage2_rows`), 10 from every match,
+each row's 25
 features computed by the same `features::compute_all` serving uses (so
 train/serve skew would have to be in the index, and an integration test
 compares a replayed index with a loaded one feature by feature, bit for bit).

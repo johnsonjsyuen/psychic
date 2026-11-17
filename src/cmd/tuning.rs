@@ -118,8 +118,12 @@ pub(super) const CMD_TRAIN_RECENT_NEGATIVES: usize = 0;
 /// Distinct recent commands examined to find them.
 pub(super) const CMD_TRAIN_RECENT_SCAN: usize = 500;
 
-/// Negatives drawn at random from all matching commands.
+/// Negatives drawn at random (03-learn.md section 5.2).
 pub(super) const CMD_TRAIN_RANDOM_NEGATIVES: usize = 30;
+
+/// Of those, drawn from the rows serving's model scores for the query; the
+/// rest from every matching command.
+pub(super) const CMD_TRAIN_STAGE2_NEGATIVES: usize = 20;
 
 /// Draws allowed to find them.
 pub(super) const CMD_TRAIN_RANDOM_TRIES: usize = 200;
@@ -183,6 +187,7 @@ pub(super) fn snapshot() -> serde_json::Map<String, serde_json::Value> {
         CMD_TRAIN_RECENT_NEGATIVES,
         CMD_TRAIN_RECENT_SCAN,
         CMD_TRAIN_RANDOM_NEGATIVES,
+        CMD_TRAIN_STAGE2_NEGATIVES,
         CMD_TRAIN_RANDOM_TRIES,
         CMD_NEVER_SECS_LOG,
         CMD_FAIL_RECENT_SECS,

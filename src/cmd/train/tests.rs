@@ -1053,12 +1053,13 @@ fn a_quarter_of_non_empty_training_queries_are_fragments() {
 }
 
 #[test]
-fn tc_l_21_negatives_come_from_the_rows_serving_scores() {
+fn tc_l_21_most_negatives_come_from_the_rows_serving_scores() {
     // 2,100 commands run once each, oldest first, in no known directory but
     // the 50 oldest, which ran in /w; then the oldest again, in /w. Serving's
     // model scores fzf's top CMD_STAGE2_K (every "g" match ties, so the
     // newest: idx >= 100) and the directory's most-run matches (idx 0-49;
-    // idx 0 is the positive), never idx 50-99. Every negative is one of those.
+    // idx 0 is the positive), never idx 50-99. CMD_TRAIN_STAGE2_NEGATIVES of
+    // the negatives are drawn from those rows, the rest from every match.
     let total = crate::cmd::tuning::CMD_STAGE2_K as i64 + 100;
     let commands = git_commands(total);
     let mut replayer = Replayer::new(&commands);
@@ -1071,7 +1072,7 @@ fn tc_l_21_negatives_come_from_the_rows_serving_scores() {
     }
     let again = run(total + 1, 1, T0 + total + 10);
     for query in ["", "g"] {
-        let mut from_dir = false;
+        let (mut from_dir, mut outside) = (false, false);
         for seed in 1..=10 {
             let group = build_run_group(&replayer, &again, query, seed).unwrap();
             let negatives: Vec<u32> = group
@@ -1081,12 +1082,18 @@ fn tc_l_21_negatives_come_from_the_rows_serving_scores() {
                 .map(|row| row.idx)
                 .collect();
             assert_eq!(negatives.len(), CMD_TRAIN_RANDOM_NEGATIVES);
+            let scored = negatives
+                .iter()
+                .filter(|&&idx| !(50..100).contains(&idx))
+                .count();
             assert!(
-                negatives.iter().all(|&idx| !(50..100).contains(&idx)),
+                scored >= CMD_TRAIN_STAGE2_NEGATIVES,
                 "{query:?}: {negatives:?}"
             );
             from_dir |= negatives.iter().any(|&idx| idx < 50);
+            outside |= negatives.iter().any(|&idx| (50..100).contains(&idx));
         }
-        assert!(from_dir, "{query:?}: the directory's rows are drawn too");
+        assert!(from_dir, "{query:?}: the directory's rows are drawn");
+        assert!(outside, "{query:?}: and rows serving never scores");
     }
 }
