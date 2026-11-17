@@ -232,10 +232,10 @@ pub(super) fn in_scope(index: &CommandIndex, ctx: &RankContext, scope: Scope, id
 /// each with fzf's score (0 for the empty query).
 /// `base`: the idx list to test, ascending; `None` = every entry.
 ///
-/// Each command is tested by its byte classes first (one array, no text
-/// read), then its scope, then whether its text holds each term's bytes in
-/// order, and only then matched and scored by fzf: the prefilter rejects
-/// only what fzf would ([`fuzzy::Pattern::may_match`]).
+/// Each command is tested for being live, then for its scope, then by
+/// [`fuzzy::Pattern::test`]: its byte classes (one array, no text read),
+/// the query's bytes in order (Skim's rule, exact on an ASCII text; Skim
+/// itself decides a non-ASCII one), then fzf's score.
 pub(super) fn filter_candidates(
     index: &CommandIndex,
     ctx: &RankContext,

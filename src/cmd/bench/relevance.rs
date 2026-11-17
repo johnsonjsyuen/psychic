@@ -3,7 +3,7 @@
 //!
 //! Everything that decides an order is production code (ADR-16): the
 //! replay and the training set (`train::build_training_set`), the fit
-//! (`training::fit_seeded`), the model files and their loader
+//! (`train::fit_command_model`), the model files and their loader
 //! (`CmdModelStats::from_fit`, `CmdModel::load`), the filter
 //! (`worker::filter_candidates`) and the ranking (`rank::rank_commands`).
 //! The only orders defined here are the two baselines of section 5.3.
@@ -66,7 +66,7 @@ const FILE_REFERENCE: &str = "file search on its own benchmark: top-1 0.7960, MR
                               (different task; see 00-blueprint.md section 2)";
 /// What a rank is when the target did not match its own prefix.
 const NOT_MATCHED: u32 = u32::MAX;
-/// How `training::fit_seeded` says a time split left a part empty.
+/// How `training::fit_capped` says a time split left a part empty.
 const NOT_ENOUGH_FOR_A_SPLIT: &str = "every split needs rows";
 
 // ---------------------------------------------------------------------------
@@ -257,7 +257,7 @@ impl Ranked for CommandCandidate {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SkimScored {
     pub idx: u32,
-    /// `fuzzy::skim_score`: 0 where Skim does not match a command fzf did.
+    /// `fuzzy::skim_score` (every candidate matches by Skim's rule).
     pub skim: i64,
 }
 

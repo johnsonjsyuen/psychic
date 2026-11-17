@@ -2911,15 +2911,23 @@ command) split by id over four connections that each build their entries, R2-R8
 commands and what followed them, this session's commands, 30 days of picks) on
 a fifth, every one memory-mapped (`PRAGMA mmap_size`; the only connections in
 psychic that are), while the rayon pool starts and warms the matcher. After
-that no SQL runs per keystroke. A query is a `SkimMatcherV2` filter over the
-index (rayon from 2,000 candidates, and only with a query), then the heuristic
-`(1.0*recency + 0.5*dir + 0.2*repo + 0.6*fuzzy) / 2.3` with recency
-`1/(1 + age/3600)` and dir/repo the share of the command's runs made there,
-damped below 10 runs; ties go to the newer run, then the larger id. Only the
-first page is sorted (`select_nth` over 32-byte keys, then a sort of 200); the
-rest is sorted if a page reaches it. Typing a longer query re-matches only the
-matches of its longest prefix typed before; deleting back to a query reuses
-its matches, and the empty query's ranking is kept per scope until a delete.
+that no SQL runs per keystroke. A query is one pass over the index (rayon from 2,000 candidates,
+and only with a query; `src/cmd/fuzzy.rs`): a 64-bit mask of the byte
+classes each text holds rejects most commands unread; a command matches by
+Skim's rule (the whole query in order, ASCII smart case), which on an ASCII
+text is just an in-order byte scan, so Skim's matcher runs only on non-ASCII
+texts; and the same pass attaches fzf's `--scheme=history` score
+(`src/cmd/fzf.rs`, ASCII texts read as bytes). The cold-start order is that
+score, ties newest first (fzf's own Ctrl-R order); the model re-scores the
+first 2,000 of it. Only the first page is sorted (`select_nth` over 32-byte
+keys, then a sort of 200); the rest is sorted if a page reaches it. Matching
+happens in scope All and a scope keeps its own commands afterwards, so
+typing a longer query re-matches only the matches of its longest prefix
+typed before in any scope; deleting back to a query reuses its matches;
+while idle after start the worker precomputes the matches of each letter
+a-z, a slice of 8,192 commands at a time, so the first letter of a search
+costs no pass; and the empty query's ranking is kept per scope until a
+delete.
 One `cmd_query` TIMING line per query, after the answer, numbers only. The UI
 thread shows rank, a red `!` for a failed last run, `*` for "run here", the
 command (newlines as `↵`, control characters made safe) and its age; a preview

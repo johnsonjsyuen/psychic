@@ -541,7 +541,10 @@ before every Ctrl-R, and it keeps the write-ahead log within
 Without it (until 2026-11-17) the pickers' own impression rows grew the log
 without bound, 45 MB on the perf DB, and every start paid for rebuilding
 the log's index in its first connection (13-20 ms, measured): a cost no
-user sees, inside B3.
+user sees, inside B3. The recorded runs stay in the perf DB (session
+`bench`, never the context's session; 50 texts at most), so later modes
+on the same DB see them as the newest runs; `setup` again before comparing
+two commits.
 
 | Reported (p50, p95) | From |
 |---|---|

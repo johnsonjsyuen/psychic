@@ -11,7 +11,8 @@
 //! - every Ctrl-R pick is a group of the impressions of its picker process,
 //!   the picked command as the positive (section 5.3).
 //!
-//! The fit is the file model's (`crate::training::fit_seeded`); the files it
+//! The fit is the file model's (`crate::training::fit_capped` through
+//! `fit_command_model`, at most `CMD_MODEL_MAX_TREES` trees); the files it
 //! writes are `cmd_model.txt` and `cmd_model_stats.json`. Training runs in a
 //! detached child process the picker starts at most once an hour (ADR-10),
 //! or in the foreground with `psychic history --retrain`.

@@ -327,10 +327,9 @@ the query has an ASCII upper-case letter (Skim folds ASCII case only,
 the ranking orders by; nothing scores a candidate a second time
 (`CommandCandidate { idx, fzf }`). Every Skim match is an fzf match: each
 space-separated fzf term lies inside the whole query's alignment, and a term
-fzf treats as case-sensitive was matched exactly. The one exception is a
-query with a non-ASCII upper-case letter and ASCII lower-case ones (fzf's
-smart case then compares case, Skim's does not); such a command keeps
-`fzf = NO_FZF_MATCH`, below every other match. fzf's own matching (terms in
+fzf treats as case-sensitive was matched exactly. The exceptions: a term with a non-ASCII character whose lower case differs from it (an upper-case or title-case letter: fzf then compares that term's case, Skim does not) or a TAB (fzf reads it as a space); such a command keeps
+`fzf = NO_FZF_MATCH`, below every other match (found by review; the random
+test's alphabet covers upper case, the code handles all three). fzf's own matching (terms in
 any order, a trailing space ignored) was measured as the filter and
 rejected: the training sets it implies cost the model 0.012 top-1 at two
 characters and tripled the seed spread (results.md, 2026-11-17 merge
@@ -502,9 +501,8 @@ The filter (section 6.3) decides which commands match, by Skim's rule, and
 computes this score in the same pass; `rank.rs` never scores again. Every
 command the filter keeps is an fzf match (Skim's matches are a subset of
 fzf's: a multi-term query's terms all lie inside the whole query's
-alignment), except for a query whose smart case differs between the two (a
-non-ASCII upper-case letter: fzf compares case, Skim does not); such a
-command gets `NO_FZF_MATCH = -1`, below every match. Normalisation is not
+alignment), except for a term with a non-ASCII character whose lower case differs from it (an upper-case or title-case letter: fzf then compares that term's case, Skim does not) or a TAB (fzf reads it as a space); such a command gets `NO_FZF_MATCH = -1`, below
+every match. Normalisation is not
 adopted (above), so accented letters do not differ.
 
 **Speed (2026-11-17, at the merge with the speed work).** An ASCII text is
@@ -1093,7 +1091,7 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 | TC-B-20 | empty-query cache | `""`, `c1`, `""` on 230 commands; `GetRows` past 200; delete | The second `""` answers with the same `Arc` (no ranking); the page past the head is in rank order and the cache holds the sorted copy; a delete empties the cache | - |
 | TC-B-22 | `fzf.rs` | fzf's `TestFuzzyMatch` vectors (default scheme, V1 and V2, 20 matches and 3 non-matches); the history scheme on `git status` / `tig git` / `tig/git` for `gi`; extended-search splitting and smart case; a 60,000-character text; 17 queries over a 12-line list | The scores of fzf's tests; equal history-scheme scores (48 each), default 10 > 9; the V1 fallback's score; the orders the fzf 0.74.5 binary printed (`src/cmd/fzf/expected.rs`) | An ignored test writes this module's orders for a list and queries, to diff against `fzf --filter` (section 7.1) |
 | TC-B-21 | id split | `split_ids` of `1..=10` in 4, `5..=6` in 4, `i64::MIN..=i64::MAX` in 4 | `[1-3, 4-6, 7-9, 10]`; `[5, 6]`; 4 contiguous parts covering both ends | - |
-| TC-B-23 | match and score in one pass (`fuzzy.rs`) | 300,000 random texts and queries over ASCII case pairs, shared mask bits, multi-byte characters (the Kelvin sign, `İ`, `é`), spaces and backslashes; 200,000 ASCII-only pairs | `Pattern::test` keeps exactly what `SkimMatcherV2` matches, with fzf's score; on ASCII texts the byte scan alone equals Skim | A non-ASCII upper-case query letter: fzf may not match, `NO_FZF_MATCH` |
+| TC-B-23 | match and score in one pass (`fuzzy.rs`) | 300,000 random texts and queries over ASCII case pairs, shared mask bits, multi-byte characters (the Kelvin sign, `İ`, `é`), spaces and backslashes; 200,000 ASCII-only pairs | `Pattern::test` keeps exactly what `SkimMatcherV2` matches, with fzf's score; on ASCII texts the byte scan alone equals Skim | A non-ASCII query character whose lower case differs, or a TAB: fzf may not match, `NO_FZF_MATCH` |
 | TC-B-24 | fzf's byte path (`fzf.rs`) | 100,000 random ASCII texts and patterns, both schemes, both cases; 50,000 one-character patterns | Byte and `char` paths give the same scores; the one-character path equals full V2 | Non-ASCII text decoded; a non-ASCII term matches no ASCII text |
 | TC-B-25 | seeds in slices | `2 * SEED_SLICE + 100` commands | One idle step tests one slice; a query between slices is answered in full and leaves the seed where it was; three steps finish it, equal to a fresh filter; a delete drops the seed in progress | - |
 | TC-B-26 | a scope's `recency_rank` | Trained fixture, scope Directory, queries `""`, `g`, `m`, `c`, `ls` | Every model-scored row's `recency_rank` counts newer commands among the `All` matches; at least one differs from a count among the scope's | - |

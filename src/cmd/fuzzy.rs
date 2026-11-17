@@ -6,10 +6,12 @@
 //! the model was built on): the whole query, spaces included, is a
 //! subsequence of the text, ASCII case ignored unless the query has an
 //! ASCII upper-case letter. **The score** the ranking orders by is fzf's
-//! (`super::fzf::FzfQuery`, `--scheme=history`). Every Skim match is an fzf
+//! (`super::fzf::FzfQuery`, `--scheme=history`). A Skim match is an fzf
 //! match (each space-separated term of the query lies inside the whole
-//! query's alignment), so the two never disagree on a command the filter
-//! keeps.
+//! query's alignment), except for a query with a non-ASCII character whose
+//! lower case differs from it (fzf then compares that term's case, Skim
+//! does not) or with a TAB (fzf reads it as a space); such a command keeps
+//! `NO_FZF_MATCH`, below every match.
 //!
 //! One pass per command:
 //!
@@ -256,7 +258,7 @@ mod tests {
     /// (`İ`), escaped spaces, separators.
     const ALPHABET: &[char] = &[
         'a', 'b', 'A', 'B', 'g', 'G', 'k', 'K', '\u{212A}', 'i', 'İ', '1', '-', ' ', ' ', '/',
-        '\\', '^', ';', 'é', 'É', 'ß', 'ü', '☃', '\u{0}', '_',
+        '\\', '^', ';', 'é', 'É', 'ß', 'ü', '☃', '\u{0}', '_', '\t', 'ǅ',
     ];
 
     fn random_text(rng: &mut StdRng, max: usize) -> String {
@@ -287,7 +289,9 @@ mod tests {
                 // case sees a non-ASCII upper-case letter that Skim's does
                 // not: fzf is case-sensitive there, Skim is not.
                 let fzf = FzfQuery::new(&query).score(&text);
-                let exotic = query.chars().any(|c| !c.is_ascii() && c.is_uppercase());
+                let exotic = query
+                    .chars()
+                    .any(|c| c == '\t' || (!c.is_ascii() && !c.to_lowercase().eq([c])));
                 assert!(
                     Some(score) == fzf || (exotic && fzf.is_none() && score == NO_FZF_MATCH),
                     "{text:?} {query:?}"

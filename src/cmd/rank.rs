@@ -44,8 +44,10 @@ pub(super) struct HeuristicParts {
 }
 
 /// The `fzf_score` feature of a command fzf does not match: below every
-/// match. Serving never sees one (fzf decides the match); training can, for
-/// a logged impression of a command that no longer matches its query.
+/// match. The filter keeps a command by Skim's rule; fzf rejects a few of
+/// those (02 section 6.3: a non-ASCII character whose case differs, a TAB),
+/// and training can see one for a logged impression of a command that no
+/// longer matches its query.
 pub(super) const NO_FZF_MATCH: i32 = -1;
 
 /// One ranked command.
