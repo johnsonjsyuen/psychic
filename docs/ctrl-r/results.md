@@ -5,6 +5,940 @@ entry first; one entry per benchmark run used for a decision. Targets are
 defined in [00-blueprint.md section 2](00-blueprint.md#2-success-metrics).
 Every figure below is an aggregate; no command or query text.
 
+## 2026-11-17 - be20d21 - fzf's order as the cold start; model sampler, features and query mix (kept)
+
+The changes, each measured on its own first (variants below), then together:
+
+The code measured is be20d21 (a3f25a5 plus the review fixes).
+
+1. **Cold start = fzf's Ctrl-R order.** Without a model the ranking is now
+   fzf's own (`--scheme=history`: fzf's match score, ties newest first;
+   newest first for an empty query), from a reimplementation of fzf v0.74.5
+   (`src/cmd/fzf.rs`, [02 section 7](02-browse.md#7-heuristic-ranking)). It
+   replaces the hand-weighted heuristic. In stage 2 the model now scores
+   fzf's top `CMD_STAGE2_K`.
+2. **Model features 24-25**: `fzf_score`, beside the Skim `fuzzy_score`
+   (measured in place of it too: variant B), and `recency_rank` (newer
+   matching commands, capped at 15).
+3. **Training negatives**: 30 uniform random matching commands, no fixed
+   "15 most recent" ones (`CMD_TRAIN_RECENT_NEGATIVES` 15 -> 0,
+   `CMD_TRAIN_RANDOM_NEGATIVES` 15 -> 30); for the empty query drawn from
+   the `CMD_STAGE2_K` newest commands, the rows stage 1 gives the model.
+4. **Training queries**: 25% of the non-empty ones are a fragment of a later
+   word (`CMD_TRAIN_FRAGMENT_SHARE` 25), the rest prefixes as before.
+5. **Benchmark**: a second query style (fragments of a later word, lengths
+   1, 2, 3, 5), a true-fzf row, stage-1 recall, and a Bayes ceiling for the
+   synthetic generator ([04 section 5](04-bench.md#5-relevance-benchmark)).
+   Prefix stays the headline and the verdicts read it only.
+6. A model with an older feature list is refused (heuristic ranking) and
+   retrained at the next picker start instead of after the hour's interval.
+
+Corpora: synthetic only. Tuned on generator seed 1 (interactive 50k and 2k,
+repetitive 50k and 2k, agent 5k); confirmed on seed 7 (same sizes and
+profiles), which was not looked at while tuning. The two small real corpora
+(`cmd-real`, 500 imported runs; `cmd-agent`, agent transcripts) lived in
+`/tmp`, which a reboot cleared; they could not be rebuilt and their rows
+were not re-run (they decided nothing before either). "Before" is the
+parent commit's ranking measured by this commit's benchmark (the benchmark
+change alone, built in a separate worktree), so both columns have the same
+rows, query styles and lookups. Seeds 5; the tuning corpora with `--folds`.
+The relevance runs shared the machine with other benchmark jobs (load
+50-150), which changes run time, not results (the benchmark is
+deterministic per seed).
+
+### What fzf does, and what was adopted
+
+Read from fzf v0.74.5 (commit `c0a193e`): `src/algo/algo.go`
+(`FuzzyMatchV2`, `FuzzyMatchV1`, `calculateScore`, `Init`), `src/pattern.go`
+(`BuildPattern`, `parseTerms`, `extendedMatch`), `src/options.go`
+(`parseScheme`), `src/result.go`, `src/core.go` and
+`shell/key-bindings.{zsh,bash,fish}`.
+
+| fzf | Adopted |
+|---|---|
+| Ctrl-R widgets: history newest first, duplicates removed keeping the newest, `--scheme=history`, the typed buffer as the query, `ctrl-r` toggles sorting | The order: the index holds distinct commands; sorted by score, ties newest first; an empty query lists newest first. The sort toggle is not a picker feature (out of scope) |
+| `--scheme=history`: sort criteria `[byScore]` only; ties keep the input order | Yes: ties by `last_run_at`, then `db_id` |
+| Score: `FuzzyMatchV2` (16 per character, gaps -3/-1, boundary 8, non-word 8, camel/digit 7, consecutive at least 4 and carrying the chunk's first bonus, first character's bonus doubled); history scheme makes the start of the text and a word after whitespace or `/,:;\|` all 8 (default scheme: 10 and 9) | Yes, exactly; checked against fzf's own score vectors and the binary |
+| V1 fallback for long texts (`chars * pattern chars > 100 * 1024`) | Yes |
+| Extended search: space-separated terms, all must match, scores summed, smart case per term, `\ ` a literal space | Yes, for fuzzy terms |
+| Extended operators `'exact`, `^prefix`, `suffix$`, `!not`, `\|` | No: they change which commands match, and matching is the worker's filter (Skim), which the speed work keeps as it is. Recommendation below |
+| Latin normalisation (`é` = `e`) | No, for the same reason (the filter does not normalise) |
+
+Where Skim (the filter and the old `fzf_scored` row) and fzf differ: Skim
+gives the first character of the text 16 more than any later word start
+(fzf history: equal); Skim matches a multi-word query as one subsequence
+with the spaces, fzf as independent terms in any order (Skim's matches are
+a subset); Skim does not normalise. On prefix queries that Skim bias is
+worth 0.12 top-1 at length 1 (0.518 vs fzf 0.395 on interactive 50k); on
+fragment queries it costs 0.27 (0.058 vs 0.324 at length 2).
+
+Recommendation (not done; needs the worker's filter): make the candidate
+filter fzf's too (extended operators, normalisation, terms in any order).
+The merge with the speed work must reconcile: `rank.rs` scores every
+candidate with `FzfQuery` (one more pass of a DP matcher over the
+candidates, measured below); the worker still filters with Skim and passes
+`CommandCandidate { idx, fuzzy_score }` unchanged; `CommandRanking` and
+`HeuristicParts` changed shape (`HeuristicParts { recency, fzf }`), which
+`worker.rs` only copies, and `render.rs` shows; `rank_with` now returns
+the newest candidates to the model stage internally (no worker-visible
+change). If the filter switched to fzf, `rank.rs` could take the fzf score
+from the filter instead of computing it again.
+
+### Headline (interactive 50,000 / 500,000, holdout, prefix queries, top-1; model mean ±sd over 5 seeds)
+
+| holdout | recency | fzf_scored (Skim) | fzf | heuristic before | heuristic after (= fzf) | model before | model after |
+|---|---|---|---|---|---|---|---|
+| gt10min len2 top-1 | 0.236 | 0.448 | 0.435 | 0.184 | 0.435 | 0.432 ±0.015 | 0.530 ±0.007 |
+| all len0 top-1 | 0.065 | 0.065 | 0.065 | 0.065 | 0.065 | 0.154 ±0.010 | 0.151 ±0.009 |
+| all len0 top-10 | 0.528 | 0.528 | 0.528 | 0.419 | 0.528 | 0.340 ±0.038 | 0.592 |
+| all len1 top-1 | 0.220 | 0.518 | 0.395 | 0.237 | 0.395 | 0.510 ±0.013 | 0.533 ±0.011 |
+| all len2 top-1 | 0.415 | 0.612 | 0.599 | 0.380 | 0.599 | 0.575 ±0.012 | 0.635 ±0.006 |
+| all len3 top-1 | 0.507 | 0.623 | 0.621 | 0.427 | 0.621 | 0.587 ±0.014 | 0.648 ±0.009 |
+| all len2 MRR | 0.527 | 0.684 | 0.671 | 0.493 | 0.671 | 0.657 ±0.009 | 0.736 ±0.004 |
+| other_dir len2 top-1 | 0.157 | 0.354 | 0.345 | 0.124 | 0.345 | 0.319 ±0.023 | 0.447 ±0.016 |
+| all, fragment len2 top-1 | 0.251 | 0.058 | 0.324 | 0.229 | 0.324 | 0.008 ±0.003 | 0.265 ±0.008 |
+
+R1 +0.295 PASS (was +0.196) | R2 +0.085 PASS (was +0.080) | R3 +0.000 PASS (was -0.262 FAIL) | unreachable 0.099
+B1 not re-measured in the pty (see "Cost"); `latency` total p95 6.9-7.8 ms (was 4.4-5.1) | B6 10.6 s PASS (was 4.6 s) | B8 0.9815 / 1.0000 PASS (was 1.0000 / 1.0000)
+Synthetic guard (repetitive 50k): R2 -0.003 PASS (was -0.030 FAIL), R3 +0.000 PASS (was -0.230 FAIL).
+Decision: kept. Thresholds of 04 section 7.3: the model's target cell (gt10min len2 top-1) moved +0.098 against a threshold of max(0.01, 2*sqrt(0.015^2/5 + 0.007^2/5)) = 0.015.
+
+R3 cannot be positive any more: with an empty query the heuristic is
+newest-first, which is the baseline, so R3's worst cell is 0.000 by
+construction. The verdicts on every corpus:
+
+| Corpus | R1 before -> after | R2 before -> after | R3 before -> after |
+|---|---|---|---|
+| interactive 50k | +0.196 PASS -> +0.295 PASS | +0.080 PASS -> +0.085 PASS | -0.262 FAIL -> +0.000 PASS |
+| interactive 2k | +0.365 PASS -> +0.349 PASS | +0.088 PASS -> +0.094 PASS | -0.110 FAIL -> +0.000 PASS |
+| repetitive 50k | +0.116 PASS -> +0.169 PASS | -0.030 FAIL -> -0.003 PASS | -0.230 FAIL -> +0.000 PASS |
+| repetitive 2k | +0.283 PASS -> +0.244 PASS | -0.023 FAIL -> -0.004 PASS | -0.218 FAIL -> +0.000 PASS |
+| agent 5k | +0.030 FAIL -> +0.058 FAIL | +0.029 PASS -> +0.053 PASS | +0.001 PASS -> +0.000 PASS |
+
+The targets of the task, checked:
+
+| Target | Result |
+|---|---|
+| Cold start >= max(recency, fzf_scored) - 1 point on every headline cell | Met against recency and true fzf everywhere (it is fzf). Not met against `fzf_scored` on prefix queries of length 1 (interactive 50k 0.395 vs 0.518; 2k 0.424 vs 0.549): that row is Skim's score, whose bonus for the first character of the text is exactly what a prefix query rewards; on fragment queries the same row is 0.27 below fzf (0.058 vs 0.324 at length 2). Pure fzf was the instruction once the user asked for fzf; each psychic signal added as a tie-break lost to it somewhere (below). On the agent corpus the old heuristic was better (top-1 0.043 vs 0.000 at every prefix length): every agent command starts `cd /synth/repoN &&`, so a 1-3 character prefix is uninformative and only the old directory term separated them |
+| Model >= every baseline on every headline cell of the interactive corpora | Met on prefix `all` and `gt10min`, lengths 0-3, top-1/top-10/MRR, on interactive 50k and 2k and on both held-out interactive corpora (the closest: 50k length 1 top-1 0.533 vs `fzf_scored` 0.518, seed 7 0.529 vs 0.508) |
+| R2 on the repetitive corpora | PASS: length 0 top-1 within 0.4 point of recency (50k 0.509 vs 0.512; 2k 0.513 vs 0.517; seed 7: 50k 0.508 vs 0.511, 2k -0.9 point). Recency is at the Bayes ceiling there (0.502-0.519), so tying it is the best possible |
+| Length 0 on the interactive corpus: top-10 above recency | Met: 0.592 vs 0.528 (was 0.340) |
+| Approach file search (top-1 0.80, MRR 0.87) | Not reached and not reachable on these corpora: the Bayes ceiling of interactive 50k at length 2 is top-1 0.72, MRR 0.80 (below) |
+| Fragment queries | The model is far better than before (length 2: 0.008 -> 0.265) but still below its own cold start, fzf, at lengths 1-3 on interactive 50k (0.096 / 0.265 / 0.275 vs 0.261 / 0.324 / 0.329) and at length 1 on every corpus; equal at length 5 (0.381 vs 0.417 at 50k; 0.472 vs 0.450 at 2k). Loading a model makes short fragment queries worse than no model |
+
+### Ceiling: how good could any ranker be on these corpora
+
+Bayes ceiling (`src/cmd/corpus/ceiling.rs`, [04 section 5.5](04-bench.md#55-metrics-and-verdicts)):
+the generator's own probability of each next command given its exact
+state, ranked among commands with the query's first characters; about
+1,800 reused runs of the last 20%. Prefix queries; top-1 / MRR.
+
+| Corpus (seed 1) | len 0 | len 1 | len 2 | len 3 | model after, len 2 top-1 |
+|---|---|---|---|---|---|
+| interactive 50k | 0.207 / 0.344 | 0.629 / 0.723 | 0.724 / 0.804 | 0.741 / 0.816 | 0.635 |
+| interactive 2k | 0.184 / 0.344 | 0.666 / 0.784 | 0.791 / 0.873 | 0.812 / 0.888 | 0.731 |
+| repetitive 50k | 0.502 / 0.569 | 0.677 / 0.725 | 0.717 / 0.764 | 0.721 / 0.769 | see tables |
+| repetitive 2k | 0.519 / 0.598 | 0.741 / 0.807 | 0.805 / 0.860 | 0.809 / 0.864 | 0.718 |
+| agent 5k | 0.106 / 0.195 at every length | | | | 0.083 |
+
+Seed 7 is within 0.03 of these (interactive 50k len 2: 0.700 / 0.784).
+So on interactive 50k at two characters the model is 0.09 below the best
+possible (0.635 vs 0.724), and the best possible is itself 0.08 below file
+search's 0.80: picking the next of 50,000 commands from two characters is
+a harder problem than file search's benchmark, and no ranker over this
+history closes that. Other limits found:
+
+- Stage-1 recall: the model scores only fzf's first 2,000 rows. The target
+  is outside them in 13% of empty-query lookups (it was last run before the
+  2,000 newest) and 5% at one character on interactive 50k (the old
+  heuristic, which weighted frequency and directory, lost 0.4% there); 13%
+  at one-character fragments. Every one of those is a miss for the model.
+  `CMD_STAGE2_K` or a second stage-1 source (the most frequent matching
+  commands) is the lever; not tried (cost, below).
+- A third information row, "how often is the target's feature vector
+  identical to another stage-2 row's", was 1.000 on every cell: the last
+  run time alone separates all commands, so the features never tie and the
+  gap is in the ranking function and the noise, not in indistinguishable
+  candidates. The row was removed.
+
+### What each change contributed (interactive 50k / 2k, model top-1, prefix unless noted)
+
+Variants, measured on the holdout split, 5 seeds; "before" is the parent.
+Columns: prefix length 0 top-1 and top-10, lengths 1-3 top-1, `gt10min`
+and `other_dir` at length 2, fragments of length 2 and 5.
+
+| variant | corpus | p0 top1 | p0 top10 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f2 | f5 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baselines recency / fzf_scored / fzf | i50k | 0.065/0.065/0.065 | 0.528/0.528/0.528 | 0.220/0.518/0.395 | 0.415/0.612/0.599 | 0.507/0.623/0.621 | 0.236/0.448/0.435 | 0.157/0.354/0.345 | 0.251/0.058/0.324 | 0.361/0.414/0.417 |
+| before: parent | i50k | 0.154 | 0.340 | 0.510 | 0.575 | 0.587 | 0.432 | 0.319 | 0.008 | 0.096 |
+| A: fzf cold start + fzf_score | i50k | 0.160 | 0.411 | 0.521 | 0.581 | 0.593 | 0.441 | 0.328 | 0.088 | 0.107 |
+| B: A, Skim score zeroed | i50k | 0.152 | 0.403 | 0.520 | 0.587 | 0.598 | 0.448 | 0.336 | 0.090 | 0.111 |
+| D: A + 50% fragments | i50k | 0.153 | 0.413 | 0.505 | 0.585 | 0.600 | 0.484 | 0.391 | 0.219 | 0.311 |
+| J: A + recency_rank + uniform negatives | i50k | 0.118 | 0.538 | 0.524 | 0.629 | 0.649 | 0.520 | 0.442 | 0.206 | 0.319 |
+| K: J + 50% fragments | i50k | 0.116 | 0.543 | 0.483 | 0.616 | 0.638 | 0.516 | 0.433 | 0.247 | 0.383 |
+| L: D + hard negatives | i50k | 0.153 | 0.419 | 0.509 | 0.597 | 0.613 | 0.496 | 0.388 | 0.231 | 0.325 |
+| M: J + 25% fragments | i50k | 0.121 | 0.545 | 0.513 | 0.627 | 0.646 | 0.520 | 0.440 | 0.280 | 0.408 |
+| N: M + empty-query negatives from the 2,000 newest (shipped) | i50k | 0.151 | 0.592 | 0.533 | 0.635 | 0.648 | 0.530 | 0.447 | 0.265 | 0.381 |
+| baselines recency / fzf_scored / fzf | ismall | 0.067/0.067/0.067 | 0.569/0.569/0.569 | 0.223/0.549/0.424 | 0.459/0.659/0.644 | 0.550/0.677/0.675 | 0.287/0.515/0.496 | 0.170/0.370/0.355 | 0.268/0.065/0.349 | 0.392/0.448/0.450 |
+| before: parent | ismall | 0.155 | 0.552 | 0.617 | 0.740 | 0.755 | 0.652 | 0.521 | 0.023 | 0.199 |
+| A: fzf cold start + fzf_score | ismall | 0.155 | 0.545 | 0.612 | 0.735 | 0.751 | 0.654 | 0.520 | 0.068 | 0.244 |
+| B: A, Skim score zeroed | ismall | 0.155 | 0.547 | 0.613 | 0.735 | 0.751 | 0.651 | 0.514 | 0.051 | 0.241 |
+| C: A + hard negatives | ismall | 0.157 | 0.543 | 0.616 | 0.736 | 0.753 | 0.650 | 0.515 | 0.043 | 0.216 |
+| D: A + 50% fragments | ismall | 0.156 | 0.546 | 0.590 | 0.723 | 0.739 | 0.643 | 0.512 | 0.334 | 0.460 |
+| H: A + recency_rank, recent negatives kept | ismall | 0.043 | 0.221 | 0.515 | 0.687 | 0.717 | 0.598 | 0.447 | 0.023 | 0.120 |
+| I: A + uniform negatives | ismall | 0.144 | 0.617 | 0.597 | 0.721 | 0.744 | 0.625 | 0.492 | 0.166 | 0.397 |
+| J: A + recency_rank + uniform negatives | ismall | 0.164 | 0.627 | 0.608 | 0.730 | 0.749 | 0.638 | 0.505 | 0.101 | 0.334 |
+| K: J + 50% fragments | ismall | 0.160 | 0.630 | 0.583 | 0.725 | 0.742 | 0.633 | 0.501 | 0.361 | 0.476 |
+| L: D + hard negatives | ismall | 0.147 | 0.545 | 0.593 | 0.724 | 0.742 | 0.643 | 0.501 | 0.342 | 0.466 |
+| M: J + 25% fragments | ismall | 0.159 | 0.626 | 0.598 | 0.725 | 0.742 | 0.631 | 0.499 | 0.330 | 0.471 |
+| N: M + empty-query negatives from the 2,000 newest (shipped) | ismall | 0.161 | 0.631 | 0.606 | 0.731 | 0.748 | 0.636 | 0.509 | 0.348 | 0.472 |
+
+- **A (fzf cold start + `fzf_score`)**: the cold start passes R3
+  everywhere; the model hardly moves (it is still trained on the biased
+  sampler). **B** (fzf score in place of Skim's): no difference beyond
+  noise (0.587 vs 0.581 at length 2), so `fzf_score` sits beside
+  `fuzzy_score` and both stay.
+- **C, L (hard negatives: the best fzf scores among recent matches)**: no
+  gain; rejected.
+- **H** exposed the real problem. With the 15 newest matching commands as
+  fixed negatives, `recency_rank` 0-14 was almost always a negative and
+  15-19 almost never (pos/neg histogram of 3,202 empty-query groups: rank 1
+  559/2,643, ranks 16-19 30-39 positive vs 33-54 negative), and the model
+  ranked those commands first: top-1 0.043. The same skew, smoothed, is in
+  every recency feature, which is why the model underrated recent commands
+  at 50,000 and lost to `fzf_scored`.
+- **I, J (uniform negatives)**: length-0 top-10 0.41 -> 0.54-0.62, lengths
+  2-3 +0.05 at 50k, `gt10min` +0.08, `other_dir` +0.11; length-0 top-1
+  fell (0.160 -> 0.118), fixed by **N**: for the empty query the negatives
+  come from the 2,000 newest, the rows stage 1 actually hands the model
+  (top-1 0.151, top-10 0.592, MRR 0.288; lengths 1-2 +0.01-0.02 too).
+- **D, K, M (fragment training queries, 50 / 50 / 25%)**: fragments of
+  length 2 0.09 -> 0.22-0.28 at 50k; at 50% prefix length 1 lost 0.04
+  (0.483 vs 0.524), at 25% it is within noise of none. 25% shipped.
+- Rejected cold-start tie-breaks inside equal fzf scores (harness over all
+  five corpora, both styles, every cell of `all`/`gt10min`/`other_dir` x
+  lengths x 4 metrics, against pure fzf): all-time runs (weights 0.05, 0.2:
+  -0.09 / -0.17 at length 0 on repetitive 50k), runs in 30 days (-0.16),
+  directory share (-0.07 on interactive 50k), recency in this directory
+  (-0.006, the mildest), recency scale 900 s (-0.04). None ships.
+
+### Held-out generator seed (7; not looked at while tuning; holdout, 5 seeds, top-1)
+
+#### interactive 50,000 / 500,000, generator seed 7 (held out)
+
+| ranker | p0 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f1 | f2 | f3 | f5 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| recency | 0.062 | 0.217 | 0.408 | 0.489 | 0.243 | 0.131 | 0.165 | 0.255 | 0.304 | 0.359 |
+| fzf_scored (Skim) | 0.062 | 0.508 | 0.594 | 0.602 | 0.444 | 0.323 | 0.056 | 0.064 | 0.243 | 0.397 |
+| fzf = heuristic after | 0.062 | 0.389 | 0.581 | 0.608 | 0.431 | 0.307 | 0.250 | 0.329 | 0.334 | 0.397 |
+| heuristic before | 0.054 | 0.218 | 0.348 | 0.398 | 0.180 | 0.083 | 0.143 | 0.234 | 0.258 | 0.301 |
+| model before | 0.166 ±0.006 | 0.529 ±0.005 | 0.597 ±0.005 | 0.613 ±0.005 | 0.482 ±0.006 | 0.372 ±0.009 | 0.027 ±0.001 | 0.021 ±0.009 | 0.061 ±0.013 | 0.135 ±0.021 |
+| model after | 0.149 ±0.006 | 0.529 ±0.011 | 0.634 ±0.009 | 0.645 ±0.009 | 0.541 ±0.010 | 0.438 ±0.016 | 0.125 ±0.015 | 0.285 ±0.021 | 0.281 ±0.026 | 0.356 ±0.043 |
+
+top-1. Before: R1 +0.239 PASS | R2 +0.104 PASS | R3 -0.269 FAIL. After: R1 +0.298 PASS | R2 +0.087 PASS | R3 +0.000 PASS.
+
+#### interactive 2,000 / 20,000, generator seed 7 (held out)
+
+| ranker | p0 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f1 | f2 | f3 | f5 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| recency | 0.069 | 0.230 | 0.451 | 0.553 | 0.275 | 0.161 | 0.187 | 0.280 | 0.321 | 0.401 |
+| fzf_scored (Skim) | 0.069 | 0.559 | 0.662 | 0.674 | 0.518 | 0.350 | 0.053 | 0.066 | 0.278 | 0.459 |
+| fzf = heuristic after | 0.069 | 0.429 | 0.642 | 0.676 | 0.494 | 0.330 | 0.273 | 0.363 | 0.370 | 0.459 |
+| heuristic before | 0.072 | 0.292 | 0.478 | 0.572 | 0.326 | 0.204 | 0.200 | 0.285 | 0.334 | 0.420 |
+| model before | 0.175 ±0.004 | 0.622 ±0.005 | 0.737 ±0.005 | 0.760 ±0.003 | 0.643 ±0.006 | 0.478 ±0.003 | 0.032 ±0.001 | 0.019 ±0.004 | 0.092 ±0.012 | 0.220 ±0.012 |
+| model after | 0.164 ±0.008 | 0.608 ±0.007 | 0.736 ±0.008 | 0.758 ±0.008 | 0.644 ±0.012 | 0.490 ±0.020 | 0.149 ±0.018 | 0.365 ±0.017 | 0.382 ±0.012 | 0.471 ±0.009 |
+
+top-1. Before: R1 +0.369 PASS | R2 +0.106 PASS | R3 -0.127 FAIL. After: R1 +0.370 PASS | R2 +0.094 PASS | R3 +0.000 PASS.
+
+#### repetitive 50,000 / 500,000, generator seed 7 (held out)
+
+| ranker | p0 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f1 | f2 | f3 | f5 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| recency | 0.511 | 0.544 | 0.569 | 0.583 | 0.180 | 0.149 | 0.527 | 0.542 | 0.550 | 0.566 |
+| fzf_scored (Skim) | 0.511 | 0.579 | 0.592 | 0.581 | 0.215 | 0.184 | 0.051 | 0.074 | 0.451 | 0.577 |
+| fzf = heuristic after | 0.511 | 0.568 | 0.589 | 0.596 | 0.211 | 0.180 | 0.537 | 0.551 | 0.552 | 0.577 |
+| heuristic before | 0.286 | 0.489 | 0.538 | 0.561 | 0.170 | 0.138 | 0.331 | 0.413 | 0.434 | 0.509 |
+| model before | 0.480 ±0.002 | 0.592 ±0.006 | 0.621 ±0.005 | 0.624 ±0.006 | 0.291 ±0.009 | 0.201 ±0.006 | 0.038 ±0.001 | 0.011 ±0.006 | 0.212 ±0.021 | 0.336 ±0.005 |
+| model after | 0.508 ±0.002 | 0.595 ±0.007 | 0.644 ±0.003 | 0.652 ±0.002 | 0.333 ±0.010 | 0.280 ±0.003 | 0.522 ±0.018 | 0.563 ±0.003 | 0.567 ±0.002 | 0.615 ±0.007 |
+
+top-1. Before: R1 +0.110 PASS | R2 -0.031 FAIL | R3 -0.224 FAIL. After: R1 +0.153 PASS | R2 -0.003 PASS | R3 +0.000 PASS.
+
+#### repetitive 2,000 / 20,000, generator seed 7 (held out)
+
+| ranker | p0 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f1 | f2 | f3 | f5 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| recency | 0.507 | 0.554 | 0.594 | 0.624 | 0.200 | 0.163 | 0.525 | 0.541 | 0.559 | 0.595 |
+| fzf_scored (Skim) | 0.507 | 0.619 | 0.648 | 0.635 | 0.286 | 0.257 | 0.065 | 0.054 | 0.435 | 0.616 |
+| fzf = heuristic after | 0.507 | 0.595 | 0.645 | 0.656 | 0.282 | 0.252 | 0.543 | 0.562 | 0.564 | 0.616 |
+| heuristic before | 0.304 | 0.532 | 0.610 | 0.653 | 0.264 | 0.209 | 0.363 | 0.440 | 0.467 | 0.566 |
+| model before | 0.489 ±0.003 | 0.686 ±0.006 | 0.743 ±0.003 | 0.754 ±0.004 | 0.492 ±0.005 | 0.399 ±0.009 | 0.056 ±0.001 | 0.137 ±0.029 | 0.408 ±0.019 | 0.504 ±0.012 |
+| model after | 0.493 ±0.013 | 0.652 ±0.020 | 0.729 ±0.017 | 0.752 ±0.007 | 0.462 ±0.033 | 0.394 ±0.028 | 0.528 ±0.013 | 0.576 ±0.008 | 0.591 ±0.003 | 0.666 ±0.001 |
+
+top-1. Before: R1 +0.293 PASS | R2 -0.018 FAIL | R3 -0.203 FAIL. After: R1 +0.262 PASS | R2 -0.014 FAIL | R3 +0.000 PASS.
+
+#### agent 5,000 / 50,000, generator seed 7 (held out)
+
+| ranker | p0 | p1 | p2 | p3 | gt10min p2 | other_dir p2 | f1 | f2 | f3 | f5 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| recency | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.003 | 0.009 | 0.004 | 0.019 |
+| fzf_scored (Skim) | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.011 | 0.037 | 0.023 | 0.050 |
+| fzf = heuristic after | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.009 | 0.036 | 0.023 | 0.050 |
+| heuristic before | 0.046 | 0.046 | 0.046 | 0.046 | 0.017 | 0.000 | 0.051 | 0.068 | 0.056 | 0.081 |
+| model before | 0.050 ±0.014 | 0.051 ±0.015 | 0.051 ±0.015 | 0.047 ±0.020 | 0.040 ±0.014 | 0.005 ±0.003 | 0.052 ±0.015 | 0.059 ±0.017 | 0.053 ±0.021 | 0.066 ±0.024 |
+| model after | 0.085 ±0.005 | 0.086 ±0.004 | 0.084 ±0.005 | 0.084 ±0.005 | 0.059 ±0.008 | 0.004 ±0.003 | 0.095 ±0.004 | 0.113 ±0.006 | 0.112 ±0.006 | 0.123 ±0.006 |
+
+top-1. Before: R1 +0.040 FAIL | R2 +0.037 PASS | R3 -0.005 FAIL. After: R1 +0.059 FAIL | R2 +0.059 PASS | R3 +0.000 PASS.
+
+The held-out corpora agree with the tuning ones in every direction: on
+interactive 50k the model is above every baseline at prefix lengths 1-3
+(length 2: 0.634 vs `fzf_scored` 0.594), length 0 top-1 is a little lower
+than before (0.149 vs 0.166), fragments are far better than before and
+still below fzf at lengths 1-3.
+
+### Leakage controls
+
+| Check | Result |
+|---|---|
+| Shuffled labels, interactive 50k and 2k, 5 seeds | model top-1 0.012-0.025 at prefix lengths 0-3 on 50k (0.018-0.062 on 2k), far below every baseline: the gain is learned from labels |
+| Train-before-cut, own-run-not-in-index, replay = fresh load (IT-N-02, now also for `recency_rank`'s newest list and every feature) | pass (`cargo test`) |
+| Folds, interactive 50k, length 2 top-1, all / gt10min (recency, fzf_scored, heuristic, model) | fold60 0.401, 0.589, 0.568, 0.631 ±0.009 / 0.229, 0.433, 0.412, 0.529 ±0.003; fold70 0.412, 0.617, 0.602, 0.648 ±0.009 / 0.238, 0.470, 0.452, 0.558 ±0.009; fold80 0.405, 0.593, 0.577, 0.624 ±0.006 / 0.232, 0.434, 0.416, 0.512 ±0.004 (before: model 0.611 / 0.496, 0.624 / 0.514, 0.571 / 0.427) |
+
+### Cost (perf DB = interactive 50k, model pinned by `setup`; `latency 300`, twice each, alternating; machine load 20-28 from other jobs)
+
+| Stage, mean / p95 ms | before #1 | before #2 | after #1 | after #2 |
+|---|---|---|---|---|
+| filter | 1.54 / 3.03 | 1.62 / 3.59 | 1.69 / 3.75 | 1.86 / 4.19 |
+| heuristic (fzf scoring + select) | 0.32 / 0.92 | 0.35 / 0.96 | 0.80 / 1.65 | 0.89 / 2.07 |
+| features | 0.15 / 0.26 | 0.15 / 0.30 | 0.18 / 0.32 | 0.18 / 0.33 |
+| predict | 0.16 / 0.31 | 0.15 / 0.31 | 0.79 / 1.63 | 0.89 / 1.72 |
+| blend | 0.17 / 0.31 | 0.19 / 0.36 | 0.19 / 0.39 | 0.21 / 0.52 |
+| total (filter + rank) | 2.33 / 4.36 | 2.47 / 5.07 | 3.65 / 6.90 | 4.03 / 7.79 |
+| by length, total p50: len 0 / 1 / 2 | 1.70 / 3.67 / 2.56 | 1.67 / 3.53 / 2.50 | 2.97 / 5.41 / 4.11 | 3.58 / 6.42 / 4.37 |
+
+The rank stages cost about 1.3-1.5 ms more at the mean and 2.5-2.7 ms
+more at p95. Two causes: fzf's score over every candidate (+0.5 ms mean,
++0.7-1.1 ms p95; a second matcher pass after the filter's), and the
+model, which grew from 40 to 200 trees once the sampler stopped handing
+it easy negatives (early stopping keeps finding gains): predict +0.65 ms
+mean, +1.3-1.4 ms p95. The `latency` mode runs back to back on a warm
+pool; in the picker the worker took about twice these figures (Phase D),
+so B1 (8 ms p95, already 8.2-9.5 ms) is now further over and was not
+re-measured here (the speed work is changing the worker in parallel).
+Levers, not tried: a cap on the command model's trees (the relevance gain
+at 100 trees is unmeasured), `CMD_STAGE2_K` 1,000, fzf's one-character
+fast path and a byte prefilter before decoding a text, or one matcher pass
+if the filter becomes fzf's (recommendation above). Training: B6 4.6 ->
+10.6 s (budget 60 s), mostly `recency_rank`'s walk of the recency order
+for rare queries.
+
+### Review
+
+A reviewer agent (opus) read the diff of a3f25a5 and the evidence without
+being told the conclusions. Found and fixed: fzf sorts on the score as an
+unsigned 16-bit value, so negative V1 totals (long texts, long gaps) tie at
+0; the port now clamps the same way (test against the binary's order).
+The length-0 top-1 regression at 50k (0.154 -> 0.121): fixed by drawing
+empty-query negatives from the rows stage 1 hands the model (0.151).
+Pick groups recomputed the newest-matching walk per impression; once per
+query now. A stale comment. Found and left, stated in the specs:
+`recency_rank` is counted among the candidates, which the picker's
+Directory/Repository/Session scopes narrow, while training counts all
+matching commands (the worker would have to pass the scope or the
+all-scope count: a merge item for `worker.rs`); non-ASCII case-class
+edges of the port. Found and reported here: the fragment training
+queries use the same fragment rule as the benchmark (another salt), so
+the fragment cells measure the query distribution trained on, not
+generalisation to how people really type; `CMD_TRAIN_FRAGMENT_SHARE` was
+chosen on the holdout split (the held-out seed confirms the direction);
+the 2k corpora lost about 0.02 top-1 at prefix length 1 (interactive 0.617
+-> 0.606, repetitive 0.688 -> 0.641, the latter with sd 0.028); training
+queries are 0-3 characters, so `fzf_score` values of longer queries are
+outside what the trees saw.
+
+### What remains unproven
+
+- Every number is on synthetic histories. The generator's process is known,
+  which is what makes the Bayes ceiling possible and also what a model can
+  learn too well; the held-out seed checks overfitting to one draw, not to
+  the generator. The real sample (500 imported lines) and the agent
+  transcripts could not be re-run (cleared with `/tmp`).
+- No corpus has a Ctrl-R pick: pick groups, pick features and
+  `CMD_PICK_WEIGHT` are untested by the benchmark, and every label is "the
+  command run next" with a made-up query.
+- Real query style is unknown: prefix and word-start fragments are two
+  guesses; a real user also types substrings inside words and several words.
+- The fzf cold start matches fzf's own Ctrl-R order, which is a well-used
+  default, but no real user has compared it with the old heuristic.
+- B1/B2/B3 in the pty were not re-measured; the rank stages are slower.
+
+### How to re-run
+
+As in the first entry, plus: the fragment style and the `fzf` and
+`stage1_recall` rows are in every relevance run; the Bayes ceiling is
+`CEILING_PROFILE=interactive CEILING_COMMANDS=50000 CEILING_RUNS=500000
+CEILING_SEED=1 cargo test --release cmd::corpus::ceiling::bayes_ceiling --
+--ignored --nocapture` (seconds); the fzf check against the binary is the
+ignored test `cmd::fzf::tests::bulk_order_for_comparison_with_the_binary`
+(02 section 7.1). Times on this machine under load 50-150: interactive 50k
+holdout 9-14 min, with folds 33 min; 2k 4-9 min.
+
+### Relevance tables, tuning corpora (generator seed 1, holdout, 5 seeds; "before" = parent commit's ranking, same benchmark)
+
+#### interactive 50,000 / 500,000 (headline)
+
+50,000 commands, 500,000 runs; holdout 2,002 sampled of 90,053 reachable; seeds 5.
+
+`all`, prefix, top1 (n = 2002, 2002, 2002, 1975)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.065 | 0.220 | 0.415 | 0.507 |
+| fzf_scored (Skim) | 0.065 | 0.518 | 0.612 | 0.623 |
+| fzf (history scheme) | 0.065 | 0.395 | 0.599 | 0.621 |
+| heuristic before | 0.065 | 0.237 | 0.380 | 0.427 |
+| heuristic after (= fzf) | 0.065 | 0.395 | 0.599 | 0.621 |
+| model before | 0.154 ±0.010 | 0.510 ±0.013 | 0.575 ±0.012 | 0.587 ±0.014 |
+| model after | 0.151 ±0.009 | 0.533 ±0.011 | 0.635 ±0.006 | 0.648 ±0.009 |
+| stage-1 recall before | 0.883 | 0.996 | 1.000 | 1.000 |
+| stage-1 recall after | 0.867 | 0.946 | 0.995 | 0.997 |
+
+`all`, prefix, top10 (n = 2002, 2002, 2002, 1975)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.528 | 0.638 | 0.713 | 0.754 |
+| fzf_scored (Skim) | 0.528 | 0.763 | 0.800 | 0.795 |
+| fzf (history scheme) | 0.528 | 0.715 | 0.789 | 0.793 |
+| heuristic before | 0.419 | 0.617 | 0.704 | 0.742 |
+| heuristic after (= fzf) | 0.528 | 0.715 | 0.789 | 0.793 |
+| model before | 0.340 ±0.038 | 0.739 ±0.004 | 0.825 ±0.006 | 0.832 ±0.006 |
+| model after | 0.592 ±0.004 | 0.843 ±0.003 | 0.911 ±0.001 | 0.913 ±0.003 |
+
+`all`, prefix, mrr (n = 2002, 2002, 2002, 1975)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.223 | 0.363 | 0.527 | 0.598 |
+| fzf_scored (Skim) | 0.223 | 0.613 | 0.684 | 0.689 |
+| fzf (history scheme) | 0.223 | 0.517 | 0.671 | 0.686 |
+| heuristic before | 0.160 | 0.366 | 0.493 | 0.535 |
+| heuristic after (= fzf) | 0.223 | 0.517 | 0.671 | 0.686 |
+| model before | 0.221 ±0.016 | 0.594 ±0.011 | 0.657 ±0.009 | 0.667 ±0.010 |
+| model after | 0.288 ±0.007 | 0.644 ±0.005 | 0.736 ±0.004 | 0.744 ±0.006 |
+
+`gt10min`, prefix, top1 (n = 1367, 1367, 1367, 1346)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.008 | 0.080 | 0.236 | 0.334 |
+| fzf_scored (Skim) | 0.008 | 0.339 | 0.448 | 0.463 |
+| fzf (history scheme) | 0.008 | 0.224 | 0.435 | 0.458 |
+| heuristic before | 0.025 | 0.096 | 0.184 | 0.225 |
+| heuristic after (= fzf) | 0.008 | 0.224 | 0.435 | 0.458 |
+| model before | 0.114 ±0.013 | 0.372 ±0.012 | 0.432 ±0.015 | 0.442 ±0.017 |
+| model after | 0.093 ±0.004 | 0.422 ±0.013 | 0.530 ±0.007 | 0.542 ±0.012 |
+| stage-1 recall before | 0.828 | 0.993 | 1.000 | 1.000 |
+| stage-1 recall after | 0.805 | 0.920 | 0.993 | 0.996 |
+
+`other_dir`, prefix, top1 (n = 670, 670, 670, 657)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.007 | 0.055 | 0.157 | 0.251 |
+| fzf_scored (Skim) | 0.007 | 0.243 | 0.354 | 0.371 |
+| fzf (history scheme) | 0.007 | 0.163 | 0.345 | 0.367 |
+| heuristic before | 0.010 | 0.084 | 0.124 | 0.132 |
+| heuristic after (= fzf) | 0.007 | 0.163 | 0.345 | 0.367 |
+| model before | 0.067 ±0.012 | 0.290 ±0.022 | 0.319 ±0.023 | 0.324 ±0.023 |
+| model after | 0.047 ±0.006 | 0.355 ±0.005 | 0.447 ±0.016 | 0.455 ±0.020 |
+| stage-1 recall before | 0.652 | 0.987 | 1.000 | 1.000 |
+| stage-1 recall after | 0.857 | 0.955 | 0.999 | 0.998 |
+
+`all`, fragment, top1 (n = 1222, 1157, 1157, 756)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.182 | 0.251 | 0.299 | 0.361 |
+| fzf_scored (Skim) | 0.048 | 0.058 | 0.241 | 0.414 |
+| fzf (history scheme) | 0.261 | 0.324 | 0.329 | 0.417 |
+| heuristic before | 0.158 | 0.229 | 0.264 | 0.317 |
+| heuristic after (= fzf) | 0.261 | 0.324 | 0.329 | 0.417 |
+| model before | 0.015 ±0.002 | 0.008 ±0.003 | 0.028 ±0.006 | 0.096 ±0.025 |
+| model after | 0.096 ±0.015 | 0.265 ±0.008 | 0.275 ±0.012 | 0.381 ±0.020 |
+| stage-1 recall before | 0.857 | 0.957 | 0.968 | 0.991 |
+| stage-1 recall after | 0.870 | 0.915 | 0.920 | 0.955 |
+
+`all`, fragment, top10 (n = 1222, 1157, 1157, 756)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.478 | 0.500 | 0.519 | 0.581 |
+| fzf_scored (Skim) | 0.078 | 0.086 | 0.406 | 0.626 |
+| fzf (history scheme) | 0.509 | 0.540 | 0.547 | 0.626 |
+| heuristic before | 0.429 | 0.506 | 0.528 | 0.575 |
+| heuristic after (= fzf) | 0.509 | 0.540 | 0.547 | 0.626 |
+| model before | 0.032 ±0.001 | 0.038 ±0.008 | 0.123 ±0.019 | 0.288 ±0.038 |
+| model after | 0.486 ±0.027 | 0.644 ±0.008 | 0.654 ±0.008 | 0.763 ±0.006 |
+
+`all`, fragment, mrr (n = 1222, 1157, 1157, 756)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.294 | 0.346 | 0.383 | 0.439 |
+| fzf_scored (Skim) | 0.059 | 0.075 | 0.307 | 0.491 |
+| fzf (history scheme) | 0.358 | 0.406 | 0.411 | 0.492 |
+| heuristic before | 0.252 | 0.326 | 0.358 | 0.409 |
+| heuristic after (= fzf) | 0.358 | 0.406 | 0.411 | 0.492 |
+| model before | 0.022 ±0.002 | 0.024 ±0.005 | 0.069 ±0.010 | 0.163 ±0.029 |
+| model after | 0.224 ±0.021 | 0.396 ±0.007 | 0.405 ±0.008 | 0.515 ±0.012 |
+
+Before: R1 +0.196 PASS (gt10min/len2) | R2 +0.080 PASS (all/len3) | R3 -0.262 FAIL (other_dir/len3/top10)  
+After: R1 +0.295 PASS (gt10min/len2) | R2 +0.085 PASS (all/len0) | R3 +0.000 PASS (all/len0/top1)
+
+#### interactive 2,000 / 20,000
+
+2,000 commands, 20,000 runs; holdout 3,632 sampled of 3,632 reachable; seeds 5.
+
+`all`, prefix, top1 (n = 3632, 3632, 3632, 3562)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.067 | 0.223 | 0.459 | 0.550 |
+| fzf_scored (Skim) | 0.067 | 0.549 | 0.659 | 0.677 |
+| fzf (history scheme) | 0.067 | 0.424 | 0.644 | 0.675 |
+| heuristic before | 0.076 | 0.289 | 0.496 | 0.581 |
+| heuristic after (= fzf) | 0.067 | 0.424 | 0.644 | 0.675 |
+| model before | 0.155 ±0.008 | 0.617 ±0.002 | 0.740 ±0.004 | 0.755 ±0.003 |
+| model after | 0.161 ±0.005 | 0.606 ±0.004 | 0.731 ±0.005 | 0.748 ±0.003 |
+| stage-1 recall before | 1.000 | 1.000 | 1.000 | 1.000 |
+| stage-1 recall after | 1.000 | 1.000 | 1.000 | 1.000 |
+
+`all`, prefix, top10 (n = 3632, 3632, 3632, 3562)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.569 | 0.707 | 0.791 | 0.833 |
+| fzf_scored (Skim) | 0.569 | 0.843 | 0.895 | 0.899 |
+| fzf (history scheme) | 0.569 | 0.788 | 0.879 | 0.892 |
+| heuristic before | 0.526 | 0.810 | 0.898 | 0.926 |
+| heuristic after (= fzf) | 0.569 | 0.788 | 0.879 | 0.892 |
+| model before | 0.552 ±0.006 | 0.935 ±0.002 | 0.971 ±0.001 | 0.975 ±0.000 |
+| model after | 0.631 ±0.003 | 0.921 ±0.002 | 0.969 ±0.002 | 0.975 ±0.001 |
+
+`all`, prefix, mrr (n = 3632, 3632, 3632, 3562)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.234 | 0.386 | 0.581 | 0.655 |
+| fzf_scored (Skim) | 0.234 | 0.665 | 0.748 | 0.759 |
+| fzf (history scheme) | 0.234 | 0.563 | 0.733 | 0.756 |
+| heuristic before | 0.202 | 0.462 | 0.643 | 0.708 |
+| heuristic after (= fzf) | 0.234 | 0.563 | 0.733 | 0.756 |
+| model before | 0.278 ±0.006 | 0.738 ±0.002 | 0.830 ±0.003 | 0.841 ±0.002 |
+| model after | 0.306 ±0.004 | 0.723 ±0.004 | 0.823 ±0.004 | 0.838 ±0.002 |
+
+`gt10min`, prefix, top1 (n = 2458, 2458, 2458, 2412)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.014 | 0.093 | 0.287 | 0.394 |
+| fzf_scored (Skim) | 0.014 | 0.388 | 0.515 | 0.541 |
+| fzf (history scheme) | 0.014 | 0.268 | 0.496 | 0.536 |
+| heuristic before | 0.029 | 0.154 | 0.343 | 0.448 |
+| heuristic after (= fzf) | 0.014 | 0.268 | 0.496 | 0.536 |
+| model before | 0.122 ±0.007 | 0.510 ±0.006 | 0.652 ±0.006 | 0.672 ±0.005 |
+| model after | 0.108 ±0.015 | 0.493 ±0.009 | 0.636 ±0.007 | 0.659 ±0.004 |
+| stage-1 recall before | 1.000 | 1.000 | 1.000 | 1.000 |
+| stage-1 recall after | 1.000 | 1.000 | 1.000 | 1.000 |
+
+`other_dir`, prefix, top1 (n = 1179, 1179, 1179, 1149)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.003 | 0.050 | 0.170 | 0.260 |
+| fzf_scored (Skim) | 0.003 | 0.256 | 0.370 | 0.398 |
+| fzf (history scheme) | 0.003 | 0.180 | 0.355 | 0.391 |
+| heuristic before | 0.006 | 0.102 | 0.205 | 0.274 |
+| heuristic after (= fzf) | 0.003 | 0.180 | 0.355 | 0.391 |
+| model before | 0.075 ±0.007 | 0.394 ±0.005 | 0.521 ±0.003 | 0.537 ±0.002 |
+| model after | 0.057 ±0.013 | 0.380 ±0.012 | 0.509 ±0.008 | 0.535 ±0.008 |
+| stage-1 recall before | 1.000 | 1.000 | 1.000 | 1.000 |
+| stage-1 recall after | 1.000 | 1.000 | 1.000 | 1.000 |
+
+`all`, fragment, top1 (n = 2140, 2061, 2061, 1261)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.188 | 0.268 | 0.312 | 0.392 |
+| fzf_scored (Skim) | 0.058 | 0.065 | 0.265 | 0.448 |
+| fzf (history scheme) | 0.268 | 0.349 | 0.353 | 0.450 |
+| heuristic before | 0.199 | 0.276 | 0.320 | 0.408 |
+| heuristic after (= fzf) | 0.268 | 0.349 | 0.353 | 0.450 |
+| model before | 0.032 ±0.001 | 0.023 ±0.002 | 0.076 ±0.009 | 0.199 ±0.012 |
+| model after | 0.168 ±0.012 | 0.348 ±0.005 | 0.366 ±0.003 | 0.472 ±0.009 |
+| stage-1 recall before | 1.000 | 1.000 | 1.000 | 1.000 |
+| stage-1 recall after | 1.000 | 1.000 | 1.000 | 1.000 |
+
+`all`, fragment, top10 (n = 2140, 2061, 2061, 1261)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.551 | 0.589 | 0.631 | 0.713 |
+| fzf_scored (Skim) | 0.095 | 0.425 | 0.619 | 0.768 |
+| fzf (history scheme) | 0.605 | 0.659 | 0.670 | 0.768 |
+| heuristic before | 0.628 | 0.710 | 0.744 | 0.830 |
+| heuristic after (= fzf) | 0.605 | 0.659 | 0.670 | 0.768 |
+| model before | 0.080 ±0.003 | 0.082 ±0.036 | 0.314 ±0.059 | 0.557 ±0.041 |
+| model after | 0.642 ±0.008 | 0.776 ±0.008 | 0.795 ±0.004 | 0.874 ±0.003 |
+
+`all`, fragment, mrr (n = 2140, 2061, 2061, 1261)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.323 | 0.393 | 0.435 | 0.505 |
+| fzf_scored (Skim) | 0.079 | 0.156 | 0.386 | 0.563 |
+| fzf (history scheme) | 0.395 | 0.465 | 0.471 | 0.564 |
+| heuristic before | 0.339 | 0.426 | 0.472 | 0.557 |
+| heuristic after (= fzf) | 0.395 | 0.465 | 0.471 | 0.564 |
+| model before | 0.053 ±0.002 | 0.053 ±0.012 | 0.155 ±0.023 | 0.324 ±0.018 |
+| model after | 0.323 ±0.011 | 0.498 ±0.004 | 0.518 ±0.001 | 0.612 ±0.007 |
+
+Before: R1 +0.365 PASS (gt10min/len2) | R2 +0.088 PASS (all/len0) | R3 -0.110 FAIL (all/len0/top3)  
+After: R1 +0.349 PASS (gt10min/len2) | R2 +0.094 PASS (gt10min/len0) | R3 +0.000 PASS (all/len0/top1)
+
+#### repetitive 50,000 / 500,000
+
+50,000 commands, 500,000 runs; holdout 2,001 sampled of 90,009 reachable; seeds 5.
+
+`all`, prefix, top1 (n = 2001, 2001, 2001, 2001)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.512 | 0.546 | 0.572 | 0.595 |
+| fzf_scored (Skim) | 0.512 | 0.589 | 0.609 | 0.595 |
+| fzf (history scheme) | 0.512 | 0.573 | 0.607 | 0.611 |
+| heuristic before | 0.282 | 0.504 | 0.548 | 0.570 |
+| heuristic after (= fzf) | 0.512 | 0.573 | 0.607 | 0.611 |
+| model before | 0.482 ±0.004 | 0.591 ±0.004 | 0.628 ±0.003 | 0.631 ±0.004 |
+| model after | 0.509 ±0.003 | 0.608 ±0.013 | 0.654 ±0.010 | 0.664 ±0.012 |
+| stage-1 recall before | 0.766 | 0.957 | 0.996 | 0.999 |
+| stage-1 recall after | 0.767 | 0.901 | 0.989 | 0.999 |
+
+`all`, prefix, top10 (n = 2001, 2001, 2001, 2001)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.594 | 0.605 | 0.629 | 0.658 |
+| fzf_scored (Skim) | 0.594 | 0.651 | 0.681 | 0.667 |
+| fzf (history scheme) | 0.594 | 0.637 | 0.680 | 0.685 |
+| heuristic before | 0.591 | 0.625 | 0.663 | 0.682 |
+| heuristic after (= fzf) | 0.594 | 0.637 | 0.680 | 0.685 |
+| model before | 0.543 ±0.004 | 0.724 ±0.003 | 0.761 ±0.005 | 0.767 ±0.005 |
+| model after | 0.647 ±0.002 | 0.755 ±0.004 | 0.800 ±0.002 | 0.806 ±0.003 |
+
+`all`, prefix, mrr (n = 2001, 2001, 2001, 2001)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.550 | 0.572 | 0.596 | 0.617 |
+| fzf_scored (Skim) | 0.550 | 0.613 | 0.633 | 0.620 |
+| fzf (history scheme) | 0.550 | 0.598 | 0.631 | 0.636 |
+| heuristic before | 0.397 | 0.556 | 0.590 | 0.607 |
+| heuristic after (= fzf) | 0.550 | 0.598 | 0.631 | 0.636 |
+| model before | 0.506 ±0.002 | 0.637 ±0.004 | 0.674 ±0.002 | 0.678 ±0.003 |
+| model after | 0.561 ±0.002 | 0.662 ±0.010 | 0.708 ±0.006 | 0.716 ±0.007 |
+
+`gt10min`, prefix, top1 (n = 1007, 1007, 1007, 1007)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.133 | 0.154 | 0.173 | 0.206 |
+| fzf_scored (Skim) | 0.133 | 0.203 | 0.227 | 0.226 |
+| fzf (history scheme) | 0.133 | 0.185 | 0.224 | 0.232 |
+| heuristic before | 0.068 | 0.145 | 0.168 | 0.182 |
+| heuristic after (= fzf) | 0.133 | 0.185 | 0.224 | 0.232 |
+| model before | 0.107 ±0.004 | 0.230 ±0.007 | 0.288 ±0.008 | 0.293 ±0.009 |
+| model after | 0.132 ±0.000 | 0.272 ±0.009 | 0.342 ±0.011 | 0.351 ±0.016 |
+| stage-1 recall before | 0.534 | 0.915 | 0.992 | 0.997 |
+| stage-1 recall after | 0.537 | 0.802 | 0.977 | 0.997 |
+
+`other_dir`, prefix, top1 (n = 761, 761, 761, 761)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.122 | 0.141 | 0.158 | 0.189 |
+| fzf_scored (Skim) | 0.122 | 0.183 | 0.209 | 0.214 |
+| fzf (history scheme) | 0.122 | 0.167 | 0.209 | 0.216 |
+| heuristic before | 0.083 | 0.150 | 0.156 | 0.160 |
+| heuristic after (= fzf) | 0.122 | 0.167 | 0.209 | 0.216 |
+| model before | 0.091 ±0.004 | 0.181 ±0.007 | 0.223 ±0.005 | 0.229 ±0.004 |
+| model after | 0.115 ±0.008 | 0.231 ±0.033 | 0.293 ±0.028 | 0.310 ±0.029 |
+| stage-1 recall before | 0.414 | 0.887 | 0.989 | 0.996 |
+| stage-1 recall after | 0.545 | 0.795 | 0.972 | 0.996 |
+
+`all`, fragment, top1 (n = 2001, 2001, 2001, 1486)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.526 | 0.539 | 0.551 | 0.559 |
+| fzf_scored (Skim) | 0.063 | 0.074 | 0.435 | 0.570 |
+| fzf (history scheme) | 0.541 | 0.554 | 0.555 | 0.570 |
+| heuristic before | 0.344 | 0.426 | 0.443 | 0.510 |
+| heuristic after (= fzf) | 0.541 | 0.554 | 0.555 | 0.570 |
+| model before | 0.042 ±0.001 | 0.035 ±0.034 | 0.215 ±0.056 | 0.327 ±0.022 |
+| model after | 0.523 ±0.023 | 0.573 ±0.006 | 0.575 ±0.006 | 0.606 ±0.001 |
+| stage-1 recall before | 0.786 | 0.877 | 0.890 | 0.960 |
+| stage-1 recall after | 0.831 | 0.893 | 0.899 | 0.962 |
+
+`all`, fragment, top10 (n = 2001, 2001, 2001, 1486)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.596 | 0.601 | 0.605 | 0.624 |
+| fzf_scored (Skim) | 0.066 | 0.076 | 0.473 | 0.656 |
+| fzf (history scheme) | 0.601 | 0.615 | 0.615 | 0.656 |
+| heuristic before | 0.593 | 0.610 | 0.619 | 0.631 |
+| heuristic after (= fzf) | 0.601 | 0.615 | 0.615 | 0.656 |
+| model before | 0.054 ±0.001 | 0.163 ±0.093 | 0.455 ±0.039 | 0.509 ±0.047 |
+| model after | 0.657 ±0.010 | 0.709 ±0.002 | 0.713 ±0.002 | 0.757 ±0.002 |
+
+`all`, fragment, mrr (n = 2001, 2001, 2001, 1486)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.559 | 0.567 | 0.576 | 0.584 |
+| fzf_scored (Skim) | 0.065 | 0.080 | 0.457 | 0.602 |
+| fzf (history scheme) | 0.569 | 0.580 | 0.582 | 0.602 |
+| heuristic before | 0.445 | 0.502 | 0.516 | 0.558 |
+| heuristic after (= fzf) | 0.569 | 0.580 | 0.582 | 0.602 |
+| model before | 0.047 ±0.001 | 0.079 ±0.048 | 0.298 ±0.054 | 0.384 ±0.030 |
+| model after | 0.571 ±0.017 | 0.622 ±0.004 | 0.625 ±0.004 | 0.660 ±0.002 |
+
+Before: R1 +0.116 PASS (gt10min/len2) | R2 -0.030 FAIL (all/len0) | R3 -0.230 FAIL (all/len0/top1)  
+After: R1 +0.169 PASS (gt10min/len2) | R2 -0.003 PASS (all/len0) | R3 +0.000 PASS (all/len0/top1)
+
+#### repetitive 2,000 / 20,000
+
+2,000 commands, 20,000 runs; holdout 3,634 sampled of 3,634 reachable; seeds 5.
+
+`all`, prefix, top1 (n = 3634, 3634, 3634, 3634)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.517 | 0.556 | 0.594 | 0.624 |
+| fzf_scored (Skim) | 0.517 | 0.622 | 0.651 | 0.647 |
+| fzf (history scheme) | 0.517 | 0.600 | 0.646 | 0.655 |
+| heuristic before | 0.299 | 0.527 | 0.586 | 0.630 |
+| heuristic after (= fzf) | 0.517 | 0.600 | 0.646 | 0.655 |
+| model before | 0.494 ±0.005 | 0.688 ±0.004 | 0.739 ±0.004 | 0.748 ±0.002 |
+| model after | 0.513 ±0.003 | 0.641 ±0.028 | 0.718 ±0.021 | 0.746 ±0.010 |
+| stage-1 recall before | 1.000 | 1.000 | 1.000 | 1.000 |
+| stage-1 recall after | 1.000 | 1.000 | 1.000 | 1.000 |
+
+`all`, prefix, top10 (n = 3634, 3634, 3634, 3634)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.614 | 0.641 | 0.694 | 0.751 |
+| fzf_scored (Skim) | 0.614 | 0.744 | 0.799 | 0.804 |
+| fzf (history scheme) | 0.614 | 0.709 | 0.789 | 0.804 |
+| heuristic before | 0.625 | 0.739 | 0.803 | 0.840 |
+| heuristic after (= fzf) | 0.614 | 0.709 | 0.789 | 0.804 |
+| model before | 0.670 ±0.008 | 0.849 ±0.002 | 0.895 ±0.002 | 0.899 ±0.002 |
+| model after | 0.713 ±0.002 | 0.833 ±0.013 | 0.887 ±0.008 | 0.896 ±0.002 |
+
+`all`, prefix, mrr (n = 3634, 3634, 3634, 3634)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.561 | 0.591 | 0.631 | 0.667 |
+| fzf_scored (Skim) | 0.561 | 0.664 | 0.700 | 0.699 |
+| fzf (history scheme) | 0.561 | 0.638 | 0.694 | 0.704 |
+| heuristic before | 0.423 | 0.604 | 0.662 | 0.703 |
+| heuristic after (= fzf) | 0.561 | 0.638 | 0.694 | 0.704 |
+| model before | 0.552 ±0.005 | 0.747 ±0.002 | 0.794 ±0.002 | 0.801 ±0.001 |
+| model after | 0.581 ±0.002 | 0.712 ±0.021 | 0.779 ±0.016 | 0.798 ±0.008 |
+
+`gt10min`, prefix, top1 (n = 1752, 1752, 1752, 1752)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.122 | 0.149 | 0.186 | 0.229 |
+| fzf_scored (Skim) | 0.122 | 0.225 | 0.279 | 0.284 |
+| fzf (history scheme) | 0.122 | 0.197 | 0.272 | 0.287 |
+| heuristic before | 0.076 | 0.170 | 0.233 | 0.292 |
+| heuristic after (= fzf) | 0.122 | 0.197 | 0.272 | 0.287 |
+| model before | 0.105 ±0.004 | 0.378 ±0.009 | 0.469 ±0.009 | 0.486 ±0.004 |
+| model after | 0.121 ±0.001 | 0.304 ±0.044 | 0.430 ±0.037 | 0.481 ±0.018 |
+| stage-1 recall before | 1.000 | 1.000 | 1.000 | 1.000 |
+| stage-1 recall after | 1.000 | 1.000 | 1.000 | 1.000 |
+
+`other_dir`, prefix, top1 (n = 1336, 1336, 1336, 1336)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.095 | 0.115 | 0.154 | 0.195 |
+| fzf_scored (Skim) | 0.095 | 0.189 | 0.248 | 0.256 |
+| fzf (history scheme) | 0.095 | 0.165 | 0.244 | 0.257 |
+| heuristic before | 0.068 | 0.140 | 0.179 | 0.219 |
+| heuristic after (= fzf) | 0.095 | 0.165 | 0.244 | 0.257 |
+| model before | 0.074 ±0.004 | 0.300 ±0.007 | 0.376 ±0.005 | 0.394 ±0.003 |
+| model after | 0.089 ±0.004 | 0.256 ±0.041 | 0.373 ±0.030 | 0.420 ±0.013 |
+| stage-1 recall before | 1.000 | 1.000 | 1.000 | 1.000 |
+| stage-1 recall after | 1.000 | 1.000 | 1.000 | 1.000 |
+
+`all`, fragment, top1 (n = 3634, 3634, 3634, 2785)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.533 | 0.545 | 0.560 | 0.605 |
+| fzf_scored (Skim) | 0.054 | 0.051 | 0.431 | 0.631 |
+| fzf (history scheme) | 0.553 | 0.567 | 0.567 | 0.631 |
+| heuristic before | 0.362 | 0.432 | 0.460 | 0.578 |
+| heuristic after (= fzf) | 0.553 | 0.567 | 0.567 | 0.631 |
+| model before | 0.046 ±0.000 | 0.185 ±0.093 | 0.412 ±0.050 | 0.523 ±0.031 |
+| model after | 0.542 ±0.004 | 0.575 ±0.010 | 0.591 ±0.006 | 0.683 ±0.006 |
+| stage-1 recall before | 1.000 | 1.000 | 1.000 | 1.000 |
+| stage-1 recall after | 1.000 | 1.000 | 1.000 | 1.000 |
+
+`all`, fragment, top10 (n = 3634, 3634, 3634, 2785)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.620 | 0.633 | 0.649 | 0.728 |
+| fzf_scored (Skim) | 0.060 | 0.550 | 0.641 | 0.787 |
+| fzf (history scheme) | 0.631 | 0.657 | 0.662 | 0.787 |
+| heuristic before | 0.646 | 0.687 | 0.703 | 0.799 |
+| heuristic after (= fzf) | 0.631 | 0.657 | 0.662 | 0.787 |
+| model before | 0.059 ±0.001 | 0.464 ±0.058 | 0.640 ±0.027 | 0.734 ±0.020 |
+| model after | 0.727 ±0.005 | 0.770 ±0.009 | 0.778 ±0.003 | 0.862 ±0.002 |
+
+`all`, fragment, mrr (n = 3634, 3634, 3634, 2785)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.572 | 0.583 | 0.597 | 0.648 |
+| fzf_scored (Skim) | 0.062 | 0.140 | 0.491 | 0.682 |
+| fzf (history scheme) | 0.587 | 0.603 | 0.605 | 0.682 |
+| heuristic before | 0.475 | 0.532 | 0.554 | 0.658 |
+| heuristic after (= fzf) | 0.587 | 0.603 | 0.605 | 0.682 |
+| model before | 0.055 ±0.001 | 0.280 ±0.084 | 0.491 ±0.044 | 0.598 ±0.027 |
+| model after | 0.605 ±0.005 | 0.643 ±0.009 | 0.657 ±0.005 | 0.742 ±0.005 |
+
+Before: R1 +0.283 PASS (gt10min/len2) | R2 -0.023 FAIL (all/len0) | R3 -0.218 FAIL (all/len0/top1)  
+After: R1 +0.244 PASS (gt10min/len2) | R2 -0.004 PASS (all/len0) | R3 +0.000 PASS (all/len0/top1)
+
+#### agent 5,000 / 50,000
+
+5,000 commands, 50,000 runs; holdout 2,256 sampled of 9,023 reachable; seeds 5.
+
+`all`, prefix, top1 (n = 2256, 2256, 2256, 2256)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.000 | 0.000 | 0.000 | 0.000 |
+| fzf_scored (Skim) | 0.000 | 0.000 | 0.000 | 0.000 |
+| fzf (history scheme) | 0.000 | 0.000 | 0.000 | 0.000 |
+| heuristic before | 0.043 | 0.043 | 0.043 | 0.043 |
+| heuristic after (= fzf) | 0.000 | 0.000 | 0.000 | 0.000 |
+| model before | 0.045 ±0.014 | 0.047 ±0.016 | 0.047 ±0.016 | 0.046 ±0.015 |
+| model after | 0.080 ±0.002 | 0.083 ±0.003 | 0.083 ±0.003 | 0.082 ±0.002 |
+| stage-1 recall before | 0.891 | 0.891 | 0.891 | 0.891 |
+| stage-1 recall after | 0.766 | 0.766 | 0.766 | 0.766 |
+
+`all`, prefix, top10 (n = 2256, 2256, 2256, 2256)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.219 | 0.219 | 0.219 | 0.219 |
+| fzf_scored (Skim) | 0.219 | 0.219 | 0.219 | 0.219 |
+| fzf (history scheme) | 0.219 | 0.219 | 0.219 | 0.219 |
+| heuristic before | 0.270 | 0.270 | 0.270 | 0.270 |
+| heuristic after (= fzf) | 0.219 | 0.219 | 0.219 | 0.219 |
+| model before | 0.271 ±0.011 | 0.271 ±0.011 | 0.270 ±0.008 | 0.270 ±0.009 |
+| model after | 0.325 ±0.003 | 0.324 ±0.002 | 0.323 ±0.003 | 0.324 ±0.004 |
+
+`all`, prefix, mrr (n = 2256, 2256, 2256, 2256)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.069 | 0.069 | 0.069 | 0.069 |
+| fzf_scored (Skim) | 0.069 | 0.069 | 0.069 | 0.069 |
+| fzf (history scheme) | 0.069 | 0.069 | 0.069 | 0.069 |
+| heuristic before | 0.120 | 0.120 | 0.120 | 0.120 |
+| heuristic after (= fzf) | 0.069 | 0.069 | 0.069 | 0.069 |
+| model before | 0.119 ±0.016 | 0.120 ±0.017 | 0.119 ±0.016 | 0.119 ±0.016 |
+| model after | 0.162 ±0.002 | 0.164 ±0.002 | 0.163 ±0.002 | 0.163 ±0.001 |
+
+`gt10min`, prefix, top1 (n = 1999, 1999, 1999, 1999)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.000 | 0.000 | 0.000 | 0.000 |
+| fzf_scored (Skim) | 0.000 | 0.000 | 0.000 | 0.000 |
+| fzf (history scheme) | 0.000 | 0.000 | 0.000 | 0.000 |
+| heuristic before | 0.017 | 0.017 | 0.017 | 0.017 |
+| heuristic after (= fzf) | 0.000 | 0.000 | 0.000 | 0.000 |
+| model before | 0.029 ±0.019 | 0.030 ±0.020 | 0.030 ±0.020 | 0.029 ±0.019 |
+| model after | 0.053 ±0.003 | 0.059 ±0.003 | 0.058 ±0.003 | 0.055 ±0.004 |
+| stage-1 recall before | 0.877 | 0.877 | 0.877 | 0.877 |
+| stage-1 recall after | 0.736 | 0.736 | 0.736 | 0.736 |
+
+`other_dir`, prefix, top1 (n = 878, 878, 878, 878)
+
+| ranker | len 0 | len 1 | len 2 | len 3 |
+|---|---|---|---|---|
+| recency | 0.000 | 0.000 | 0.000 | 0.000 |
+| fzf_scored (Skim) | 0.000 | 0.000 | 0.000 | 0.000 |
+| fzf (history scheme) | 0.000 | 0.000 | 0.000 | 0.000 |
+| heuristic before | 0.001 | 0.001 | 0.001 | 0.001 |
+| heuristic after (= fzf) | 0.000 | 0.000 | 0.000 | 0.000 |
+| model before | 0.006 ±0.004 | 0.005 ±0.004 | 0.005 ±0.004 | 0.006 ±0.004 |
+| model after | 0.007 ±0.001 | 0.007 ±0.001 | 0.006 ±0.001 | 0.006 ±0.001 |
+| stage-1 recall before | 0.720 | 0.720 | 0.720 | 0.720 |
+| stage-1 recall after | 0.583 | 0.583 | 0.583 | 0.583 |
+
+`all`, fragment, top1 (n = 2256, 2197, 2119, 1120)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.002 | 0.004 | 0.003 | 0.015 |
+| fzf_scored (Skim) | 0.008 | 0.030 | 0.020 | 0.048 |
+| fzf (history scheme) | 0.008 | 0.029 | 0.020 | 0.046 |
+| heuristic before | 0.050 | 0.065 | 0.059 | 0.081 |
+| heuristic after (= fzf) | 0.008 | 0.029 | 0.020 | 0.046 |
+| model before | 0.049 ±0.015 | 0.053 ±0.015 | 0.050 ±0.014 | 0.062 ±0.016 |
+| model after | 0.089 ±0.006 | 0.106 ±0.007 | 0.104 ±0.004 | 0.114 ±0.009 |
+| stage-1 recall before | 0.902 | 0.921 | 0.921 | 0.929 |
+| stage-1 recall after | 0.797 | 0.847 | 0.844 | 0.861 |
+
+`all`, fragment, top10 (n = 2256, 2197, 2119, 1120)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.224 | 0.230 | 0.231 | 0.266 |
+| fzf_scored (Skim) | 0.224 | 0.269 | 0.263 | 0.310 |
+| fzf (history scheme) | 0.236 | 0.269 | 0.265 | 0.311 |
+| heuristic before | 0.283 | 0.302 | 0.300 | 0.352 |
+| heuristic after (= fzf) | 0.236 | 0.269 | 0.265 | 0.311 |
+| model before | 0.277 ±0.009 | 0.285 ±0.008 | 0.286 ±0.008 | 0.319 ±0.009 |
+| model after | 0.341 ±0.004 | 0.379 ±0.006 | 0.372 ±0.005 | 0.407 ±0.008 |
+
+`all`, fragment, mrr (n = 2256, 2197, 2119, 1120)
+
+| ranker | len 1 | len 2 | len 3 | len 5 |
+|---|---|---|---|---|
+| recency | 0.072 | 0.076 | 0.075 | 0.093 |
+| fzf_scored (Skim) | 0.077 | 0.106 | 0.097 | 0.131 |
+| fzf (history scheme) | 0.081 | 0.107 | 0.098 | 0.132 |
+| heuristic before | 0.129 | 0.147 | 0.142 | 0.169 |
+| heuristic after (= fzf) | 0.081 | 0.107 | 0.098 | 0.132 |
+| model before | 0.123 ±0.016 | 0.129 ±0.016 | 0.126 ±0.015 | 0.146 ±0.018 |
+| model after | 0.173 ±0.003 | 0.196 ±0.006 | 0.191 ±0.004 | 0.210 ±0.008 |
+
+Before: R1 +0.030 FAIL (gt10min/len2) | R2 +0.029 PASS (gt10min/len0) | R3 +0.001 PASS (other_dir/len0/top1)  
+After: R1 +0.058 FAIL (gt10min/len2) | R2 +0.053 PASS (gt10min/len0) | R3 +0.000 PASS (all/len0/top1)
+
 ## 2026-11-17 - Phase D commit (on 967023a) - first full run of the Phase D harness (baseline, kept)
 
 The change: none to ranking. This is the reference every later row compares
