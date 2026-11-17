@@ -5,6 +5,52 @@ entry first; one entry per benchmark run used for a decision. Targets are
 defined in [00-blueprint.md section 2](00-blueprint.md#2-success-metrics).
 Every figure below is an aggregate; no command or query text.
 
+## 2026-11-18 - 1f6eaee..01a398d - merge of the review fixes, two leftovers (kept)
+
+The whole-branch review fixes (`ctrl-r-review-fixes`, 6f17032..ce1cc61) merged
+into the ranking work (merge 1f6eaee, no textual conflicts), then two
+leftovers fixed. Ranking code (`rank.rs`, `train.rs`, `features.rs`,
+`model.rs`, `index.rs`) is unchanged by all of it, so relevance was not re-run;
+the previous entry's relevance figures stand.
+
+### What changed
+
+| Commit | Change |
+|---|---|
+| 6f17032 | `--purge` keeps the tombstones, so a deleted command stays deleted through a purge and a re-import |
+| 3fab935 | `secure_delete` on every connection; a picker delete checkpoints and truncates the log without waiting, so no text of a deleted command stays in `events.db` or `-wal` (again at exit if busy) |
+| e6bcc6b | The pick is printed within 100 ms when another process holds the write lock (`CMD_EVENT_WAIT_MS`), the pick event is then dropped |
+| 161fff0 | The terminal is given back on a panic or SIGTERM/SIGHUP/SIGINT (`terminal.rs`, E-B-20, E-B-21) |
+| dcf4b02, ce1cc61 | Tests: IT-N-05 against a scratch `HOME`; the shell tests run this build, never an installed one |
+| a94a260 | `internal bench-history` refuses a missing or real `--data-dir` before the logger creates the data directory and `app.log` (IT-N-05's second test) |
+| 038a3b2 | At exit after a delete, the picker waits up to `CMD_EXIT_DELETE_WAIT_MS` (1 s) for the worker, so Esc right after `y` no longer rolls the delete back (IT-B-15, E-B-22) |
+
+### Verdicts
+
+Interactive 50,000 / 500,000, quiet machine (load < 2 at each step's start),
+interleaved before/after, 40 x 120 pty, release; p50 / p95. Before = the
+pre-merge build `perfbin/final-c1` (a802f56), after = a build of the merged
+tree with both leftovers (`perfbin/postmerge-01a398d`), each on its own perf
+DB set up (and trained) from `rel/c/i50k` by that build.
+
+| Target | Before | After | Bar | Verdict after |
+|---|---|---|---|---|
+| B4 `track-command` (`track 200`, 3 rounds) | 5.30-5.64 / 7.17-7.84 ms | 5.52-5.83 / 7.08-7.43 ms | p95 <= 10 ms | PASS (no change beyond noise) |
+| B3 first results on screen (`startup 200`, 3 rounds) | 30.5-31.1 / 37.5-37.7 ms | 30.3-31.6 / 37.1-39.2 ms | p95 <= 50 ms | PASS (the 39.2 round ended at load 2.6) |
+| B1 worker per keystroke (`keystroke 200`, 3 rounds) | 3.55-3.67 / 6.49-6.68 ms | 3.49-3.68 / 6.15-6.70 ms | p95 <= 8 ms | PASS |
+| B10 key -> results drawn | 4.63-4.76 / 7.49-7.62 ms | 4.59-4.81 / 7.35-7.59 ms | p95 <= 16 ms | PASS |
+| B2 key -> first byte | 1.68-1.70 / 2.24-2.38 ms | 1.56-1.63 / 2.20-2.38 ms | p95 <= 16 ms | PASS |
+
+`secure_delete` on every connection and the picker's changed event writes
+cost nothing measurable on these paths. The exit wait of 038a3b2 applies only
+after a delete and was not timed here (IT-B-15 bounds it: 0.9-2.5 s with the
+lock held throughout, otherwise as long as the delete takes).
+
+### How to re-run
+
+`notes/merge/run.sh` under the benchmark scratch directory (the pattern of
+the previous entry's series), output in `notes/merge/out.txt`.
+
 ## 2026-11-18 - 76169ff..a802f56 - B8, short fragment queries, a deterministic training (kept)
 
 Three problems of the previous entry, each taken apart and fixed where
