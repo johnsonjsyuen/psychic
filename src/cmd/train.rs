@@ -30,9 +30,10 @@ use super::rank::{fzf_score, recency_rank};
 use super::store::{CmdStore, CommandRecord, EventRecord, RunRecord, Source};
 use super::tuning::{
     CMD_HOOK_WEIGHT, CMD_IMPORT_WEIGHT, CMD_PICK_RUN_SECS, CMD_PICK_WEIGHT, CMD_RECENCY_RANK_CAP,
-    CMD_RETRAIN_MIN_INTERVAL_SECS, CMD_TRAIN_FRAGMENT_SHARE, CMD_TRAIN_LOCK_STALE_SECS,
-    CMD_TRAIN_MAX_RUN_GROUPS, CMD_TRAIN_MIN_GROUPS, CMD_TRAIN_QLEN_MIX, CMD_TRAIN_RANDOM_NEGATIVES,
-    CMD_TRAIN_RANDOM_TRIES, CMD_TRAIN_RECENT_NEGATIVES, CMD_TRAIN_RECENT_SCAN,
+    CMD_RETRAIN_MIN_INTERVAL_SECS, CMD_STAGE2_K, CMD_TRAIN_FRAGMENT_SHARE,
+    CMD_TRAIN_LOCK_STALE_SECS, CMD_TRAIN_MAX_RUN_GROUPS, CMD_TRAIN_MIN_GROUPS, CMD_TRAIN_QLEN_MIX,
+    CMD_TRAIN_RANDOM_NEGATIVES, CMD_TRAIN_RANDOM_TRIES, CMD_TRAIN_RECENT_NEGATIVES,
+    CMD_TRAIN_RECENT_SCAN,
 };
 use anyhow::{Context, Result};
 use fuzzy_matcher::FuzzyMatcher;
@@ -533,7 +534,8 @@ fn source_weight(source: Source) -> f64 {
 }
 
 /// The group of one executed command for `query` (section 5.2, from
-/// "Context" down): the positive and up to 15 recent plus 15 random other
+/// "Context" down): the positive and up to `CMD_TRAIN_RECENT_NEGATIVES` (0)
+/// recent plus `CMD_TRAIN_RANDOM_NEGATIVES` (30) random other
 /// commands that match, ordered by idx. `None` when the command never ran
 /// before, does not match its own query, or no negative is found. Does not
 /// touch the replayer.
@@ -577,7 +579,12 @@ fn build_run_group(
         }
     }
 
-    let commands = index.entries.len() as u64;
+    // An empty query: serving's model sees only the CMD_STAGE2_K newest
+    // commands (stage 1 is newest first), so draw from those.
+    let pool: Option<Vec<u32>> = query
+        .is_empty()
+        .then(|| replayer.recent_distinct().take(CMD_STAGE2_K).collect());
+    let commands = pool.as_ref().map_or(index.entries.len(), Vec::len) as u64;
     let mut state = splitmix64(seed ^ run.id as u64 ^ RANDOM_NEGATIVE_SALT);
     let mut random = 0;
     for _ in 0..CMD_TRAIN_RANDOM_TRIES {
@@ -585,7 +592,8 @@ fn build_run_group(
             break;
         }
         state = splitmix64(state);
-        let candidate = (state % commands) as u32;
+        let at = (state % commands) as usize;
+        let candidate = pool.as_ref().map_or(at as u32, |pool| pool[at]);
         if !usable(candidate) || negatives.iter().any(|&(idx, _)| idx == candidate) {
             continue;
         }
@@ -635,6 +643,14 @@ fn build_pick_group(
         pick.shell_session.as_deref(),
     );
     let index = &replayer.index;
+    // One walk of the recency order per distinct query of the episode.
+    let mut newest: FxHashMap<&str, Vec<(i64, i64)>> = FxHashMap::default();
+    for impression in &episode.impressions {
+        let query = impression.query.as_str();
+        newest
+            .entry(query)
+            .or_insert_with(|| newest_matching(replayer, matcher, query));
+    }
     let rows: Vec<GroupRow> = episode
         .impressions
         .iter()
@@ -655,14 +671,7 @@ fn build_pick_group(
                 } else {
                     0.0
                 },
-                features: feature_row(
-                    index,
-                    &ctx,
-                    query,
-                    &newest_matching(replayer, matcher, query),
-                    idx,
-                    score,
-                ),
+                features: feature_row(index, &ctx, query, &newest[query], idx, score),
             })
         })
         .collect();

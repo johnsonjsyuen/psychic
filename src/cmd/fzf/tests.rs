@@ -190,6 +190,23 @@ fn long_texts_fall_back_to_v1_like_fzf() {
     );
 }
 
+#[test]
+fn negative_long_text_scores_tie_at_zero_like_fzf() {
+    // V1 on 60,000-character texts: the gaps make both totals negative;
+    // fzf sorts on the score as a u16, so both are 0 and the input order
+    // stays (the fzf 0.74.5 binary prints the 300-gap line first).
+    let far = format!("a{}b{}", "x".repeat(300), "y".repeat(60_000));
+    let near = format!("a{}b{}", "x".repeat(100), "z".repeat(60_000));
+    let q = FzfQuery::new("ab");
+    let chars: Vec<char> = near.chars().collect();
+    assert!(
+        fuzzy_v1(&q.terms[0], &chars).unwrap() < 0,
+        "negative before the clamp"
+    );
+    assert_eq!(q.score(&far), Some(0));
+    assert_eq!(q.score(&near), Some(0));
+}
+
 /// Orders produced by `fzf --filter=QUERY --scheme=history` (fzf 0.74.5,
 /// `FZF_DEFAULT_OPTS` empty) on the list below, given newest first: index
 /// into `LIST`, best first. A tie keeps the input order (newest first).

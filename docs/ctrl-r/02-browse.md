@@ -406,7 +406,8 @@ copied. What it computes:
 | `--scheme=history` | `Init("history")`: the boundary bonus after whitespace and after a delimiter (`/,:;|`) is 8, the same as any other word boundary; the default scheme gives 10 and 9, so there the start of the text and a word after a space outrank a word after `/` | The history scheme. Consequence: the start of a command is worth exactly as much as the start of any later word |
 | Long texts | V2 falls back to the greedy `FuzzyMatchV1` + `calculateScore` when `text chars * pattern chars > 100 * 1024` (the slab) or the pattern is over 1,000 characters | Same thresholds, same fallback |
 | Query | Extended search (`BuildPattern`, `parseTerms` in `src/pattern.go`): leading spaces and unescaped trailing spaces dropped, split on runs of spaces, `\ ` a literal space; each term smart-case (case-sensitive only if it has an upper-case letter); a command must match every term; the score is the sum of the terms' scores | Same, for fuzzy terms |
-| Case folding | ASCII `A-Z` lower-cased; other upper-case letters by a one-character mapping | Same |
+| Case folding | ASCII `A-Z` lower-cased; other upper-case letters by a one-character mapping | Same for ASCII. Non-ASCII differs at the edges: Rust's `is_lowercase`/`is_uppercase`/`is_alphabetic` are wider than Go's `IsLower`/`IsUpper`/`IsLetter` (e.g. `ª`, `Ⓐ`, `Ⅰ`), V1 folds only upper-case letters where Go folds every non-ASCII rune, and `İ` has no one-character lower case |
+| Sort value | `util.AsUint16(score)`: a negative total (V1 on a long text with long gaps) counts as 0 | Same: the sum is clamped to `0..=65535`, so every match scores at least 0 and `NO_FZF_MATCH` is below all of them |
 
 Not adopted, with the reason:
 

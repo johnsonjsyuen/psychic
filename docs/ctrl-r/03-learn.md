@@ -146,7 +146,7 @@ Type N = Numeric, B = Binary. Mono: `+` Increasing, `-` Decreasing, blank none.
 | 22 | `command_length` | N | | `e.chars` | - |
 | 23 | `argument_count` | N | | `e.words.saturating_sub(1)` | `0.0` |
 | 24 | `fzf_score` | N | + | `inputs.fzf_score`: fzf's score of the text for the query under `--scheme=history` ([02 section 7.1](02-browse.md#71-fzfs-score-srccmdfzfrs)); serving takes it from the heuristic's parts, training computes it with the same `rank::fzf_score` | `0.0` for the empty query; `-1.0` (`NO_FZF_MATCH`) when fzf does not match |
-| 25 | `recency_rank` | N | | `inputs.recency_rank`: how many commands matching the query (the candidates, for serving; the commands `newest_matching` finds, for training) have a newer `(last_run_at, db_id)`, at most `CMD_RECENCY_RANK_CAP`. Serving takes the `CMD_RECENCY_RANK_CAP` newest candidates in the heuristic's pass (`rank::newest_of`, one pass over the sort keys, no allocation per candidate); training walks the replay's recency order until it has that many matches (`train::newest_matching`); IT-N-02 checks both give the same list | - |
+| 25 | `recency_rank` | N | | `inputs.recency_rank`: how many commands matching the query (the candidates, for serving; the commands `newest_matching` finds, for training) have a newer `(last_run_at, db_id)`, at most `CMD_RECENCY_RANK_CAP`. Serving takes the `CMD_RECENCY_RANK_CAP` newest candidates in the heuristic's pass (`rank::newest_of`, one pass over the sort keys, no allocation per candidate); training walks the replay's recency order until it has that many matches (`train::newest_matching`); IT-N-02 checks both give the same list (in scope `All`). Known skew: in the picker's Directory, Repository and Session scopes the candidates are the scope's, so the count is lower than training (which counts all matching commands) ever saw; the worker would have to pass the scope or the all-scope count to fix it (`worker.rs`, left to the merge with the speed work) | - |
 
 Features 24 on were added on 2026-11-17 (results.md). Feature 24 sits
 beside feature 1 rather than replacing it: measured both ways, see results.md.
@@ -216,7 +216,7 @@ For each run, **before** `apply_run`:
 | Context | `ctx = replayer.context(run.started_at, run.cwd, run.repo_root, Some(&run.shell_session))` |
 | "Matches" | Empty query: every command. Otherwise `matcher.fuzzy_match(&entry.text, query).is_some()` with one `SkimMatcherV2` owned by the builder |
 | Recent negatives | From `recent_distinct()`: skip the positive and deleted entries; examine at most `CMD_TRAIN_RECENT_SCAN` of the rest; keep those that match, up to `CMD_TRAIN_RECENT_NEGATIVES` (0 since 2026-11-17: none; see below) |
-| Random negatives | `state = splitmix64(seed ^ (run.id as u64) ^ 0x9E37_79B9_7F4A_7C15)`; repeat at most `CMD_TRAIN_RANDOM_TRIES` times: `state = splitmix64(state)`, `cand = state % entries.len()`; keep `cand` if it is not the positive, not deleted, not already chosen (recent or random), and matches; stop at `CMD_TRAIN_RANDOM_NEGATIVES` |
+| Random negatives | The pool: for the empty query the first `CMD_STAGE2_K` of `recent_distinct()` (serving's model sees only the `CMD_STAGE2_K` newest then, as stage 1 is newest first), otherwise every entry. `state = splitmix64(seed ^ (run.id as u64) ^ 0x9E37_79B9_7F4A_7C15)`; repeat at most `CMD_TRAIN_RANDOM_TRIES` times: `state = splitmix64(state)`, `cand = pool[state % pool.len()]`; keep `cand` if it is not the positive, not deleted, not already chosen (recent or random), and matches; stop at `CMD_TRAIN_RANDOM_NEGATIVES` |
 | Skip | No negative found, or the positive does not match its own query (a prefix of its text always matches; the rule only makes the function total): no group |
 | Rows | The positive (label 1) and the negatives (label 0), **ordered by idx ascending**; each row = `compute_all` with that candidate's own fuzzy score for the query (0 for the empty query) |
 | Weight | `CMD_HOOK_WEIGHT` or `CMD_IMPORT_WEIGHT` by `run.source`, on every row of the group |
@@ -243,7 +243,10 @@ interactive 50k corpus its top-10 at length 0 was 0.41 against newest-first
 0.53, and it lost to plain score-sorted fuzzy matching at lengths 1-3.
 Uniform negatives represent the candidates as serving sees them; the same
 corpus went to 0.54 top-10 at length 0 and above every baseline at lengths
-2-3 (results.md). Feature 25 made the effect visible: with a cap of 20 the
+2-3 (results.md). Drawn from all commands, though, the empty query's
+negatives were mostly older than anything stage 1 hands the model, and
+top-1 at length 0 fell (0.154 to 0.121); drawn from the `CMD_STAGE2_K`
+newest, as serving sees them, it is back (0.151) with top-10 0.59. Feature 25 made the effect visible: with a cap of 20 the
 ranks 15-19 were almost never a negative (the 15 newest were, the random
 ones rarely land there), and the model put those commands first.
 
@@ -603,6 +606,7 @@ Fixture `F1`: built with the `CommandIndex` mutators; `now = 1_000_000`; command
 | TC-L-09 | no leakage | Commands A, B; timeline A, B, A (`build_run_group` for the third run, query `""`) | In that group the positive's `runs_last_hour` counts 1 run (the first A), and `log_seconds_since_last_run` is the gap to the first A, not 0 | - |
 | TC-L-10 | first-ever run | Timeline A, B | No group for either run; `counts.hook == 0` | - |
 | TC-L-11 | negatives (`build_run_group`) | 40 commands run once each, then command 0 again, query `""` | 31 rows: 1 positive and 30 random distinct others (no fixed recent ones since 2026-11-17), older commands among them; rows in ascending idx; labels sum to 1 | With query `zz` matching nothing else -> no group |
+| TC-L-21 | empty-query negatives | 2,100 commands run once each, then the oldest again, query `""` | All 30 negatives are among the 2,000 newest; with `g` some are older (over seeds 1-10) | - |
 | TC-L-19 | `training_query` | 4,000 run ids, text `git commit --amend` | Length as `query_length`; of the non-empty ones `CMD_TRAIN_FRAGMENT_SHARE`% (+-3) are the start of `commit` or `amend`, the rest prefixes | A one-word text: always a prefix |
 | TC-L-20 | old model on disk | Stats whose `feature_names` are the first 23 of the registry | `CmdModel::load` is `None` (heuristic ranking); `retrain_due` holds although the last attempt is a minute old; an attempt newer than the stats backs off; current names wait for the interval | - |
 | TC-L-12 | weights and cap | 5 eligible hook runs, 5 eligible import runs, `max_run_groups = 4` | 4 groups, built from the 4 newest eligible runs; `row_weights` are 1.0 or 0.3 by source | - |

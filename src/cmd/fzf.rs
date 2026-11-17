@@ -188,7 +188,9 @@ impl FzfQuery {
             for term in &self.terms {
                 total += i32::from(term_score(term, scratch)?);
             }
-            Some(total)
+            // fzf ranks by `util.AsUint16(score)`: a negative total (V1 on a
+            // long text with long gaps) ties at 0 with the input order.
+            Some(total.clamp(0, i32::from(u16::MAX)))
         })
     }
 }

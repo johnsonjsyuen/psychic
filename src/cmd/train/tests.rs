@@ -1058,3 +1058,35 @@ fn a_quarter_of_non_empty_training_queries_are_fragments() {
     // A one-word text has no fragment: always the prefix.
     assert!((0..200).all(|id| "make".starts_with(&training_query(42, id, "make"))));
 }
+
+#[test]
+fn empty_query_negatives_come_from_the_newest_that_serving_scores() {
+    // 2,100 commands run once each, oldest first; then the oldest again.
+    // For "" serving's model sees the CMD_STAGE2_K newest (stage 1 is
+    // newest first), so every negative is one of them: idx >= 100.
+    let total = CMD_STAGE2_K as i64 + 100;
+    let commands = git_commands(total);
+    let mut replayer = Replayer::new(&commands);
+    for id in 1..=total {
+        replayer.apply_run(&run(id, id, T0 + id));
+    }
+    let matcher = SkimMatcherV2::default();
+    let again = run(total + 1, 1, T0 + total + 10);
+    let group = build_run_group(&replayer, &matcher, &again, "", 42).unwrap();
+    let negatives: Vec<u32> = group
+        .rows
+        .iter()
+        .filter(|row| row.label == 0.0)
+        .map(|row| row.idx)
+        .collect();
+    assert_eq!(negatives.len(), CMD_TRAIN_RANDOM_NEGATIVES);
+    assert!(negatives.iter().all(|&idx| idx >= 100), "{negatives:?}");
+    // A non-empty query draws from every matching command, old ones too.
+    assert!((1..=10).any(|seed| {
+        let group = build_run_group(&replayer, &matcher, &again, "g", seed).unwrap();
+        group
+            .rows
+            .iter()
+            .any(|row| row.label == 0.0 && row.idx < 100)
+    }));
+}
