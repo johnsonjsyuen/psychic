@@ -175,6 +175,7 @@ pub(super) fn snapshot() -> serde_json::Map<String, serde_json::Value> {
         CMD_PAGE_PREFETCH,
         CMD_IMPRESSION_AGE_MS,
         CMD_TICK_MS,
+        CMD_EXIT_DELETE_WAIT_MS,
         CMD_STACK_BELOW_COLS,
         CMD_RECENCY_RANK_CAP,
         CMD_STAGE2_K,
