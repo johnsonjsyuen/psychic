@@ -33,7 +33,7 @@ this phase is built to the design in section 12 so that they pass there.
 
 ## 2. Files touched
 
-New files: `src/cmd/{index,rank,worker,events,keys,app,render}.rs`,
+New files: `src/cmd/{index,rank,worker,fuzzy,events,keys,app,render}.rs`,
 `tests/picker.rs`. Extended: `src/cmd/mod.rs` (the no-action branch of
 `run_history`), `src/cmd/tuning.rs` (section 3), `src/cmd/store.rs` (R1 split
 by id and the start-up reader methods, [01 section 6.5](01-record.md#65-cmdstore-methods-and-row-types)),
@@ -140,6 +140,7 @@ pub(super) struct CommandEntry {
     pub text_lower: Box<str>,          // text.to_lowercase(), computed once
     pub chars: u32,                    // text.chars().count()
     pub words: u32,                    // template::word_count(text)
+    pub classes: u64,                  // fuzzy::text_classes(text): one bit per byte class present (section 6.3)
     pub last_run_at: i64,
     pub run_count: u32,
     pub success_count: u32,
@@ -154,6 +155,7 @@ pub(super) struct DirStat { pub runs: u32, pub last_run_at: i64 }
 
 pub(super) struct CommandIndex {
     pub entries: Vec<CommandEntry>,                         // position = "idx" (u32) used everywhere below
+    filter_classes: Vec<u64>,                               // per idx: entry.classes | fuzzy::LIVE, LIVE cleared by remove; read by the filter only
     by_db_id: FxHashMap<i64, u32>,
     pub dirs: Interner, pub repos: Interner, pub templates: Interner,
     dir_stats: FxHashMap<(u32, u32), DirStat>,              // (idx, dir id)
@@ -181,7 +183,7 @@ pub(super) struct RankContext {
 | `add_command(db_id, text) -> u32` | Push an entry with zero counts; fill `text_lower`, `chars`, `words`; register in `by_db_id`. Asserts `db_id` is new |
 | `record_run(idx, at, dir: Option<u32>, repo: Option<u32>, exit: Option<i32>, prev_template: Option<u32>)` | `run_count += 1`; `success_count`/`fail_count` by `exit`; if `at >= last_run_at` then `last_exit_code = exit`; `last_run_at = max`; non-zero `exit` -> `last_fail_at = max(last_fail_at, at)`; insert `at` into `run_times` at `partition_point(\|&t\| t <= at)`; for a `Some` dir: `dir_stats[(idx, dir)].runs += 1` and its `last_run_at = max(last_run_at, at)`; for a `Some` repo: `repo_runs += 1`; for a `Some` prev_template: `followers += 1` |
 | `record_pick(idx, at, query: &str, episode_queries: &[String])` | Push `at` to `picks[idx]`, to `picks_by_query[query][idx]`, and to `episode_picks_by_query[q][idx]` for each distinct `q` in `episode_queries` |
-| `remove(idx)` | `entries[idx].deleted = true` |
+| `remove(idx)` | `entries[idx].deleted = true`; clear `fuzzy::LIVE` in `filter_classes[idx]` |
 
 ### 5.2 `load` (picker start)
 
@@ -291,7 +293,9 @@ pub(super) fn spawn<T>(data_dir: &Path, params: LoadParams, event_tx: Sender<T>)
 3. Send `Loaded`. Log `TIMING {"op":"cmd_index_load","ms":..,"commands":N}` and
    `TIMING {"op":"cmd_worker_ready","ms":<since PROCESS_START>}`.
 4. Loop: `rx.recv()`, then drain with `try_recv` into a queue applying the
-   supersession rule; process the queue in order.
+   supersession rule; process the queue in order. While seeds (section 6.3)
+   remain to be computed, `try_recv` instead, computing one seed whenever
+   nothing is waiting.
 
 Supersession rule (same as `drain_requests`, [src/search_worker.rs:1508-1534](../../src/search_worker.rs)):
 when the request being queued is an `UpdateQuery` and the last request already
@@ -327,8 +331,23 @@ and `GetRows` refer to):
 | Trail | Drop entries from its end until the last one satisfies `narrowing_applies(query, scope, entry.query, entry.scope)`, that is `!query.is_empty() && !entry.query.is_empty() && query.starts_with(&entry.query) && scope == entry.scope` |
 | Reuse | If the trail's last entry has exactly this query: its candidates are the result (`reused = true`, base-set size 0, no matching). Deleting back to a query typed before costs no filter |
 | Base set | Otherwise the last entry's idx list (`narrowed = true`), or every idx `0..entries.len()` when the trail is empty. (A text that matches a longer query matches its prefix, so narrowing loses nothing) |
-| Per idx | Skip `deleted`. Skip when out of scope (below). Empty query: keep with `fuzzy_score = 0`. Otherwise `matcher.fuzzy_match(&entry.text, query)`: `None` drops the row, `Some(s)` keeps it with `fuzzy_score = s` |
-| Parallelism | `par_iter().filter_map(..).collect()` when the query is non-empty and the base set has at least `CMD_PAR_FILTER_MIN` entries, a plain iterator otherwise (with no query there is nothing to match, and a pass over 50,000 entries costs less than waking the pool). Output order is ascending idx in both cases |
+| Per idx | Skip when `filter_classes[idx]` lacks `LIVE` (deleted). Skip when out of scope (below). Empty query: keep with `fuzzy_score = 0`. Otherwise the prefilter, then the scorer (`src/cmd/fuzzy.rs`, below): rejected or `None` drops the row, `Some(s)` keeps it with `fuzzy_score = s` |
+| Parallelism | When the query is non-empty and the base set has at least `CMD_PAR_FILTER_MIN` entries, the base set is cut into chunks of `FILTER_CHUNK` (1,024, `worker.rs`), one rayon task each with its own output vector, joined in order; a plain loop otherwise (with no query there is nothing to match, and a pass over 50,000 entries costs less than waking the pool). Output order is ascending idx in both cases |
+| Seeds | While no request waits, the worker computes, one per loop turn, the matches in scope `All` of each single character of `SEED_CHARS` (`a`-`z`; an upper-case letter is a case-sensitive query of its own, and a digit or punctuation rarely starts a search; at 50,000 commands the 26 seeds hold about 530,000 candidates, 8.5 MB). When the trail is empty and the scope is `All`, a query starting with a seeded character starts the trail from that seed: typing the first letter is a reuse and the second narrows from it. `Delete` clears the seeds (they are computed again). One slice is one filter pass over every command, so a request that arrives meanwhile waits at most that |
+
+The per-command test (`src/cmd/fuzzy.rs`, `Pattern`): a text can match only
+if it holds every byte of the query in order (ASCII case folded unless the
+query has an ASCII upper-case letter, the matcher's smart case). It is
+checked in two steps: `filter_classes[idx]` must hold every class bit of the
+query (64 bits: `a`-`z` case-folded, `0`-`9`, common punctuation, one bit for
+the rest, one for any non-ASCII byte), which rejects most texts without
+reading them; then the bytes are scanned in order. Only then is the scorer
+called: `SkimMatcherV2::fuzzy_match`, unchanged. This holds for any matcher
+that pairs each query character with an equal text character in order, so
+the prefilter only ever rejects what the scorer would; the candidates and
+scores are exactly those of matching every command (test
+`the_filter_returns_exactly_what_matching_every_command_does`, and digests
+of the 50,000-command key cycle, 04 section 6.6 `--dump`).
 | Afterwards | A non-empty query that was not reused is pushed onto the trail with its result. `Delete` clears the trail (not `current_query`/`current_scope`) |
 | Empty-query cache | The worker keeps the `CommandRanking` of the empty query per scope (`empty_rankings`, shared `Arc`s): asking for it again skips filter and ranking (`reused = true`, stage times 0). `Delete` clears it. When a page needs the rest sorted, the cache's handle is taken out first so `sort_rest` runs in place, and the sorted ranking is cached |
 
@@ -340,7 +359,7 @@ and `GetRows` refer to):
 | `Session` | `index.session_commands.contains(&idx)` |
 
 The closure captures `&CommandIndex`, `&RankContext`, `&SkimMatcherV2` and the
-query: nothing lazily initialised, no lock, no allocation other than the output
+prepared query: nothing lazily initialised, no lock, no allocation other than the output
 ([docs/how-it-works.md:1205-1207](../how-it-works.md)).
 
 ### 6.4 Handling each request
@@ -802,6 +821,8 @@ Targets B1-B3, B5. The decisions that make them reachable:
 | Start-up reads side by side | R1 split by id over `CMD_LOAD_READERS` connections that also build the entries, R2-R8 on one more, each memory-mapped (section 5.2); the rayon pool starts and warms meanwhile (section 6.2) |
 | Work in parallel with terminal set-up | The worker is spawned before the terminal is touched (section 4, steps 2-5) |
 | Parallel filter with a floor | rayon from `CMD_PAR_FILTER_MIN` candidates and only with a query; sequential otherwise, where waking the pool costs more than it saves |
+| Reject before scoring | A 64-bit byte-class mask per command in one array, then an in-order byte scan, before the scorer (section 6.3): most commands are rejected without reading their text, and the empty query reads only the array |
+| First letters precomputed | The matches of each single lower-case letter are computed while the worker is idle after start-up (section 6.3, seeds), so the first letter of a search, a scan of every command, costs no filter |
 | Narrowing and reuse | Typing a longer query re-matches only the matches of its longest prefix typed before; deleting back to a query typed before reuses its matches; the empty query's ranking is kept per scope until a delete (section 6.3) |
 | Sort only what is shown | `select_nth` + sort of the first `CMD_PAGE_ROWS` 32-byte keys; the rest is sorted only when a page reaches it (section 7) |
 | No cold global in the parallel loop | One matcher, warmed on every rayon thread at start (section 6.2, step 2); the registry of Phase C is a `static` array, not a `Lazy` |
