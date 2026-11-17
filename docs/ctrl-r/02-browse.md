@@ -510,6 +510,11 @@ TIMING lines written by the UI thread, each once per process, of the form
 `cmd_first_results` (first accepted `QueryUpdated`), `cmd_first_full_render`
 (end of the first draw that had at least one row, or that followed a
 `QueryUpdated` with zero rows). `cmd_first_full_render` is what B3 measures.
+One more, per accepted `QueryUpdated` (Phase D): `TIMING
+{"op":"cmd_key_to_results","ms":<ms>}` after the draw that follows it, `ms`
+counted from when the UI thread sent the query (the key handler) to the end
+of that draw: the key-to-results time `bench/history.py` reports beside B2
+([04 section 6.3](04-bench.md#63-keystroke-n200---pause-s---b2-and-b1)).
 
 ### 8.3 Layout and rows
 

@@ -7,6 +7,9 @@
 //! Every output here is an aggregate: no command text (01 section 10.6).
 //! There is no SQL in this file; everything goes through `CmdStore`.
 
+mod perf;
+mod relevance;
+
 use super::corpus::{self, Profile};
 use super::store::{CmdStore, CommandRecord, EventRecord, RunRecord, StoreCounts};
 use super::tuning::CMD_EVENT_WINDOW_SECS;
@@ -48,6 +51,41 @@ pub enum BenchCommand {
     },
     /// Describe the history in --data-dir
     Stats,
+    /// Replay the history and score the rankers
+    Relevance {
+        /// Models trained per split, seeds 1..=N
+        #[arg(long, default_value_t = 5)]
+        seeds: u64,
+        /// About this many sampled test runs per split
+        #[arg(long, default_value_t = 2000)]
+        max_test_runs: usize,
+        /// Also the rolling-origin folds at 60, 70 and 80% of the timeline
+        #[arg(long)]
+        folds: bool,
+        #[arg(long)]
+        json: Option<PathBuf>,
+        #[arg(long)]
+        md: Option<PathBuf>,
+        /// The corpus label printed on every result; default: from the history
+        #[arg(long, default_value = "")]
+        label: String,
+        /// Exit 1 unless R1, R2 and R3 all pass
+        #[arg(long)]
+        strict: bool,
+        /// Control run: train on labels shuffled within each group (the model then knows nothing)
+        #[arg(long)]
+        shuffle_labels: bool,
+    },
+    /// Compare two-stage ranking with full scoring
+    Twostage {
+        #[arg(long, default_value_t = 400)]
+        queries: usize,
+    },
+    /// Time filter+rank without a terminal
+    Latency {
+        #[arg(long, default_value_t = 300)]
+        keystrokes: usize,
+    },
 }
 
 /// What `run` needs from the process environment, gathered by the caller.
@@ -118,6 +156,41 @@ pub(super) fn run(
             for line in stats.lines().into_iter().chain(shape.lines()) {
                 writeln!(out, "{line}")?;
             }
+        }
+        BenchCommand::Relevance {
+            seeds,
+            max_test_runs,
+            folds,
+            json,
+            md,
+            label,
+            strict,
+            shuffle_labels,
+        } => {
+            if seeds == 0 {
+                bail!("--seeds must be at least 1");
+            }
+            let options = relevance::Options {
+                seeds,
+                max_test_runs,
+                folds,
+                json,
+                md,
+                label,
+                strict,
+                shuffle_labels,
+            };
+            let today = jiff::Timestamp::from_second(env.now)?
+                .strftime("%Y-%m-%d")
+                .to_string();
+            let passed = relevance::run(data_dir, &options, &today, out, &mut std::io::stderr())?;
+            if options.strict && !passed {
+                bail!("--strict: R1, R2 and R3 did not all pass");
+            }
+        }
+        BenchCommand::Twostage { queries } => perf::twostage(data_dir, queries, out)?,
+        BenchCommand::Latency { keystrokes } => {
+            perf::latency(data_dir, keystrokes, env.home.as_deref(), env.now, out)?
         }
     }
     Ok(())

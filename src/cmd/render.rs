@@ -443,6 +443,26 @@ mod tests {
         assert_eq!(row_text("echo 日本語のテキスト", 10), "echo 日本\u{2026}");
     }
 
+    // TC-N-10 (B5): render functions make no system or SQLite calls.
+    #[test]
+    fn tc_n_10_render_is_pure() {
+        let source = include_str!("render.rs");
+        let code = &source[..source
+            .find("#[cfg(test)]\nmod tests")
+            .expect("the test module is last")];
+        for banned in [
+            "rusqlite",
+            "std::fs",
+            "std::env",
+            "Instant::now",
+            "Timestamp::now",
+            "std::process",
+            "log::",
+        ] {
+            assert!(!code.contains(banned), "render.rs uses {banned}");
+        }
+    }
+
     #[test]
     fn tilde_shortens_only_the_home_directory_itself() {
         assert_eq!(tilde("/home/u", Some("/home/u")), "~");

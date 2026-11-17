@@ -3,7 +3,8 @@
 Implementation specs for `psychic history` (Ctrl-R) in this fork, written with
 the documentation-first "stream coding" method: one Strategic document says
 what and why, four Implementation documents say how. Coding agents implement
-straight from these files. Base commit `8b6246e`. Phases A, D0, B and C are built.
+straight from these files. Base commit `8b6246e`. Phases A, D0, B, C and D are built; the first full
+set of results is in [results.md](results.md).
 
 ## Documents
 
@@ -94,3 +95,5 @@ An implementer who hits one of these fixes the spec first, in the same commit.
 | 11 | Templating is heuristic (`sudo -u bob ls /x` has command word `-u`; `ssh host.com` becomes `ssh PATH`) | [01 section 7](01-record.md#7-templating) | Deterministic and specified; templates feed only the two sequence features |
 | 12 | B4 on a real disk: `track-command` skips the close-time checkpoint and truncates the log past `CMD_WAL_TRUNCATE_BYTES` | [01 section 9.1](01-record.md#91-the-write-ahead-log-of-track-command) | Measured with a Python harness (not `bench/history.py`) on ext4 NVMe at the perf DB: p95 7.2-8.8 ms over three series of 500 runs, log at most 2,047 KiB over 5,000 runs. Open: with 8 writers at once p95 is ~21.5 ms (was 12.4-13.7 ms; the log then reached 77 MB, now 2.7 MiB), because a truncating run holds the write lock through its `fsync`s; B4 is defined for sequential runs |
 | 13 | The synthetic `interactive` profile is calibrated on 500 runs of one person's bash history (one session, synthetic timestamps, cwd known for 10.8% of runs) | [04 section 4.3](04-bench.md#43-corpus-3-synthetic-generator) | Immediate repeats, top-10/top-100 shares, commands run once, recurrence gaps and lengths are matched at 203 / 500 and checked at 2,000 / 20,000 and 50,000 / 500,000; how they scale, directory and session locality, timestamps and exit codes are assumptions listed there. Relevance is reported per profile (`interactive`, `repetitive`, `agent`) |
+| 14 | What the Phase D numbers can and cannot say: every decided figure is on synthetic corpora; no corpus has a Ctrl-R pick; the made-up query is always a prefix (which favours `fzf_scored`); on the perf DB the picker has no repository (the `/synth` directories do not exist) | [results.md](results.md), [04 section 6](04-bench.md#6-performance-benchmarks) | Open until a real timestamped history with picks exists |
+| 15 | B2 as defined (keystroke to first byte) is the echo of the query line, drawn before the worker answers; key to results drawn is logged as `cmd_key_to_results` and reported beside it, not a target | [04 section 6.3](04-bench.md#63-keystroke-n200---pause-s---b2-and-b1) | Open to the owner: B2 could be redefined on `cmd_key_to_results` |

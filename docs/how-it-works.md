@@ -2755,13 +2755,14 @@ Why: User might scroll up/down many times. Only log once per (query, file) combi
 
 Ctrl-R over the user's shell history, ranked by directory, repository and
 the previous command. Specified in `docs/ctrl-r/` (start at its README); built
-in phases. **Phases A ("Record"), D0 (benchmark corpora), B ("Browse") and
-C ("Learn") are what exists today:** commands are recorded and imported,
+in phases. **Phases A ("Record"), D0 (benchmark corpora), B ("Browse"),
+C ("Learn") and D ("Bench") are what exists today:** commands are recorded and imported,
 `psychic history` manages them, `psychic history` with no action flag is the
 Ctrl-R picker (a heuristic, and a learned model on top of it once one is
 trained), `psychic history --retrain` trains that model, and `psychic
-internal bench-history` builds and describes benchmark corpora. The relevance
-and latency benchmarks are Phase D.
+internal bench-history` builds and describes benchmark corpora and runs the
+relevance, two-stage and latency benchmarks; `bench/history.py` times the
+picker on a pty. Results are logged in `docs/ctrl-r/results.md`.
 
 New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
 `history_mode` and `ToggleHistoryMode` already mean directory back/forward.
@@ -2778,6 +2779,8 @@ New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
 | `cmd/track.rs` | `psychic track-command` |
 | `cmd/backfill.rs` | Import from Atuin, zsh, bash and fish history |
 | `cmd/bench.rs` | `psychic internal bench-history`: clap types, the data-dir guard's callee, `stats` |
+| `cmd/bench/relevance.rs` | `bench-history relevance`: train at a cut, replay what came after, rank every sampled run's command with four rankers |
+| `cmd/bench/perf.rs` | `bench-history twostage` (two-stage vs full scoring) and `latency` (filter + rank per keystroke, no terminal) |
 | `cmd/corpus.rs` | The seeded synthetic generator and the Claude Code transcript extractor |
 | `cmd/index.rs` | `CommandIndex`: every ranking statistic in memory, loaded at picker start or filled by replay (training) |
 | `cmd/worker.rs` | The picker's worker thread: requests and responses, the filter, narrowing and reuse, the `cmd_query` TIMING line |
@@ -2993,7 +2996,13 @@ command text. Measured on the 50,000-command perf DB: `--retrain` 8.5-8.8 s
 39-41 ms p50 / 46-51 ms p95 (one run of three 0.9 ms over the 50 ms target;
 the model adds about 2 ms to the first query). On a held-out last 20% of that corpus (one
 seed, 600 lookups) the model's top-1 beat newest-first by 0.03-0.05 at query
-lengths 1-3 and lost 0.03 at length 0; Phase D measures it properly.
+lengths 1-3 and lost 0.03 at length 0. Phase D's harness (below, and
+`docs/ctrl-r/results.md`) measured it on five seeds: on the interactive
+50,000-command corpus the model is 0.20 top-1 above newest-first for a
+two-character query on commands last run more than 10 minutes ago, but
+still below fuzzy-score order, and the heuristic is below newest-first;
+worker per keystroke 3.4-3.5 ms p50 / 8.2-9.5 ms p95 (the first letter's
+full scan), first results on screen 37-46 ms p50 / 43-58 ms p95.
 
 **Ctrl-R widgets.** Appended to the three scripts, after the recording block.
 Each passes the line being edited as `--query=` (with `=`, so a line starting
@@ -3196,6 +3205,9 @@ against a true 1.89ms.
 
 ### The two benchmark harnesses: `bench/`
 
+(Shell history search has its own pair, described at the end of this
+section: `psychic internal bench-history relevance` and `bench/history.py`.)
+
 There are two, because psychic has two things that can regress independently.
 **Speed** is `bench/run.py`: how long until the list appears, how long from a
 keystroke to a redraw. **Ranking quality** is `bench/model.py`: whether the file
@@ -3314,6 +3326,49 @@ count and be compared as two differently sized models. `objectives` trains one
 feature set two ways, because `compare` takes `train.py` from the working tree
 for *both* arms - a training-parameter change reads `+0.0000` there, and the tool
 now says so rather than letting the next person believe it.
+
+#### Shell history search: `bench-history relevance` and `bench/history.py`
+
+Command mode is measured by its own pair (`docs/ctrl-r/04-bench.md`
+sections 5 and 6), never by `run.py` or `model.py`, which stay untouched.
+
+```bash
+P="psychic --data-dir <scratch copy of a corpus>"
+$P internal bench-history relevance --seeds 5 --folds --json r.json --md r.md
+$P internal bench-history relevance --seeds 5 --shuffle-labels   # the control
+HOME=<scratch> ./bench/history.py --work <dir on a real disk> setup [--from <corpus dir>]
+HOME=<scratch> ./bench/history.py --work <dir> all               # B1-B4, B6-B8
+HOME=<scratch> ./bench/history.py --work <dir> latency 300        # stage times, no pty
+```
+
+**Relevance is a replay, in Rust, through the shipped code.** The timeline
+is cut at 80% of the runs (and at 60/70/80% with `--folds`); five models are
+trained on what came before the cut, side by side, with the production
+`build_training_set` and `fit_seeded`, written as model files and loaded back
+with `CmdModel::load`. Then the replay continues from the state at the cut,
+and every sampled later run is a lookup: its command's first 0-3 characters
+as the query, all matching commands as candidates (`filter_candidates`),
+ranked by newest first (the baseline of the pass bars), fuzzy score then
+newest (what fzf does), the heuristic, and each model (`rank_commands`), and
+only then is the run applied. A target never run before is unreachable, not
+a miss. Three tests guard the leakage that would make it look better than it
+is: the model trained at a cut is byte-identical to one trained on the
+history truncated there; a lookup sees its target's previous run, not
+itself; the replay state equals a fresh load from SQL, feature by feature.
+`--shuffle-labels` permutes the labels inside each training group, and the
+model then falls to about 0.03 top-1, far below every baseline: what it
+gains is learned, not leaked.
+
+**`history.py` refuses to run with the real `HOME`**, because every psychic
+subcommand but `track-command` writes a log into its data directory; every
+child gets a fixed environment and `--data-dir`. It times the picker on a
+40x120 pty against a 50,000-command perf DB with a pinned model and
+`PSYCHIC_NO_RETRAIN=1`. Two traps found in review: the first byte after a
+key is the echo of the query line, drawn before the worker answers, so the
+picker logs its own `cmd_key_to_results` line for the time to the results;
+and a key cycle that types the same word again is answered from the
+worker's trail of earlier matches, so the cycle uses six words with six
+different first letters to keep the full scan of a first letter in B1.
 
 ## Shutdown Sequence
 

@@ -89,6 +89,7 @@ fn options(max_run_groups: usize) -> BuildOptions {
         seed: 42,
         max_run_groups,
         until: None,
+        shuffle_labels: false,
     }
 }
 

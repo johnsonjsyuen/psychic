@@ -642,11 +642,21 @@ fn event_loop(
     data_dir: &Path,
 ) -> Result<Option<Arc<str>>> {
     let (mut first_render, mut first_results, mut first_full_render) = (false, false, false);
+    // When the query whose results arrived was sent: the next draw shows them.
+    let mut results_to_draw: Option<Instant> = None;
     loop {
         app.log_impressions_if_due();
         let mut layout = render::CmdLayout { visible_rows: 0 };
         terminal.draw(|f| layout = render::draw(f, app))?;
         app.set_visible_rows(layout.visible_rows);
+        if let Some(sent) = results_to_draw.take() {
+            // Query sent (on the key) to its results drawn: what the user
+            // waits for after a keystroke (bench/history.py, 04 section 6.3).
+            log::info!(
+                "TIMING {{\"op\":\"cmd_key_to_results\",\"ms\":{:.3}}}",
+                sent.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         log_once(&mut first_render, "cmd_first_render");
         if app.has_results() {
             log_once(&mut first_full_render, "cmd_first_full_render");
@@ -661,7 +671,9 @@ fn event_loop(
         };
         match event {
             CmdEvent::Worker(response) => {
+                let sent = app.query_sent_at;
                 if app.on_worker(response) {
+                    results_to_draw = sent;
                     if !first_results {
                         app.timings.first_results_ms = Some(since_start_ms());
                         // Training never runs in the picker (ADR-10): this

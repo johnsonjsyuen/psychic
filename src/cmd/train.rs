@@ -82,24 +82,33 @@ impl ReplayInput {
 
 /// One step of the timeline: runs and events merged by time.
 #[derive(Clone, Copy)]
-enum Step<'a> {
+pub(super) enum Step<'a> {
     Run(&'a RunRecord),
     Event(&'a EventRecord),
 }
 
 /// Runs (by `started_at`) and events (by `timestamp`) merged, events first at
 /// equal times, ending before the first step at or after `until`.
-struct Timeline<'a> {
+pub(super) struct Timeline<'a> {
     runs: Peekable<std::slice::Iter<'a, RunRecord>>,
     events: Peekable<std::slice::Iter<'a, EventRecord>>,
+    /// Steps before this time are skipped.
+    from: Option<i64>,
     until: Option<i64>,
 }
 
 impl<'a> Timeline<'a> {
-    fn new(input: &'a ReplayInput, until: Option<i64>) -> Self {
+    pub(super) fn new(input: &'a ReplayInput, until: Option<i64>) -> Self {
+        Self::window(input, None, until)
+    }
+
+    /// The steps at or after `from` and before `until`: what happens after a
+    /// replay stopped at `from` (the benchmark's test window).
+    pub(super) fn window(input: &'a ReplayInput, from: Option<i64>, until: Option<i64>) -> Self {
         Timeline {
             runs: input.runs.iter().peekable(),
             events: input.events.iter().peekable(),
+            from,
             until,
         }
     }
@@ -109,28 +118,32 @@ impl<'a> Iterator for Timeline<'a> {
     type Item = Step<'a>;
 
     fn next(&mut self) -> Option<Step<'a>> {
-        let event_first = match (self.events.peek(), self.runs.peek()) {
-            (Some(event), Some(run)) => event.timestamp <= run.started_at,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (None, None) => return None,
-        };
-        let (step, at) = if event_first {
-            let event = self.events.peek().expect("peeked");
-            (Step::Event(event), event.timestamp)
-        } else {
-            let run = self.runs.peek().expect("peeked");
-            (Step::Run(run), run.started_at)
-        };
-        if self.until.is_some_and(|until| at >= until) {
-            return None;
+        loop {
+            let event_first = match (self.events.peek(), self.runs.peek()) {
+                (Some(event), Some(run)) => event.timestamp <= run.started_at,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => return None,
+            };
+            let (step, at) = if event_first {
+                let event = self.events.peek().expect("peeked");
+                (Step::Event(event), event.timestamp)
+            } else {
+                let run = self.runs.peek().expect("peeked");
+                (Step::Run(run), run.started_at)
+            };
+            if self.until.is_some_and(|until| at >= until) {
+                return None;
+            }
+            if event_first {
+                self.events.next();
+            } else {
+                self.runs.next();
+            }
+            if self.from.is_none_or(|from| at >= from) {
+                return Some(step);
+            }
         }
-        if event_first {
-            self.events.next();
-        } else {
-            self.runs.next();
-        }
-        Some(step)
     }
 }
 
@@ -265,7 +278,6 @@ impl Replayer {
     }
 
     /// The dir id of the command's most recent run with a known cwd.
-    #[allow(dead_code, reason = "the benchmark's other_dir slice (Phase D)")]
     pub fn last_cwd(&self, idx: u32) -> Option<u32> {
         self.last_cwd[idx as usize]
     }
@@ -349,6 +361,19 @@ impl Replayer {
             pick: event.clone(),
             impressions,
         })
+    }
+
+    /// Apply one step of the timeline: a run, or an event (committing the
+    /// pick it ends, if any).
+    pub fn apply_step(&mut self, step: Step<'_>) {
+        match step {
+            Step::Run(run) => self.apply_run(run),
+            Step::Event(event) => {
+                if let Some(episode) = self.apply_event(event) {
+                    self.commit_pick(&episode);
+                }
+            }
+        }
     }
 
     /// Record the episode's pick in the index.
@@ -580,6 +605,10 @@ pub(super) struct BuildOptions {
     pub max_run_groups: usize,
     /// `Some(t)`: stop the timeline at the first run or event at or after `t`.
     pub until: Option<i64>,
+    /// A benchmark control, never set by training: each group's positive
+    /// label moves to a row of the group drawn by a seeded hash, so the
+    /// labels carry nothing true (04-bench.md section 5.7).
+    pub shuffle_labels: bool,
 }
 
 /// Groups by kind, and rows.
@@ -601,7 +630,6 @@ pub(super) struct BuiltSet {
     pub set: crate::training::TrainingSet,
     pub counts: GroupCounts,
     /// The replay state at `until` (or the end).
-    #[allow(dead_code, reason = "the benchmark continues from it (Phase D)")]
     pub replayer: Replayer,
 }
 
@@ -675,7 +703,10 @@ fn eligible_runs(input: &ReplayInput, until: Option<i64>) -> usize {
 pub(super) fn build_training_set(input: &ReplayInput, options: &BuildOptions) -> BuiltSet {
     let built = build_groups(input, options);
     let mut builder = SetBuilder::default();
-    for group in built.groups {
+    for (ordinal, mut group) in built.groups.into_iter().enumerate() {
+        if options.shuffle_labels {
+            shuffle_labels(&mut group, splitmix64(options.seed ^ ordinal as u64));
+        }
         builder.push(group);
     }
     BuiltSet {
@@ -683,6 +714,29 @@ pub(super) fn build_training_set(input: &ReplayInput, options: &BuildOptions) ->
         counts: built.counts,
         replayer: built.replayer,
     }
+}
+
+/// Permute the labels of `group` (Fisher-Yates on a splitmix64 stream from
+/// `state`): the group keeps its rows and its number of positives, but which
+/// rows are positive no longer depends on what was run.
+fn shuffle_labels(group: &mut Group, mut state: u64) {
+    for i in (1..group.rows.len()).rev() {
+        state = splitmix64(state);
+        let j = (state % (i as u64 + 1)) as usize;
+        let (a, b) = (group.rows[i].label, group.rows[j].label);
+        group.rows[i].label = b;
+        group.rows[j].label = a;
+    }
+}
+
+/// The replay state after every run and event before `until` (or all of
+/// them), without building any group: what serving would have loaded then.
+pub(super) fn replay(input: &ReplayInput, until: Option<i64>) -> Replayer {
+    let mut replayer = Replayer::new(&input.commands);
+    for step in Timeline::new(input, until) {
+        replayer.apply_step(step);
+    }
+    replayer
 }
 
 /// The groups of a replay, in time order.
@@ -1029,6 +1083,7 @@ fn train_and_write(data_dir: &Path, seed: u64, report: &Report) -> Result<Retrai
         seed,
         max_run_groups: CMD_TRAIN_MAX_RUN_GROUPS,
         until: None,
+        shuffle_labels: false,
     };
     let built = build_training_set(&input, &options);
     drop(input);

@@ -59,6 +59,9 @@ pub(super) struct CmdRankTimings {
     pub predict_ms: Option<f64>,
     pub blend_ms: Option<f64>,
     pub stage2: usize,
+    /// The part of `heuristic_ms` and `blend_ms` spent selecting and sorting
+    /// (the benchmark's stage breakdown; not on the TIMING line).
+    pub sort_ms: f64,
 }
 
 /// The ranked scores and what they cost.
@@ -308,7 +311,9 @@ fn apply_model(
         score.ml_weight = w;
         keys.push(sort_key(index, score.score, score.idx, at as u32));
     }
+    let sort_started = Instant::now();
     keys.sort_unstable_by(compare);
+    ranking.timings.sort_ms += ms_since(sort_started);
     let order: Vec<usize> = keys.iter().map(|key| key.at as usize).collect();
     permute(head, &order);
     ranking.feature_rows = order.iter().map(|&at| at as u32).collect();
@@ -385,6 +390,7 @@ fn rank_heuristic(
     } else {
         candidates.iter().enumerate().map(score).unzip()
     };
+    let sort_started = Instant::now();
     let selected = select.min(keys.len());
     let sorted = head.min(keys.len());
     if sorted < keys.len() {
@@ -400,6 +406,7 @@ fn rank_heuristic(
     } else {
         keys.sort_unstable_by(compare);
     }
+    let sort_ms = ms_since(sort_started);
     let build = |key: &SortKey| {
         let at = key.at as usize;
         CommandScore {
@@ -422,6 +429,7 @@ fn rank_heuristic(
         sorted,
         timings: CmdRankTimings {
             heuristic_ms: ms_since(started),
+            sort_ms,
             ..CmdRankTimings::default()
         },
         model_failed: false,

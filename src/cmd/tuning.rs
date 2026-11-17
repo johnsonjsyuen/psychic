@@ -136,3 +136,69 @@ pub(super) const CMD_PICK_RUN_SECS: i64 = 300;
 
 /// A training lock file older than this is taken over.
 pub(super) const CMD_TRAIN_LOCK_STALE_SECS: u64 = 900;
+
+/// Every constant above as `name -> value`: the `tuning` object of the
+/// relevance benchmark's JSON (`docs/ctrl-r/04-bench.md` section 5.6), so a
+/// result names the settings it was measured with.
+pub(super) fn snapshot() -> serde_json::Map<String, serde_json::Value> {
+    macro_rules! entries {
+        ($($name:ident),* $(,)?) => {{
+            let mut map = serde_json::Map::new();
+            $(map.insert(stringify!($name).to_string(), serde_json::json!($name));)*
+            map
+        }};
+    }
+    entries!(
+        CMD_MAX_TEXT_BYTES,
+        CMD_SEQUENCE_MAX_GAP_SECS,
+        CMD_MARKER_FILE,
+        CMD_EVENT_WINDOW_SECS,
+        CMD_OWN_COMMANDS,
+        CMD_PATH_ARG_COMMANDS,
+        CMD_WAL_TRUNCATE_BYTES,
+        CMD_H_W_RECENCY,
+        CMD_H_W_DIR,
+        CMD_H_W_REPO,
+        CMD_H_W_FUZZY,
+        CMD_H_RECENCY_SCALE_SECS,
+        CMD_H_DIR_SATURATION,
+        CMD_LOAD_READERS,
+        CMD_PAR_FILTER_MIN,
+        CMD_PAGE_ROWS,
+        CMD_PAGE_PREFETCH,
+        CMD_IMPRESSION_AGE_MS,
+        CMD_TICK_MS,
+        CMD_STACK_BELOW_COLS,
+        CMD_STAGE2_K,
+        CMD_BLEND_SCALE,
+        CMD_PICK_WEIGHT,
+        CMD_HOOK_WEIGHT,
+        CMD_IMPORT_WEIGHT,
+        CMD_TRAIN_SEED,
+        CMD_TRAIN_MAX_RUN_GROUPS,
+        CMD_TRAIN_MIN_GROUPS,
+        CMD_TRAIN_QLEN_MIX,
+        CMD_TRAIN_RECENT_NEGATIVES,
+        CMD_TRAIN_RECENT_SCAN,
+        CMD_TRAIN_RANDOM_NEGATIVES,
+        CMD_TRAIN_RANDOM_TRIES,
+        CMD_NEVER_SECS_LOG,
+        CMD_FAIL_RECENT_SECS,
+        CMD_RETRAIN_MIN_INTERVAL_SECS,
+        CMD_PICK_RUN_SECS,
+        CMD_TRAIN_LOCK_STALE_SECS
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_snapshot_holds_every_constant() {
+        let source = include_str!("tuning.rs");
+        let declared = source
+            .lines()
+            .filter(|line| line.starts_with("pub(super) const "))
+            .count();
+        assert_eq!(super::snapshot().len(), declared);
+    }
+}

@@ -28,8 +28,9 @@ $P --data-dir $W/cmd-real history --import && $P --data-dir $W/cmd-real internal
 for C in cmd-real cmd-agent cmd-synth-small; do
   $P --data-dir $W/$C internal bench-history relevance --seeds 5 --folds --json $W/$C/relevance.json --md $W/$C/relevance.md
 done
-./bench/history.py setup          # builds the perf DB of 00 section 2 in $W/cmd-perf, trains and pins its model
-./bench/history.py all            # B1-B4, B6, B7, B8; writes $W/cmd-results.json and prints the table of section 6.7
+H="env HOME=<scratch home> ./bench/history.py --work <scratch dir on a real disk>"   # section 6: it refuses the real HOME
+$H setup          # builds the perf DB of 00 section 2 in <work>/cmd-perf, trains and pins its model
+$H all            # B1-B4, B6, B7, B8; writes <work>/cmd-results.json and prints the table of section 6.7
 ./bench/run.py setup HEAD~1 && ./bench/run.py startup 6 && ./bench/run.py keystroke 30   # file mode unchanged (B9)
 ls ~/.local/share/psychic -la     # mtimes unchanged by any command above
 ```
@@ -39,7 +40,7 @@ ls ~/.local/share/psychic -la     # mtimes unchanged by any command above
 | Commit | New files | Upstream edits |
 |---|---|---|
 | **D0** (after Phase A; developed in parallel with B, committed **before** B, which rebases onto it) | `src/cmd/corpus.rs`; `src/cmd/bench.rs` with `BenchArgs` and the `Generate`, `ExtractAgent`, `Stats` variants and arms (no stubs for the rest) | [src/cli.rs:121-157](../../src/cli.rs): add `InternalCommands::BenchHistory(crate::cmd::bench::BenchArgs)` with the doc comment `/// Benchmark shell history search: build corpora, measure relevance and latency`. [src/main.rs:500](../../src/main.rs) (the `Commands::Internal` match): add `InternalCommands::BenchHistory(args) => return cmd::run_bench(&data_dir, cli.data_dir.is_some(), args),` |
-| **D** (after Phase C) | The `Relevance`, `Twostage`, `Latency` variants of section 3 and their arms in `src/cmd/bench.rs`; `bench/history.py`; `docs/ctrl-r/results.md`; one test added to `src/cmd/render.rs` (TC-N-10) | `docs/how-it-works.md`: add the command benchmarks to "The two benchmark harnesses" ([docs/how-it-works.md:2906](../how-it-works.md)) |
+| **D** (after Phase C) | The `Relevance`, `Twostage`, `Latency` variants of section 3 and their arms in `src/cmd/bench.rs`, with the relevance benchmark in `src/cmd/bench/relevance.rs` (its tests in `src/cmd/bench/relevance/tests.rs`) and `twostage` / `latency` in `src/cmd/bench/perf.rs`; `bench/history.py`; `docs/ctrl-r/results.md`; one test added to `src/cmd/render.rs` (TC-N-10). Small edits to Phase C files the benchmark needs: `train.rs` (`Timeline`, `Step` and `Timeline::window` visible to the benchmark, `Replayer::apply_step`, `replay`, `BuildOptions.shuffle_labels`), `rank.rs` (`CmdRankTimings.sort_ms`, not on the TIMING line), `tuning.rs` (`snapshot`, the `tuning` object of 5.6), `app.rs` (the `cmd_key_to_results` TIMING line of 6.3) | `docs/how-it-works.md`: add the command benchmarks to "The two benchmark harnesses" ([docs/how-it-works.md:2906](../how-it-works.md)) |
 
 `bench/harness.py`, `bench/run.py` and `bench/model.py` are imported or run, never edited (ADR-19).
 
@@ -71,10 +72,11 @@ pub enum BenchCommand {
     ExtractAgent { #[arg(long)] projects_dir: Option<PathBuf> },
     /// Describe the history in --data-dir
     Stats,
-    /// Replay the history and score three rankers
+    /// Replay the history and score the rankers
     Relevance { #[arg(long, default_value_t = 5)] seeds: u64, #[arg(long, default_value_t = 2000)] max_test_runs: usize,
                 #[arg(long)] folds: bool, #[arg(long)] json: Option<PathBuf>, #[arg(long)] md: Option<PathBuf>,
-                #[arg(long, default_value = "")] label: String, #[arg(long)] strict: bool },
+                #[arg(long, default_value = "")] label: String, #[arg(long)] strict: bool,
+                #[arg(long)] shuffle_labels: bool },   // the control of section 5.7
     /// Compare two-stage ranking with full scoring
     Twostage { #[arg(long, default_value_t = 400)] queries: usize },
     /// Time filter+rank without a terminal
@@ -340,7 +342,9 @@ For each split, with `t_s` its training cut:
    `CMD_TRAIN_MIN_GROUPS` groups, or `fit_seeded` returning an `Err` that starts
    with `every split needs rows`; it does not depend on the seed's LightGBM
    randomness, so the whole split is reported as `skipped: not enough training
-   groups`. Any other `Err` skips that seed only (E-N-12).
+   groups`. Any other `Err` skips that seed only (E-N-12). The seeds train
+   side by side, one thread each (LightGBM here is single-threaded); each
+   result depends on its seed only, so the output is the same as in sequence.
 2. The replay state at `t_s` is `built.replayer` (identical for every seed;
    taken from seed 1).
 3. Sample the test runs. A pre-pass over the timeline with a seen-set (commands
@@ -397,13 +401,22 @@ Per (split, ranker, slice, query length): `n`, `top1`, `top3`, `top10`
 | R3 | min over (`all`, `gt10min`, `other_dir`) x 4 lengths x 4 metrics of `heuristic - recency` | value, the worst cell, PASS/FAIL |
 
 A cell with `n < 200` is printed with its value and marked `low n`; a verdict
-that depends on such a cell is `INCONCLUSIVE`, not PASS. With `--strict` the
+that depends on such a cell is `INCONCLUSIVE`, not PASS. For R2 and R3, which
+take a minimum over many cells: a cell with `n >= 200` below the bar makes the
+verdict FAIL (it names the worst such cell); otherwise any low-`n` or empty
+cell makes it `INCONCLUSIVE`; otherwise PASS. R1 and R2 are `INCONCLUSIVE`
+when fewer than 3 seeds trained (E-N-12), whatever their cells say. A lookup whose target does not match
+its own prefix (none has been seen) counts as a miss for every ranker and is
+counted in the output. With `--strict` the
 process exits 1 unless all three verdicts are PASS.
 
 ### 5.6 Output
 
-stdout and `--md`: the label, the `stats` block, the unreachable shares, then
-for the holdout split one table per slice:
+stdout and `--md` (the same Markdown; progress and elapsed times go to
+stderr): the label, the `stats` block, the unreachable shares, then
+for the holdout split one table per slice (all six of 5.4), with `top1`,
+`top3`, `top10` and `mrr` at each length and `n` per length in the heading;
+the layout below is abridged to two metrics:
 
 ```
 slice gt10min (n=1,412)       len 0            len 1            len 2            len 3
@@ -434,24 +447,58 @@ with `--folds` a compact per-fold table of `top1` at length 2 for `all` and
                 "R3": {"value": 0.0, "cell": "...", "status": "PASS"} } }
 ```
 
-For unseeded rankers `sd` is 0 and `min == max == mean`.
+For unseeded rankers `sd` is 0 and `min == max == mean`. Each split also
+carries `sampled`, `reachable`, `not_matched` and `after_pick` (sampled runs
+skipped as the execution of a pick), a skipped split a `skipped` reason, and
+each verdict its `n`. Values are rounded to 6 decimals; an empty cell's are
+`null`.
+
+### 5.7 Leakage controls
+
+What keeps the future out of a measurement, and the test that checks each:
+
+| Risk | Guard | Checked by |
+|---|---|---|
+| The model sees runs or events at or after the cut | `BuildOptions.until` stops the training replay at the first step at or after `t_s` | `training_at_a_cut_sees_nothing_after_it`: the model text trained on the whole history cut at `t_s` equals the one trained on the history with every run at or after `t_s` deleted |
+| A test run's own execution is in the index when it is ranked | Rank, then `apply_run`; a `debug_assert` that the target's `last_run_at` is not after the run | `a_lookup_is_ranked_before_its_own_run_is_applied` (recency rank 2, not 1) |
+| A command's later runs feed its features | Features read only the replay index, which holds the past | IT-N-02 (the replay state equals a fresh load from SQL at that moment) |
+| The model's gain comes from something other than what it learned | `relevance --shuffle-labels`: each training group's labels are permuted (seeded Fisher-Yates), the counts and features unchanged | Run on each corpus; the model must fall to the heuristic's level or below. Reported in `results.md` |
 
 ## 6. Performance benchmarks
 
 `bench/history.py` (new; `#!/usr/bin/env python3`, standard library only),
-importing `REPO`, `WORK`, `ROWS`, `COLS`, `Version`, `spawn`, `stop`,
+importing `REPO`, `ROWS`, `COLS`, `Version`, `spawn`,
 `drain_for`, `read_until_quiet` from `bench/harness.py`
 ([:36-41](../../bench/harness.py), [:44](../../bench/harness.py), [:83](../../bench/harness.py),
-[:100](../../bench/harness.py), [:135](../../bench/harness.py), [:118](../../bench/harness.py)).
+[:135](../../bench/harness.py), [:118](../../bench/harness.py)).
+Usage: `HOME=<scratch> ./bench/history.py --work <dir> <mode> [N]`.
+`WORK` is `--work`, required, not harness's `/tmp/psychic-bench`: the timings
+belong on a real disk, and `/tmp` may be a small tmpfs. The script refuses to
+run (exit 1) when `HOME` is the account's home directory from the password
+database, or `--work` lies inside the real data directory: every psychic
+subcommand except `track-command` writes a log into its data directory. Every
+psychic process gets `--data-dir WORK/cmd-perf` and a fixed environment
+(`HOME` = the scratch home, `PATH`, `TERM`, `LANG`, `PSYCHIC_NO_RETRAIN=1`),
+nothing else inherited. A picker is stopped with Esc and reaped, with
+`SIGKILL` only after 2 s; not with harness's `stop`, which also runs `pkill -f`
+for a file-mode `train.py` that command mode never starts.
 Binary: `REPO/target/release/psychic`. Data dir: `WORK/cmd-perf`. Terminal:
 40x120. Percentile: `p(q) = sorted(v)[min(len(v) - 1, ceil(q * len(v)) - 1)]`.
 Every picker launch sets `PSYCHIC_NO_RETRAIN=1`
 ([03 section 8](03-learn.md#8-retraining-trigger)) and restores the pinned model
 files first, so no training runs beside a measurement.
 
-### 6.1 `setup [--commands 50000 --runs 500000 --seed 1]`
+The picker resolves its repository root from the file system; the synthetic
+`/synth/...` directories do not exist, so on the perf DB the picker (and
+`latency`, which resolves it the same way) ranks with no repository: the
+repository term and features read 0. `twostage` uses each run's recorded
+`repo_root`.
 
-`rm -rf WORK/cmd-perf`; `bench-history generate` with those numbers;
+### 6.1 `setup [--commands 50000 --runs 500000 --seed 1 --profile interactive --anchor <now>] [--from DIR]`
+
+`rm -rf WORK/cmd-perf`; `bench-history generate` with those numbers (or, with
+`--from DIR`, a `sqlite3 .backup` of `DIR/events.db` opened read-only, to
+measure a corpus already built);
 `history --enable --no-import`; `history --retrain`; copy `cmd_model.txt` and
 `cmd_model_stats.json` to `WORK/pinned-cmd-*`; pick the benchmark context with
 `sqlite3`: `cwd` = the most frequent `cwd`, `session` = the `shell_session` of
@@ -472,22 +519,50 @@ appended `TIMING` lines. One extra warm-up trial first, discarded.
 | model load | `cmd_model_load.ms` |
 | first query, worker | the first `cmd_query.total_ms` |
 
-### 6.3 `keystroke [N=200]` - B2 and B1
+The startup `ms` values count from psychic's `PROCESS_START` (the start of
+`main`), as file mode's do; process creation and dynamic loading before it
+are not included.
+
+### 6.3 `keystroke [N=200] [--pause S]` - B2 and B1
 
 One picker process: spawn as 6.2; `time.sleep(1.0)`; `read_until_quiet(fd,
-idle=0.5, limit=4.0)`. Keys cycle through `b"git st"` then six `0x7F`
-(Backspace): every key changes the query, and the cycle covers query lengths
-0-6, narrowing (typing) and widening (deleting). Per key: `read_until_quiet(fd)`,
-start the clock, `os.write`, wait for the first readable byte (2 s limit; a
-miss is dropped and counted), stop the clock, `os.read`, `time.sleep(0.05)` -
-the method of [bench/harness.py:218-248](../../bench/harness.py).
+idle=0.5, limit=4.0)`. Keys cycle through six words, `b"git st"`, `b"cargo "`,
+`b"docker"`, `b"make t"`, `b"npm in"`, `b"kubect"`, each typed and then
+deleted with six `0x7F` (Backspace): every key changes the query, and the
+cycle covers query lengths 0-6, narrowing (typing) and widening (deleting).
+Each word starts with another letter: the worker keeps the matches of the
+prefixes typed (its trail, [02 section 6.3](02-browse.md#63-filter)) across
+the empty query, so one repeated word would answer every first letter but the
+first from that trail and B1 would never see the full scan that starts a real
+search. Per key: `read_until_quiet(fd)`, with `--pause S` a further sleep of
+`S` seconds, start the clock, `os.write`, wait for the first readable byte
+(2 s limit; a miss counts as 2,000 ms in B2 and is counted), stop the clock,
+`os.read`, `time.sleep(0.05)` - the method of
+[bench/harness.py:218-248](../../bench/harness.py).
+
+The first byte after a key is the picker's echo of the query line: it redraws
+before the worker answers. B2 is defined on that byte (00 section 2) and so
+is the echo; what the user waits for, the key to its results drawn, is the
+picker's own `cmd_key_to_results` TIMING line (the time from sending the
+query, in the key handler, to the end of the draw that first shows its
+results), reported beside B2 for information. Without a pause the script
+types about every 0.17-0.19 s, under `CMD_IMPRESSION_AGE_MS` (200 ms), so the
+picker seldom logs impressions (an SQLite write on the UI thread, before the
+next draw); `all` therefore also runs `keystroke 100 --pause 0.3`, and B2's
+verdict is the worse of the two runs.
 
 | Reported (p50, p95, n, misses) | From |
 |---|---|
-| **keystroke -> redraw (B2)** | the measured intervals |
+| **keystroke -> first byte, the echo (B2)** | the measured intervals |
+| keystroke -> results drawn | `cmd_key_to_results` lines except the first |
 | **worker time per keystroke (B1)** | `total_ms` of every `cmd_query` TIMING line of this run except the first (the Backspaces are answered by the worker's reuse rules, [02 section 6.3](02-browse.md#63-filter), as a user's are; `reused` says which) |
-| filter / heuristic / features / predict / blend (p50) | the same lines |
+| worker per keystroke, not reused | the lines with `reused: false` (each did a filter and a ranking) |
+| first letter | the lines with `reused: false`, `narrowed: false` and `query_len` 1: a scan of every command |
+| filter / heuristic / features / predict / blend (p50, p95) | the lines with `reused: false` |
 | matched, stage2 (p50, max) | the same lines |
+
+`app.log` is rotated to `app.log.1` at start-up once it reaches 8 MiB; the
+script then reads the rest of the old file and the new one.
 
 ### 6.4 `track [N=200]` - B4
 
@@ -495,7 +570,10 @@ the method of [bench/harness.py:218-248](../../bench/harness.py).
 `psychic --data-dir WORK/cmd-perf track-command --cwd <cwd> --exit-code 0 --duration-ms 5 --session bench -- "bench command <i % 50>"`
 timed with `time.perf_counter()` around `subprocess.run`; the first 10 are
 discarded; report p50, p95, max. Run against the perf DB because insert cost
-depends on index size. (hyperfine is not required.)
+depends on index size. The cwd is the bench context's synthetic `/synth/...`
+directory, which does not exist, so `track-command`'s repository-root walk
+stops at once; in a real deep repository it makes a few more `stat` calls
+(microseconds). (hyperfine is not required.)
 
 ### 6.5 Two-stage check (B8)
 
@@ -514,16 +592,19 @@ share of lookups with `matched > CMD_STAGE2_K`, and PASS/FAIL against B8.
 `bench-history latency --keystrokes 300`: `CommandIndex::load` for the context
 in `--data-dir/bench-context.json` (written by 6.1; missing file ->
 `bail!("run ./bench/history.py setup first")`), the model, then the key cycle of 6.3 driven straight through
-`filter_candidates` (with the worker's narrowing rule; it reuses nothing, so it measures every key) and `rank_commands` (`head = CMD_PAGE_ROWS`, as the worker) on the calling thread; prints p50/p95 of the
-total and the stage means. Not a pass bar: B1 is judged from 6.3.
+`filter_candidates` (with the worker's narrowing rule; it reuses nothing, so it measures every key; its "total" is filter plus ranking, without the building of the result rows the worker's `total_ms` also counts) and `rank_commands` (`head = CMD_PAGE_ROWS`, as the worker) on the calling thread, after one unrecorded cycle that warms the thread pool; prints the mean, p50, p95 and max of the
+total and of each stage (filter, heuristic, features, predict, blend, and
+`sort`: `CmdRankTimings.sort_ms`, the selection and sort inside the heuristic
+and blend stages), and per query length. Not a pass bar: B1 is judged from
+6.3. `history.py latency [N]` runs it on the perf DB with the pinned model.
 
 ### 6.7 `train`, `size`, `all`
 
 | Mode | Measurement | Metric |
 |---|---|---|
-| `train [N=3]` | Wall time of `psychic --data-dir WORK/cmd-perf history --retrain`, N times; median and max | B6 |
+| `train [N=3]` | Wall time of `psychic --data-dir WORK/cmd-perf history --retrain`, N times; median and max; the pinned model is restored after. `cmd_model.txt` is removed before each run, and a run that does not write it again (a training lock held: `--retrain` then exits 0 at once) stops the mode with exit 1 rather than counting as fast | B6 |
 | `size` | `sqlite3 events.db 'VACUUM'`, then the size of `events.db` in MB | B7 |
-| `all` | `startup 30`, `keystroke 200`, `train 3`, `size`, `bench-history twostage`, and last `track 200` (it adds 50 commands and 210 runs to the perf DB, 0.04% of it; `setup` is rerun before comparing two commits); prints the table below; writes `WORK/cmd-results.json` | B1-B4, B6-B8 |
+| `all` | `startup 30`, `keystroke 200`, `keystroke 100 --pause 0.3`, `train 3`, `size`, `bench-history twostage`, and last `track 200` (it adds 50 commands and 210 runs to the perf DB, 0.04% of it; the pickers before it add their impression and pick-less events, a few thousand rows; `setup` is rerun before comparing two commits); prints the table below; writes `WORK/cmd-results.json` | B1-B4, B6-B8 |
 
 ```
 perf DB: 50,000 commands / 500,000 runs, 40x120 pty      p50      p95   target  verdict
@@ -680,6 +761,10 @@ Work top to bottom; within a row try the listed values one at a time.
 | IT-N-05 | Real data dir is never written | Record size and mtime of every file in `get_default_data_dir()` (skip if it does not exist); run IT-N-01's commands | Unchanged afterwards | none |
 | IT-N-06 | No text leaks from the benchmark | IT-N-01 with one command text replaced by `SENTINEL_c0ffee` | Neither stdout, the JSON nor the Markdown contains `SENTINEL_c0ffee` | `remove_dir_all` |
 
+| IT-N-07 | Leakage controls (section 5.7) | IT-N-01's data; a three-run history | The model trained at a cut equals the one trained on the history truncated there; a test lookup is ranked before its own run is applied; shuffled labels keep the group counts and change the model | `remove_dir_all` |
+
+Also unit-tested: `percentile` of section 6 and the key cycle of 6.3 (both in
+`src/cmd/bench/perf.rs`), and that `tuning::snapshot` names every constant.
 `bench/history.py` has no automated test; its check is the "done when" run and
 the self-consistency rule of E-N-08.
 
@@ -701,6 +786,7 @@ the self-consistency rule of E-N-08.
 | E-N-12 | Training fails for one seed | `Err` from `fit_seeded` | That seed is skipped and the seed count printed is the number that succeeded; fewer than 3 -> `INCONCLUSIVE` | - | stdout |
 | E-N-13 | `git rev-parse` unavailable | Command error | `"commit": "unknown"` | - | None |
 | E-N-14 | The binary under test is stale | `history.py` compares the mtime of `target/release/psychic` with the newest `src/**/*.rs` | Prints `binary older than sources: run just build` and exits 1 | - | stderr |
+| E-N-15 | `bench/history.py` run with the real `HOME`, or `--work` inside the real data directory | Section 6 preamble | Message naming the problem; exit 1; nothing run | Rerun with a scratch `HOME` | stderr |
 
 ## 13. References
 
