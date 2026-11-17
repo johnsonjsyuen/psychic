@@ -123,6 +123,7 @@ selection --> println!(command) on stdout, exit 0 --> widget replaces the prompt
 | `app.rs` | UI state, event loop, input handling | B | [02 section 8](02-browse.md#8-ui-thread) |
 | `render.rs` | List, preview, debug pane, help overlay | B | [02 section 8.3](02-browse.md#83-layout-and-rows) |
 | `features.rs` | `CommandFeature`, `COMMAND_FEATURE_REGISTRY`, 23 features | C | [03 section 4](03-learn.md#4-features) |
+| `model.rs` | `CmdModel`: load checks, blend weight, prediction by walking the trees of `cmd_model.txt` in Rust | C | [03 section 7.1](03-learn.md#71-loading-the-model) |
 | `train.rs` | Replay, group building, fit, model files, lock, detached retrain | C | [03 section 5](03-learn.md#5-training-set-replay), [03 section 6](03-learn.md#6-fit-and-model-files) |
 | `corpus.rs` | Agent-transcript extractor, synthetic generator | D0 (parallel with B) | [04 section 4](04-bench.md#4-corpora) |
 | `bench.rs` | `psychic internal bench-history` | D0 (`BenchArgs` with `generate`, `extract-agent`, `stats`), D (`relevance`, `twostage`, `latency`) | [04 section 3](04-bench.md#3-cli-surface) |
@@ -160,7 +161,7 @@ Not edited: `src/keymap.rs`, `src/help.rs`, `src/render.rs`, `src/app.rs`,
 |---|---|
 | Rust, in the existing binary | One install, one data dir, shared LightGBM link; a second binary doubles release work |
 | SQLite, same `events.db` | Same connection setup and pragmas ([src/db.rs:207-216](../../src/db.rs)), plus `mmap_size` on the picker's start-up readers only ([02 section 5.2](02-browse.md#52-load-picker-start)); one file to protect, back up and purge |
-| LightGBM LambdaRank, same parameters as files | Already linked and measured ([src/training/mod.rs:177-199](../../src/training/mod.rs)); parameter changes are a benchmark-driven tuning step, not a starting point |
+| LightGBM LambdaRank, same parameters as files | Already linked and measured ([src/training/mod.rs:177-199](../../src/training/mod.rs)); parameter changes are a benchmark-driven tuning step, not a starting point. Serving walks the trained trees in Rust (ADR-21) |
 | `fuzzy-matcher` SkimMatcherV2 | Already the file matcher ([src/search_worker.rs:808](../../src/search_worker.rs)); one definition of "matches" for filter, features, training and benchmark |
 | rayon | Already a dependency; the 50,000-row filter needs it for B1 |
 | No new crate | Glob matching, FNV hashing and pty test plumbing are each under 60 lines; `regex` was removed upstream in `7b99679` and is not re-added |
@@ -229,6 +230,7 @@ pointing here, not by code.
 | ADR-18 | Shell tests drive real interactive shells through a pty and skip when a shell is missing | Calling hook functions from a non-interactive script | `preexec`, `PROMPT_COMMAND`, `history 1` and `fish_postexec` only behave truthfully in an interactive shell |
 | ADR-19 | Command-mode pty benchmarks live in a new `bench/history.py` that imports `bench/harness.py` | New modes in `bench/run.py` | Zero edits to upstream benchmark files |
 | ADR-20 | Deleting a command stores a 64-bit FNV-1a hash of its text as a tombstone | Storing nothing; storing the text | Without a tombstone the next import restores it; storing the text defeats deletion |
+| ADR-21 | LightGBM trains the command model; the picker predicts by walking the trees of `cmd_model.txt` in Rust (`model.rs`), LightGBM's raw scores bit for bit, accepting only numerical single-output models | `Booster::predict_with_params` (file mode's call); one booster shared over the rayon pool behind `unsafe impl Sync`; a booster per thread | The linked LightGBM has OpenMP off, so its prediction is one thread: 8.5 ms for 2,000 rows broke B1 alone; sharing a booster races inside LightGBM and needs `unsafe`; per-thread boosters cost a 15 ms parse each at start-up (B3) and were still over B1 ([03 section 7.2](03-learn.md#72-rank_commands-with-a-model)) |
 
 **Implementation Implication:** an implementer who wants to deviate from an ADR
 edits this table first, in the same commit as the code.

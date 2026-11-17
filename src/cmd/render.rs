@@ -5,9 +5,12 @@
 //! That keeps a redraw free of syscalls (B5).
 
 use super::app::CmdApp;
+use super::features::COMMAND_FEATURE_REGISTRY;
 use super::keys::{CMD_KEYMAP, keys_of};
+use super::model::ml_weight;
 use super::tuning::CMD_STACK_BELOW_COLS;
 use super::worker::CmdRow;
+use crate::feature_defs::schema::FeatureType;
 use crate::path_display::{display_width, get_time_ago, printable, truncate_to_width};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -294,16 +297,36 @@ fn draw_debug(f: &mut Frame, area: Rect, app: &CmdApp) {
         lines.push(field("ml_score", optional(row.ml_score, 4)));
         lines.push(field("ml_weight", format!("{:.2}", row.ml_weight)));
         lines.push(field("fuzzy_score", row.fuzzy_score.to_string()));
-        if row.features.is_empty() {
-            lines.push(Line::from("model: none"));
-        } else {
-            // Phase C names each value from the feature registry.
-            for (i, value) in row.features.iter().enumerate() {
-                lines.push(Line::from(format!("feature {} = {}", i, value)));
+        if !row.features.is_empty() {
+            for (feature, value) in COMMAND_FEATURE_REGISTRY.iter().zip(&row.features) {
+                let value = match feature.feature_type() {
+                    _ if value.is_nan() => "n/a".to_string(),
+                    FeatureType::Binary => format!("{:.0}", value),
+                    FeatureType::Numeric => format!("{:.4}", value),
+                };
+                lines.push(Line::from(format!("{} = {}", feature.name(), value)));
             }
+        } else if app.model.is_some() {
+            lines.push(Line::from("not model-scored (rank beyond stage 2)"));
         }
         lines.push(Line::default());
     }
+    match &app.model {
+        None => lines.push(Line::from("model: none")),
+        Some(model) => {
+            lines.push(Line::from(format!(
+                "model: {} trees, {} groups, ml weight {:.2}",
+                model.best_iteration,
+                model.groups(),
+                ml_weight(model.blend_examples)
+            )));
+            lines.push(Line::from(format!("trained {}", model.trained_at)));
+            for gain in model.feature_gain.iter().take(3) {
+                lines.push(Line::from(format!("  {} {:.1}", gain.feature, gain.gain)));
+            }
+        }
+    }
+    lines.push(Line::default());
     lines.push(field(
         "here",
         printable(&tilde(&app.cwd, app.home.as_deref())).into_owned(),

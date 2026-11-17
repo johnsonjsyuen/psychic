@@ -12,6 +12,7 @@ use super::index::LoadParams;
 use super::keys::{self, CmdAction};
 use super::render;
 use super::store::CmdStore;
+use super::train::{self, CmdModelStats};
 use super::tuning::{CMD_PAGE_PREFETCH, CMD_TICK_MS};
 use super::worker::{self, CmdDetails, CmdRequest, CmdResponse, CmdRow, Scope};
 use super::{cli, privacy, repo};
@@ -98,6 +99,8 @@ pub(super) struct CmdApp {
     pub list_clock: i64,
     pub status: Option<String>,
     pub loaded: Option<LoadInfo>,
+    /// The model the worker ranks with, from `Loaded`; `None` = heuristic only.
+    pub model: Option<CmdModelStats>,
     /// The worker could not read the history (E-B-01); the list says so.
     pub load_failed: bool,
     /// The privacy marker / `PSYCHIC_HISTORY`, read once at start.
@@ -162,6 +165,7 @@ impl CmdApp {
             list_clock: now,
             status: None,
             loaded: None,
+            model: None,
             load_failed: false,
             recording_on,
             timings: CmdTimings::default(),
@@ -305,8 +309,13 @@ impl CmdApp {
                 self.details_requested.clear();
                 self.details.insert(details.command_id, details);
             }
-            CmdResponse::Loaded { commands, load_ms } => {
+            CmdResponse::Loaded {
+                commands,
+                load_ms,
+                model,
+            } => {
                 self.loaded = Some(LoadInfo { commands, load_ms });
+                self.model = model;
             }
             CmdResponse::LoadFailed { message } => {
                 self.load_failed = true;
@@ -315,6 +324,7 @@ impl CmdApp {
             CmdResponse::DeleteFailed => {
                 self.status = Some("Could not delete".to_string());
             }
+            CmdResponse::ModelDropped => self.model = None,
         }
         false
     }
@@ -597,7 +607,7 @@ pub(super) fn run(data_dir: &Path, args: &cli::HistoryArgs) -> Result<()> {
     );
 
     // 7. The event loop.
-    let result = event_loop(&mut terminal, &mut app, &event_rx, &worker_handle);
+    let result = event_loop(&mut terminal, &mut app, &event_rx, &worker_handle, data_dir);
 
     // 8. Give the terminal back and print first: the worker may be busy
     // (a load, a delete waiting on a lock) and the shell waits for nothing
@@ -629,6 +639,7 @@ fn event_loop(
     app: &mut CmdApp,
     event_rx: &Receiver<CmdEvent>,
     worker: &JoinHandle<()>,
+    data_dir: &Path,
 ) -> Result<Option<Arc<str>>> {
     let (mut first_render, mut first_results, mut first_full_render) = (false, false, false);
     loop {
@@ -653,6 +664,12 @@ fn event_loop(
                 if app.on_worker(response) {
                     if !first_results {
                         app.timings.first_results_ms = Some(since_start_ms());
+                        // Training never runs in the picker (ADR-10): this
+                        // thread at most starts a detached child.
+                        let data_dir = data_dir.to_path_buf();
+                        std::thread::spawn(move || {
+                            train::maybe_spawn_retrain(&data_dir, std::time::SystemTime::now());
+                        });
                     }
                     log_once(&mut first_results, "cmd_first_results");
                 }
@@ -765,6 +782,34 @@ mod tests {
         (0..n)
             .map(|i| row(i as i64 + 1, &format!("c{i}")))
             .collect()
+    }
+
+    #[test]
+    fn a_dropped_model_leaves_the_debug_pane() {
+        let (mut app, _rx) = app();
+        let stats = CmdModelStats {
+            trained_at: "t".to_string(),
+            trained_at_unix: 0,
+            training_duration_seconds: 0.0,
+            feature_names: Vec::new(),
+            num_rows: 0,
+            pick_groups: 0,
+            hook_groups: 300,
+            import_groups: 0,
+            blend_examples: 300.0,
+            best_iteration: 1,
+            validation_ndcg: Vec::new(),
+            feature_gain: Vec::new(),
+            seed: 42,
+        };
+        app.on_worker(CmdResponse::Loaded {
+            commands: 1,
+            load_ms: 1.0,
+            model: Some(stats),
+        });
+        assert!(app.model.is_some());
+        assert!(!app.on_worker(CmdResponse::ModelDropped));
+        assert!(app.model.is_none());
     }
 
     #[test]

@@ -37,13 +37,12 @@ impl Interner {
     }
 
     /// The id of `s`, if it was ever interned.
-    #[allow(dead_code, reason = "replay looks contexts up (Phase C)")]
     pub fn get(&self, s: &str) -> Option<u32> {
         self.ids.get(s).copied()
     }
 
     /// The string behind `id`.
-    #[allow(dead_code, reason = "the features and the debug pane (Phase C)")]
+    #[allow(dead_code, reason = "tests; the benchmark (Phase D)")]
     pub fn name(&self, id: u32) -> &str {
         &self.names[id as usize]
     }
@@ -54,25 +53,19 @@ pub(super) struct CommandEntry {
     pub db_id: i64,
     pub text: Arc<str>,
     /// `text.to_lowercase()`, computed once.
-    #[allow(dead_code, reason = "the features of Phase C")]
     pub text_lower: Box<str>,
     /// `text.chars().count()`.
-    #[allow(dead_code, reason = "the features of Phase C")]
     pub chars: u32,
     /// `template::word_count(text)`.
-    #[allow(dead_code, reason = "the features of Phase C")]
     pub words: u32,
     pub last_run_at: i64,
     pub run_count: u32,
-    #[allow(dead_code, reason = "the features of Phase C")]
     pub success_count: u32,
-    #[allow(dead_code, reason = "the features of Phase C")]
     pub fail_count: u32,
     /// All-time Ctrl-R picks; display only, no feature reads it.
     pub pick_count: u32,
     pub last_exit_code: Option<i32>,
     /// Newest run with a non-zero exit code; 0 = none known.
-    #[allow(dead_code, reason = "the features of Phase C")]
     pub last_fail_at: i64,
     /// Ascending; every run newer than `CMD_EVENT_WINDOW_SECS` is present.
     pub run_times: Vec<i64>,
@@ -185,7 +178,6 @@ impl ContextRows {
 /// Runs of one command in one directory.
 pub(super) struct DirStat {
     pub runs: u32,
-    #[allow(dead_code, reason = "the features of Phase C")]
     pub last_run_at: i64,
 }
 
@@ -222,7 +214,6 @@ pub(super) struct RankContext {
     /// Id in `repos` of the repository root; `None` = not in a repository.
     pub repo: Option<u32>,
     /// `[0]` = template id of the most recent command in the shell session.
-    #[allow(dead_code, reason = "the sequence features of Phase C")]
     pub prev_templates: [Option<u32>; 3],
 }
 
@@ -255,7 +246,6 @@ impl CommandIndex {
     // --- Mutators (the only writers) -------------------------------------------
 
     /// Add a command with zero counts; returns its idx.
-    #[allow(dead_code, reason = "replay (Phase C); tests")]
     pub(super) fn add_command(&mut self, db_id: i64, text: &str) -> u32 {
         self.push_entry(CommandEntry::new(db_id, text))
     }
@@ -269,7 +259,6 @@ impl CommandIndex {
     }
 
     /// One execution of `idx`.
-    #[allow(dead_code, reason = "replay (Phase C); tests")]
     pub(super) fn record_run(
         &mut self,
         idx: u32,
@@ -493,7 +482,6 @@ impl CommandIndex {
     }
 
     /// Runs of `idx` right after a command with `template`.
-    #[allow(dead_code, reason = "the sequence features of Phase C")]
     pub(super) fn follower_runs(&self, idx: u32, template: Option<u32>) -> u32 {
         template
             .and_then(|template| self.followers.get(&(idx, template)).copied())
@@ -501,13 +489,11 @@ impl CommandIndex {
     }
 
     /// Runs of `idx` in `(now - secs, now]`.
-    #[allow(dead_code, reason = "the features of Phase C")]
     pub(super) fn runs_in_window(&self, idx: u32, now: i64, secs: i64) -> u32 {
         count_in_window(&self.entries[idx as usize].run_times, now, secs)
     }
 
     /// Picks of `idx` in `(now - secs, now]`.
-    #[allow(dead_code, reason = "the features of Phase C")]
     pub(super) fn picks_in_window(&self, idx: u32, now: i64, secs: i64) -> u32 {
         self.picks
             .get(&idx)
@@ -515,13 +501,11 @@ impl CommandIndex {
     }
 
     /// Picks of `idx` with exactly `query` in `(now - secs, now]`.
-    #[allow(dead_code, reason = "the features of Phase C")]
     pub(super) fn picks_for_query(&self, query: &str, idx: u32, now: i64, secs: i64) -> u32 {
         Self::query_picks(&self.picks_by_query, query, idx, now, secs)
     }
 
     /// Picks of `idx` in an episode that had `query` among its queries.
-    #[allow(dead_code, reason = "the features of Phase C")]
     pub(super) fn episode_picks_for_query(
         &self,
         query: &str,

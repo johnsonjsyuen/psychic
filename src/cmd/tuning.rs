@@ -70,3 +70,63 @@ pub(super) const CMD_TICK_MS: u64 = 1000;
 
 /// Terminals narrower than this stack the list over the preview.
 pub(super) const CMD_STACK_BELOW_COLS: u16 = 120;
+
+// ---------------------------------------------------------------------------
+// Phase C: the model (`docs/ctrl-r/03-learn.md` section 3)
+// ---------------------------------------------------------------------------
+
+/// Rows, from the top of the heuristic order, that the model scores.
+pub(super) const CMD_STAGE2_K: usize = 2000;
+
+/// `blend_examples` are divided by this before the file blend formula.
+pub(super) const CMD_BLEND_SCALE: f64 = 10.0;
+
+/// Sample weight of every row of a Ctrl-R pick group.
+pub(super) const CMD_PICK_WEIGHT: f64 = 4.0;
+
+/// Sample weight of the rows of a group built from a hook-recorded run.
+pub(super) const CMD_HOOK_WEIGHT: f64 = 1.0;
+
+/// Sample weight of the rows of a group built from an imported run.
+pub(super) const CMD_IMPORT_WEIGHT: f64 = 0.3;
+
+/// Seed of query-length choice and negative sampling, and the LightGBM seed
+/// in production.
+pub(super) const CMD_TRAIN_SEED: u64 = 42;
+
+/// Only the newest this-many eligible runs produce groups.
+pub(super) const CMD_TRAIN_MAX_RUN_GROUPS: usize = 8000;
+
+/// Below this many groups nothing is trained.
+pub(super) const CMD_TRAIN_MIN_GROUPS: usize = 50;
+
+/// Percent of run groups with synthetic query length 0, 1, 2, 3.
+pub(super) const CMD_TRAIN_QLEN_MIX: [u32; 4] = [40, 20, 20, 20];
+
+/// Negatives taken from the most recently run matching commands.
+pub(super) const CMD_TRAIN_RECENT_NEGATIVES: usize = 15;
+
+/// Distinct recent commands examined to find them.
+pub(super) const CMD_TRAIN_RECENT_SCAN: usize = 500;
+
+/// Negatives drawn at random from all matching commands.
+pub(super) const CMD_TRAIN_RANDOM_NEGATIVES: usize = 15;
+
+/// Draws allowed to find them.
+pub(super) const CMD_TRAIN_RANDOM_TRIES: usize = 200;
+
+/// "Never" on the `ln(1 + seconds)` axis: `ln(1 + 10 years)`, as file mode.
+pub(super) const CMD_NEVER_SECS_LOG: f64 = 19.57;
+
+/// Window of the `failed_within_2_minutes` feature.
+pub(super) const CMD_FAIL_RECENT_SECS: i64 = 120;
+
+/// The picker starts a retrain only when the last attempt is older than this.
+pub(super) const CMD_RETRAIN_MIN_INTERVAL_SECS: u64 = 3600;
+
+/// A run this soon after a Ctrl-R pick of the same command in the same shell
+/// session is that pick being executed; it gets no group of its own.
+pub(super) const CMD_PICK_RUN_SECS: i64 = 300;
+
+/// A training lock file older than this is taken over.
+pub(super) const CMD_TRAIN_LOCK_STALE_SECS: u64 = 900;

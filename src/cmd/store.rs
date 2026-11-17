@@ -168,7 +168,6 @@ const MMAP_FOR_READING: &str = "PRAGMA mmap_size = 268435456";
 const T1_COMMANDS: &str = "SELECT COUNT(*) FROM commands";
 const T1_RUNS: &str = "SELECT source, COUNT(*) FROM command_runs GROUP BY source";
 const T1_PICKS: &str = "SELECT COUNT(*) FROM command_events WHERE action = 'pick'";
-#[allow(dead_code, reason = "training reads it (Phase C)")]
 const T2: &str = "SELECT id, text, template FROM commands";
 const T3: &str = "SELECT id, command_id, started_at, cwd, repo_root, exit_code, shell_session, prev_command_id, source FROM command_runs ORDER BY started_at, id";
 const T4: &str = "SELECT id, timestamp, action, command_id, query, rank, session_id, subsession_id, episode_queries, cwd, repo_root, shell_session FROM command_events ORDER BY id";
@@ -372,14 +371,12 @@ pub(super) struct StoreCounts {
     pub picks: u64,
 }
 
-#[allow(dead_code, reason = "training reads it (Phase C)")]
 pub(super) struct CommandRecord {
     pub id: i64,
     pub text: String,
     pub template: String,
 }
 
-#[allow(dead_code, reason = "training reads it (Phase C)")]
 pub(super) struct RunRecord {
     pub id: i64,
     pub command_id: i64,
@@ -392,7 +389,11 @@ pub(super) struct RunRecord {
     pub source: Source,
 }
 
-#[allow(dead_code, reason = "training reads it (Phase C)")]
+#[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "id, rank, subsession_id: the benchmark (Phase D) and tests"
+)]
 pub(super) struct EventRecord {
     pub id: i64,
     pub timestamp: i64,
@@ -859,7 +860,6 @@ impl CmdStore {
         Ok(counts)
     }
 
-    #[allow(dead_code, reason = "training reads it (Phase C)")]
     pub(super) fn all_commands(&self) -> Result<Vec<CommandRecord>> {
         self.rows(T2, [], "reading commands", |row| {
             Ok(CommandRecord {

@@ -29,10 +29,17 @@ ls $D/cmd_model.txt $D/cmd_model_stats.json
 
 ## 2. Files touched
 
-New files: `src/cmd/features.rs`, `src/cmd/train.rs`. Extended: `src/cmd/rank.rs`
+New files: `src/cmd/features.rs`, `src/cmd/train.rs` and its tests
+`src/cmd/train/tests.rs`, `src/cmd/model.rs` (`CmdModel`: the load checks
+of section 7.1, the blend weight of 7.3, and prediction: the model text read
+into a `Forest` whose trees are walked in Rust, section 7.2 step 5). Extended: `src/cmd/rank.rs`
 (section 7), `src/cmd/worker.rs` (loads the model, passes it to `rank_commands`),
 `src/cmd/app.rs` (section 8), `src/cmd/render.rs` (section 7.4),
-`src/cmd/mod.rs` (`--retrain`, `--status` model line), `src/cmd/tuning.rs` (section 3).
+`src/cmd/mod.rs` (`--retrain`, `--status` model line), `src/cmd/tuning.rs` (section 3),
+`src/cmd/store.rs` (`#[derive(Clone)]` on `EventRecord`, for `PickEpisode`;
+the Phase C `dead_code` markers go), `src/cmd/index.rs` (its Phase C markers
+go), `tests/no_text_leaks.rs` (a training test: report, `training.log`,
+`app.log` and both model files hold no command text).
 
 | Upstream file | Exact edit |
 |---|---|
@@ -104,7 +111,7 @@ pub(super) trait CommandFeature: Send + Sync {
 pub(super) static COMMAND_FEATURE_REGISTRY: &[&dyn CommandFeature] = &[ /* the 23 rows below, in this order */ ];
 pub(super) fn command_feature_names() -> Vec<&'static str>;
 pub(super) fn command_feature_specs() -> Vec<crate::training::FeatureSpec<'static>>;   // name + monotone (1, -1, 0)
-pub(super) fn compute_all(inputs: &CommandFeatureInputs, out: &mut Vec<f64>);          // pushes exactly REGISTRY.len() values
+pub(super) fn compute_all(inputs: &CommandFeatureInputs, out: &mut [f64]);             // writes exactly REGISTRY.len() values (asserts out.len())
 ```
 
 Notation: `e` = `inputs.entry`, `now` = `ctx.now`, `d` = `index.dir_stat(idx, ctx.dir)`,
@@ -179,10 +186,10 @@ pub(super) struct PickEpisode { pub pick: EventRecord, pub impressions: Vec<Even
 | Method | Exact behaviour |
 |---|---|
 | `context` | `dir = cwd.and_then(\|c\| index.dirs.get(c))`, `repo` likewise (`&self`: nothing is interned; a directory never seen gives `None`, which yields the same feature values as an id with no statistics), `prev_templates` = the template ids of the last up-to-3 runs applied for `shell_session`, newest first; `now` as given |
-| `apply_run` | First run of a command: `index.add_command(id, text)`. A known `cwd` updates `last_cwd[idx]`. Then `index.record_run(idx, started_at, dir id, repo id, exit_code, template id of prev_command_id if any)`; push the run's template id on that session's tail (keep 3); push `(idx, seq)` on the recency stack and set `last_seq[idx] = seq` |
+| `apply_run` | A run whose `command_id` is not among the commands read (recorded between the T2 and T3 reads) is skipped; the Cap pre-pass ignores it too. First run of a command: `index.add_command(id, text)`. A known (non-empty) `cwd` updates `last_cwd[idx]`. Then `index.record_run(idx, started_at, dir id, repo id, exit_code, template id of prev_command_id if any)`; push the run's template id on that session's tail (keep 3); push `(idx, seq)` on the recency stack and set `last_seq[idx] = seq` |
 | `recent_distinct` | Walk the recency stack from the end, yielding entries whose `seq == last_seq[idx]`. The stack is compacted (stale entries dropped) when its length exceeds `2 * entries.len() + 1024` |
 | `apply_event`, impression | Append to `pending[session_id]`; return `None` |
-| `apply_event`, pick | Remove and return `pending[session_id]` (possibly empty) together with the pick as a `PickEpisode`. The index is not changed, so the caller builds the group from the state before the pick. A pick or impression whose `command_id` has never run is dropped (`None`) |
+| `apply_event`, pick | Remove and return `pending[session_id]` (possibly empty) together with the pick as a `PickEpisode`. The index is not changed, so the caller builds the group from the state before the pick. A pick or impression whose `command_id` has never run is dropped (`None`); a dropped pick still ends its episode (its pending impressions are removed with it) |
 | `commit_pick` | `index.record_pick(idx, pick.timestamp, &pick.query, &pick.episode_queries)`. Called by the caller after it has built (or skipped) the group |
 
 Timeline: runs in T3 order (`started_at, id`), events in T4 order (`id`), merged
@@ -201,9 +208,9 @@ For each run, **before** `apply_run`:
 | Query | The first `length` characters (`chars().take(length)`) of the positive's text; the whole text if it is shorter |
 | Context | `ctx = replayer.context(run.started_at, run.cwd, run.repo_root, Some(&run.shell_session))` |
 | "Matches" | Empty query: every command. Otherwise `matcher.fuzzy_match(&entry.text, query).is_some()` with one `SkimMatcherV2` owned by the builder |
-| Recent negatives | From `recent_distinct()`: skip the positive and deleted entries; examine at most `CMD_TRAIN_RECENT_SCAN` commands; keep those that match, up to `CMD_TRAIN_RECENT_NEGATIVES` |
-| Random negatives | `state = splitmix64(seed ^ (run.id as u64) ^ 0x9E37_79B9_7F4A_7C15)`; repeat at most `CMD_TRAIN_RANDOM_TRIES` times: `state = splitmix64(state)`, `cand = state % entries.len()`; keep `cand` if it is not the positive, not already chosen (recent or random), and matches; stop at `CMD_TRAIN_RANDOM_NEGATIVES` |
-| Skip | No negative found: no group |
+| Recent negatives | From `recent_distinct()`: skip the positive and deleted entries; examine at most `CMD_TRAIN_RECENT_SCAN` of the rest; keep those that match, up to `CMD_TRAIN_RECENT_NEGATIVES` |
+| Random negatives | `state = splitmix64(seed ^ (run.id as u64) ^ 0x9E37_79B9_7F4A_7C15)`; repeat at most `CMD_TRAIN_RANDOM_TRIES` times: `state = splitmix64(state)`, `cand = state % entries.len()`; keep `cand` if it is not the positive, not deleted, not already chosen (recent or random), and matches; stop at `CMD_TRAIN_RANDOM_NEGATIVES` |
+| Skip | No negative found, or the positive does not match its own query (a prefix of its text always matches; the rule only makes the function total): no group |
 | Rows | The positive (label 1) and the negatives (label 0), **ordered by idx ascending**; each row = `compute_all` with that candidate's own fuzzy score for the query (0 for the empty query) |
 | Weight | `CMD_HOOK_WEIGHT` or `CMD_IMPORT_WEIGHT` by `run.source`, on every row of the group |
 | Timestamp | `run.started_at` on every row |
@@ -212,6 +219,9 @@ For each run, **before** `apply_run`:
 fn splitmix64(mut x: u64) -> u64 { x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9); x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB); x ^ (x >> 31) }
 ```
+
+The one definition is `corpus::splitmix64` (Phase D0's generator uses the
+same function); `train.rs` imports it.
 
 At most 31 rows per group (1 + 15 + 15).
 
@@ -280,18 +290,18 @@ is the proof and is in "done when").
 
 ```rust
 pub(super) fn retrain(data_dir: &Path, seed: u64, quiet: bool) -> anyhow::Result<RetrainOutcome>;
-pub(super) enum RetrainOutcome { Trained(CmdModelStats), NotEnoughData { groups: usize }, AlreadyRunning }
+pub(super) enum RetrainOutcome { Trained(Box<CmdModelStats>), NotEnoughData { groups: usize }, AlreadyRunning, HistoryShrank }
 ```
 
 | Step | Action |
 |---|---|
-| 1 | Write the current time to `data_dir/"cmd_train_attempt"` (create or truncate; its mtime is the back-off clock of section 8). Take the lock: `OpenOptions::new().write(true).create_new(true).open(data_dir/"cmd_train.lock")`. If it exists and its mtime is older than `CMD_TRAIN_LOCK_STALE_SECS`, remove it and try once more. Still exists -> `AlreadyRunning`. A guard removes the lock on every exit path, including panic unwinding |
-| 2 | `CmdStore::open`; `ReplayInput::read` |
+| 1 | Write the current time to `data_dir/"cmd_train_attempt"` (create or truncate; its mtime is the back-off clock of section 8). Take the lock: `OpenOptions::new().write(true).create_new(true).open(data_dir/"cmd_train.lock")`. The new lock holds a token (`<pid> <nanoseconds>`), and while it is held a heartbeat thread refreshes its mtime every 60 s, so a fit longer than `CMD_TRAIN_LOCK_STALE_SECS`, or one paused by a suspend, is not judged stale. If the lock exists and its mtime is older than `CMD_TRAIN_LOCK_STALE_SECS`, remove it if it still holds the token read when it was judged stale, and try once more. Still exists -> `AlreadyRunning`. A guard stops the heartbeat and removes the lock on every exit path, including panic unwinding, but only if the lock still holds its own token |
+| 2 | `CmdStore::open`; `counts()` (for step 6); `ReplayInput::read` (the connection is closed once read) |
 | 3 | `build_training_set(&input, &BuildOptions { seed, max_run_groups: CMD_TRAIN_MAX_RUN_GROUPS, until: None })` |
 | 4 | Total groups `< CMD_TRAIN_MIN_GROUPS` -> `NotEnoughData`; no file is written or removed |
 | 5 | `crate::training::fit_seeded(&set, &command_feature_specs(), seed as u32)`. An `Err` whose message starts with `every split needs rows` -> `NotEnoughData`; any other `Err` propagates |
-| 6 | `atomic_write(&data_dir.join("cmd_model.txt"), fitted.model.as_bytes())`, then `atomic_write(&data_dir.join("cmd_model_stats.json"), serde_json::to_string_pretty(&stats)?.as_bytes())`; `privacy::tighten_permissions(data_dir)` |
-| 7 | Report: `quiet == false` -> print to stdout; `quiet == true` -> append to `data_dir/"training.log"` under `\n=== Command model training run at <local time> ===` (format as [src/ranker.rs:880-895](../../src/ranker.rs)) |
+| 6 | `write_unless_shrunk`: write the model text and `serde_json::to_string_pretty(&stats)` beside their targets as `<name>.<pid>.pending`; unless the history shrank since step 2 (fewer commands or runs in `CmdStore::counts`; E-L-15), rename them into place, `cmd_model.txt` first, then `cmd_model_stats.json` (the write-then-rename of `training::atomic_write`, with the check between); `privacy::tighten_permissions(data_dir)`; check once more |
+| 7 | Report: `quiet == false` -> print to stdout; `quiet == true` -> append to `data_dir/"training.log"` under `\n=== Command model training run at <local time> ===` (format as [src/ranker.rs:880-895](../../src/ranker.rs)). An `Err` from any step is logged (`log::error!`) and, under `quiet`, appended the same way as `Training failed: <error>`, then returned (E-L-03) |
 
 Report text (no command text, section 10.6 of 01):
 
@@ -336,32 +346,45 @@ when `CmdModel::load` (section 7.1) succeeds; otherwise `model: none`.
 ### 7.1 Loading the model
 
 ```rust
-pub(super) struct CmdModel { booster: lightgbm3::Booster, pub stats: CmdModelStats, pub ml_weight: f64 }
+pub(super) struct CmdModel { forest: Forest, pub stats: CmdModelStats, pub ml_weight: f64 }   // src/cmd/model.rs
 impl CmdModel {
-    pub(super) fn load(dir: &Path) -> Option<CmdModel>;      // reads dir/cmd_model.txt and dir/cmd_model_stats.json
-    /// Raw scores, one per row of the row-major `flat` (rows = flat.len() / num_features).
+    /// Reads dir/cmd_model.txt (LightGBM's text format, into a `Forest`) and dir/cmd_model_stats.json.
+    pub(super) fn load(dir: &Path) -> Option<CmdModel>;
+    /// Raw scores, one per row of the row-major `flat` (rows = flat.len() / num_features);
+    /// `Err` when `num_features` is not the model's input width.
     pub(super) fn predict(&self, flat: &[f64], num_features: usize) -> anyhow::Result<Vec<f64>>;
 }
 ```
 
-Loaded **on the worker thread**, once, after `CommandIndex::load`
-([02 section 6.2](02-browse.md#62-thread-body)), with a
-`TIMING {"op":"cmd_model_load","ms":..}` line written only when a model was loaded. It is never reloaded (ADR-11).
+Loaded **by the worker thread**, once, at the same time as
+`CommandIndex::load` ([02 section 6.2](02-browse.md#62-thread-body)): the
+index load runs on a scoped thread while the worker thread loads the model. A
+`TIMING {"op":"cmd_model_load","ms":..}` line is written only when a model was
+loaded. It is never reloaded (ADR-11). Measured on the perf DB's model (132
+trees, 238 KB): 3.8 ms p50, 5.3 ms p95 (read and parse), against an index
+load of 28-29 / 32-34 ms, so it is off the critical path.
 `load` returns `None` (ranking stays heuristic-only) unless all hold:
 
 | Check | Failure log |
 |---|---|
 | `cmd_model.txt` and `cmd_model_stats.json` exist | none (normal before the first training) |
 | The stats parse | `log::warn!("command model stats unreadable; using the heuristic")` |
-| `Booster::from_file` succeeds | `log::warn!("command model unreadable; using the heuristic")` |
-| `booster.num_features() == COMMAND_FEATURE_REGISTRY.len()` **and** `stats.feature_names == command_feature_names()` (ADR-15) | `log::info!("command model was trained with a different feature set; using the heuristic until the next retrain")` |
+| The model text reads and `Forest::parse` accepts it (below) | `log::warn!("command model unreadable; using the heuristic")` |
+| The model file's `feature_names` (which also fixes its width) **and** `stats.feature_names` both equal `command_feature_names()`, in order (ADR-15) | `log::info!("command model was trained with a different feature set; using the heuristic until the next retrain")` |
 
 `ml_weight` is computed once at load (section 7.3).
 
 ### 7.2 `rank_commands` with a model
 
 Signature from this phase on (the Phase B body is steps 1-2). `CommandRanking`
-gains the field `pub model_failed: bool` (false in every case but step 5's error):
+gains the field `pub model_failed: bool` (false in every case but step 5's
+error), `pub features: Vec<f64>` and `pub feature_rows: Vec<u32>`: the
+features of the model-scored rows, row-major in the order step 4 computed
+them, and for each rank `0..stage2` the row of `features` that is its; read
+through `features_of(rank) -> &[f64]` (empty for a tail row). `CommandScore`
+has no `features` field: one buffer instead of 2,000 vectors per keystroke,
+which cost 0.3-0.5 ms to allocate and free, and no copy into rank order; the
+worker copies a row's slice into `CmdRow.features` only for the rows it sends.
 
 ```rust
 pub(super) fn rank_commands(query: &str, candidates: &[CommandCandidate], index: &CommandIndex,
@@ -369,21 +392,54 @@ pub(super) fn rank_commands(query: &str, candidates: &[CommandCandidate], index:
 ```
 
 `head` is Phase B's ([02 section 7](02-browse.md#7-heuristic-ranking)): only
-`scores[..sorted]` are in rank order. Step 1 sorts at least
-`max(head, CMD_STAGE2_K)` rows, so stage 2 always takes its `k` rows from a
-sorted head; steps 7-8 keep `sorted` as it was (the tail after the head stays
-for `sort_rest`).
+`scores[..sorted]` are in rank order. With a model, step 1 selects the top
+`max(head, k)` rows as a set and sorts only the first `head` of them (stage 2
+re-sorts its `k` rows itself); without one it sorts `head`, as in Phase B.
+After step 7 `sorted = max(head, k)`; on a failed prediction it stays `head`
+and `sort_rest` orders everything after it.
 
 | Step | Action |
 |---|---|
-| 1 | Heuristic for every candidate and the total-order sort of [02 section 7](02-browse.md#7-heuristic-ranking), exact for the first `max(head, CMD_STAGE2_K)` rows. Call the result `H` |
+| 1 | Heuristic for every candidate and the total order of [02 section 7](02-browse.md#7-heuristic-ranking): `select_nth` at `max(head, k)` (with a model), then `select_nth` and a sort of the first `head`. Call the result `H` |
 | 2 | `model` is `None`: return `H` (`ml_score = None`, `ml_weight = 0.0`, `features` empty, stage times `None`, `stage2 = 0`) |
 | 3 | `k = min(CMD_STAGE2_K, H.len())`. Stage 2 is `H[..k]`; the tail `H[k..]` is final as it is |
-| 4 | Features for the `k` rows: `par_iter` + `fold`/`reduce` into per-chunk `Vec<f64>` recombined in order (the shape of [src/ranker.rs:517-543](../../src/ranker.rs)), giving one flat row-major `Vec<f64>` of `k * F` values. `query_lower` is computed once before the loop. Sequential when `k < 256` |
-| 5 | `stage2.predict(&flat, F)`, which for a real model is `booster.predict_with_params(&flat, F as i32, true, "num_threads=8")` (the call of [src/ranker.rs:603](../../src/ranker.rs)); `ml = crate::ranker::logistic(raw)` per row. An `Err`, or a result whose length is not `k`: return `H` as in step 2 with `CommandRanking.model_failed = true` |
-| 6 | `score = (1 - w) * heuristic + w * ml` with `w = model.ml_weight`; store `ml_score = Some(ml)`, `ml_weight = w`, `features` = that row's slice |
-| 7 | Sort `H[..k]` by the same total order (`score` desc, `last_run_at` desc, `db_id` desc) |
-| 8 | Result = sorted stage 2 followed by the untouched tail. Timings: `features_ms`, `predict_ms`, `blend_ms` as `Some`, `stage2 = k` |
+| 4 | Features for the `k` rows into one preallocated flat row-major `Vec<f64>` of `k * F` values, `par_chunks_mut(F)` zipped with the rows, each row written by `compute_all`. `query_lower` is computed once before the loop. Sequential when `k < 256` |
+| 5 | `stage2.predict(&flat, F)`. For a real model, `CmdModel::predict` walks the `Forest` once per row, on the rayon pool from `PAR_PREDICT_MIN` (256) rows, sequentially below; the scores are LightGBM's raw scores bit for bit (below). `ml = crate::ranker::logistic(raw)` per row. An `Err`, or a result whose length is not `k`: return `H` as in step 2 with `CommandRanking.model_failed = true` |
+| 6 | `score = (1 - w) * heuristic + w * ml` with `w = model.ml_weight`; store `ml_score = Some(ml)`, `ml_weight = w` |
+| 7 | Sort `H[..k]` by the same total order (`score` desc, `last_run_at` desc, `db_id` desc): 32-byte sort keys as in step 1, then one in-place permutation of the `k` scores; `feature_rows` records where each rank's features are |
+| 8 | Result = sorted stage 2 followed by the untouched tail. Timings: `features_ms`, `predict_ms`, `blend_ms` (steps 6-7) as `Some`, `stage2 = k` |
+
+Why step 5 is not a LightGBM call. LightGBM still trains the model and
+writes `cmd_model.txt`; serving reads that text into a `Forest` (in
+`model.rs`) and walks its trees in Rust. Measured on the perf DB's model (132
+trees, 238 KB):
+
+| Serving with | Load | Predict 2,000 rows, p50 / p95 | B1 p95 (3 runs) | Why not |
+|---|---|---|---|---|
+| `booster.predict_with_params(.., "num_threads=8")`, as specified first | 13-19 ms | 8.5 / 14.5 ms | 19-20 ms | The `lightgbm3-sys` build has OpenMP off (`USE_OPENMP=OFF`; `Cargo.toml` is not edited): one thread, about 4 us a row |
+| One booster, chunks predicted on the rayon pool through an `unsafe impl Sync` wrapper | 13-17 ms | 1.2 / 2.2 ms | 6.6-8.3 ms | `unsafe` (file mode removed its last such wrapper), and a data race: LightGBM's `Booster::Predict` takes a shared lock, but the predictor it builds per call writes `GBDT::InitPredict`'s fields unlocked |
+| A pool of dedicated threads, a booster each, fed over channels | 9-17 ms | 2.0-3.0 / 3.2-4.9 ms | 8.9-11 ms | Its threads sleep between keystrokes and wake cold |
+| A booster per rayon thread in a thread-local, parsed by `rayon::broadcast` | 16 ms, 24 parses | 1.7 / 2.4 ms | 8.0-8.8 ms | Over B1; the 24 parses slowed the index load beside them (B3 p95 55-60 ms) |
+| **`Forest`** (chosen) | 3.8 ms | 1.1 / 2.0 ms | 6.8-7.8 ms | - |
+
+`Forest::parse` accepts only what command training produces and refuses the
+rest (the model is then unreadable, E-L-06): LightGBM `version=v4`,
+`num_class=1`, `num_tree_per_iteration=1`, no `average_output` line (LightGBM
+writes it bare, without `=`), every tree
+`num_cat=0` and `is_linear=0`, no categorical split bit, every list as long as
+`num_leaves` says, every split feature below `max_feature_idx + 1`, a text
+that reaches `end of trees`, and every internal child numbered above its
+parent (LightGBM numbers nodes in split order), so a walk always ends. The walk
+is `GBDT::PredictRaw` with `Tree::NumericalDecision` of LightGBM 4.7.0, after
+LightGBM's dense-row input conversion: a value within `1e-35f` of 0 is 0
+(the conversion drops it), and NaN becomes 0 unless the split's missing type
+is NaN; a Zero-type split sends
+values within `1e-35f` of 0, a NaN-type split NaN, to the default side
+(`decision_type` bit 1); otherwise `value <= threshold` goes left; a one-leaf
+tree is its leaf value; the trees are summed in order from 0.0. Tests compare
+its scores with LightGBM's bit for bit, on the fixture model and on that model
+rewritten to use all six numerical decision types or thresholds inside the
+zero threshold, over rows with NaN, zeros and values either side of it.
 
 `rank_commands` is a thin wrapper over the testable core:
 
@@ -394,7 +450,8 @@ pub(super) fn rank_with(query: &str, candidates: &[CommandCandidate], index: &Co
                         ctx: &RankContext, head: usize, stage2: Option<Stage2<'_>>) -> CommandRanking;
 ```
 
-`rank_commands` passes `Stage2 { k: CMD_STAGE2_K, ml_weight: model.ml_weight, predict: &|flat, f| model.predict(flat, f) }`.
+`rank_commands` passes `Stage2 { k: CMD_STAGE2_K, ml_weight: model.ml_weight, predict: &|flat, f| model.predict(flat, f) }`
+(in the code the predictor type is the alias `rank::Predict<'a>`).
 Tests pass a stub `predict`; the two-stage check passes `k = usize::MAX`.
 
 A row of the tail is never promoted above a stage-2 row, whatever its
@@ -404,7 +461,7 @@ section 11, E-L-07.
 
 ### 7.3 Blend
 
-`ml_weight = crate::ranker::Ranker::compute_blend_weights((stats.blend_examples / CMD_BLEND_SCALE).round() as usize).1`
+`ml_weight = model::ml_weight(blend_examples)` = `crate::ranker::Ranker::compute_blend_weights((stats.blend_examples / CMD_BLEND_SCALE).round() as usize).1`
 - the file formula `(1 + tanh(x/15 - 2)) / 2` ([src/ranker.rs:465-474](../../src/ranker.rs))
 applied to scaled weighted group counts (ADR-14).
 
@@ -425,12 +482,15 @@ exactly that case (reported beside the verdicts; R2 itself covers `all` and `gt1
 ### 7.4 What the debug pane shows
 
 Added below the heuristic lines of [02 section 8.3](02-browse.md#83-layout-and-rows):
-one line per registry feature `name = value` (`NaN` printed as `n/a`) for rows
-with non-empty `features`, or `not model-scored (rank beyond stage 2)` for tail
-rows; then `model: <best_iteration> trees, <groups> groups, ml weight <w>`,
+one line per registry feature `name = value` (`NaN` printed as `n/a`, a binary
+feature as `0`/`1`, a numeric one to 4 decimals) for rows with non-empty
+`features`, or, when a model is in use, `not model-scored (rank beyond stage 2)`
+for tail rows. Then, whether or not a row is selected, `model: none` without a
+model, or `model: <best_iteration> trees, <groups> groups, ml weight <w>`,
 `trained <trained_at>`, and the top 3 of `feature_gain`.
 `CmdResponse::Loaded` gains a field `model: Option<CmdModelStats>` that the
-UI stores for this.
+UI stores for this (`CmdApp.model`); `CmdResponse::ModelDropped` (sent once,
+after E-L-07) clears it.
 
 ## 8. Retraining trigger
 
@@ -439,7 +499,7 @@ Training never runs in the picker process (ADR-10).
 | Trigger | Mechanism |
 |---|---|
 | `psychic history --retrain [--quiet]` | `train::retrain(data_dir, CMD_TRAIN_SEED, quiet)` in the foreground. `AlreadyRunning` prints `Another training run is in progress.` (nothing when `--quiet`) and exits 0 |
-| Picker start | After the first accepted `QueryUpdated`, the UI thread spawns one short-lived thread running `train::maybe_spawn_retrain(data_dir, now)` |
+| Picker start | After the first accepted `QueryUpdated`, the UI thread spawns one short-lived thread running `train::maybe_spawn_retrain(data_dir, SystemTime::now())` (a wrapper reading the environment over `start_retrain_if_due(data_dir, now, disabled, current_exe)`, which tests call). The thread waits for the child, so a child that ends while the picker still runs is reaped; when the picker exits first the child carries on alone |
 
 `maybe_spawn_retrain`: return at once when the environment variable
 `PSYCHIC_NO_RETRAIN` is set (benchmarks and tests set it). Otherwise return unless (`cmd_train_attempt` is missing, or its
@@ -474,7 +534,7 @@ first training.
 | Train in a thread of the picker | Detached child (section 8) | The picker lives for seconds |
 | Reload `cmd_model.txt` while the picker runs | Load once at worker start | The list must not reorder without input |
 | Load a model whose feature names differ, or with missing stats | `CmdModel::load` returns `None` | A repointed column ranks confidently and wrongly |
-| Write `cmd_model.txt` with `fs::write` | `training::atomic_write` | A picker starting mid-write would read half a file |
+| Write `cmd_model.txt` in place with `fs::write` | Write beside it and rename (step 6) | A picker starting mid-write would read half a file |
 | Change a LightGBM parameter, the half-life or the split for the command model inside `src/training/mod.rs` | Keep one `fit_seeded`; a command-specific parameter becomes an explicit argument added in its own commit with benchmark numbers | The file model must stay byte-identical to `train.py` |
 | Copy the blend formula into `src/cmd/` | Call `Ranker::compute_blend_weights` | "Sharing the blend maths" must stay true when upstream retunes it |
 | Promote tail rows past stage-2 rows, or run the model on all matches "when there is time" | The fixed cut of section 7.2 | B1 at 50,000 candidates; determinism |
@@ -524,6 +584,19 @@ Fixture `F1`: built with the `CommandIndex` mutators; `now = 1_000_000`; command
 | IT-L-06 | File model untouched | The existing `training` tests plus `fit(set, features)` versus `fit_seeded(set, features, 42)` on the CSV of `test_from_csv_drops_unclicked_episodes_and_sorts_stably` enlarged to 40 episodes | Identical `model` strings | none |
 | IT-L-07 | Model changes the ranking only inside stage 2 | IT-L-02's data and model; worker with and without the model; 20 queries | Same set of matched ids both ways; with the model, rows `0..k` carry `ml_score` and 23 features; no TIMING or log line contains a command text | `remove_dir_all` |
 
+Where they live: TC-L-01..06, E-L-08 and E-L-13 in `src/cmd/features.rs`;
+TC-L-07..14, 16, 18, IT-L-01..06 and E-L-02, 03, 09, 10, 11, 12, 15 in
+`src/cmd/train/tests.rs` (E-L-05's stale lock is IT-L-05; the lock's token
+and heartbeat, and `PSYCHIC_NO_RETRAIN`, have tests there too); TC-L-15, the
+load checks of 7.1, `Forest` parity with LightGBM and its refusals in
+`src/cmd/model.rs`; TC-L-17 and the ranking half of E-L-07 in
+`src/cmd/rank.rs`; IT-L-07, the worker half of IT-L-04 (all three cases) and
+of E-L-07 in `src/cmd/worker.rs`; `ModelDropped` in `src/cmd/app.rs`.
+IT-L-07's "no log line contains a command text" is checked on the built
+binary by `tests/no_text_leaks.rs` (`--retrain`, `--retrain --quiet`,
+`--status`; every file in the data dir but the database); the TIMING line
+holds numbers only by construction (TC-B-17).
+
 ## 11. Error handling matrix
 
 | # | Failure | Detection | Response | Fallback | Logging |
@@ -532,9 +605,9 @@ Fixture `F1`: built with the `CommandIndex` mutators; `now = 1_000_000`; command
 | E-L-02 | `time_split` cannot give every part rows | `Err` starting `every split needs rows` | `NotEnoughData` | As E-L-01 | info |
 | E-L-03 | LightGBM error during fit | Other `Err` from `fit_seeded` | `--retrain`: `Err` to `main`, exit 1. `--quiet`: same, plus the message appended to `training.log` | Previous model files untouched (nothing written before step 6) | `log::error!` |
 | E-L-04 | Another training holds the lock | Section 6.2 step 1 | `AlreadyRunning`, exit 0 | - | `log::info!` |
-| E-L-05 | Training process killed | Lock file left behind | Next attempt after `CMD_TRAIN_LOCK_STALE_SECS` removes it | Temp files `*.tmp` beside the targets are orphaned and harmless; the next successful write does not reuse them (pid in the name) | None |
+| E-L-05 | Training process killed | Lock file left behind, its mtime no longer refreshed | Next attempt after `CMD_TRAIN_LOCK_STALE_SECS` removes it (if it still holds the token it was judged by) | Files `*.<pid>.pending` beside the targets are orphaned and harmless; the next successful write does not reuse them (pid in the name) | None |
 | E-L-06 | Model file missing, unreadable, or feature mismatch at picker start | Section 7.1 | `CmdModel::load` -> `None` | Heuristic-only ranking | Per the table in 7.1 |
-| E-L-07 | `predict_with_params` fails or returns a different number of scores than `k` | `Err` / length check | That query is answered with `H` (heuristic order, `ml_score = None`) and `CommandRanking.model_failed = true`; the worker then sets its `Option<CmdModel>` to `None` for the rest of the process | Heuristic-only | `log::warn!("command model prediction failed; using the heuristic")` once |
+| E-L-07 | `CmdModel::predict` returns `Err` (rows not as wide as the model) or a different number of scores than `k` | `Err` / length check | That query is answered with `H` (heuristic order, `ml_score = None`) and `CommandRanking.model_failed = true`; the worker then sets its `Option<CmdModel>` to `None` for the rest of the process and sends `CmdResponse::ModelDropped`, so the debug pane says `model: none` | Heuristic-only | `log::warn!("command model prediction failed; using the heuristic")` once |
 | E-L-08 | A feature computes NaN other than `success_rate`, or an infinity | `assert!(value.is_finite() \|\| name == "success_rate")` in `compute_all` | Panic (a bug; [llm.md:3](../../llm.md)) | - | panic message names the feature, not the command |
 | E-L-09 | `current_exe()` fails or the detached spawn fails | `Err` in `maybe_spawn_retrain` | Ignored | No retrain this time | `log::warn!` |
 | E-L-10 | Stats written but model write failed (disk full between the two) | Cannot happen in that order; model is written first. Model written, stats write fails | `Err`; old stats + new model on disk | Next load: names still equal -> loads with the old `blend_examples`; next successful training repairs it | `log::error!` |
@@ -542,6 +615,7 @@ Fixture `F1`: built with the `CommandIndex` mutators; `now = 1_000_000`; command
 | E-L-12 | Run with `started_at` earlier than its predecessor in id order | T3 orders by `started_at, id` | Replayed in time order | - | None |
 | E-L-13 | Clock skew puts a run in the future of `now` at serving time | `now - last_run_at < 0` | `max(0, ..)` in features 6 and 15; excluded from windows (`t <= now`) | - | None |
 | E-L-14 | `train_parity.py` reports a difference after section 6.1 | Script output | The refactor is wrong; fix it before committing | - | - |
+| E-L-15 | History deleted (`--purge`, or a delete in the picker) while a training runs on what it read before | `CmdStore::counts` lower than at step 2, before the renames or after them | Before: `HistoryShrank`, the new files dropped, the previous model kept. After (a purge between the check and the renames): the model files removed, as the purge does. Exit 0 | The next training (an hour later) uses what is left | `log::info!`; the report says `History was deleted while training; no model written.` |
 
 ## 12. References
 

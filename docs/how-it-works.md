@@ -2755,12 +2755,13 @@ Why: User might scroll up/down many times. Only log once per (query, file) combi
 
 Ctrl-R over the user's shell history, ranked by directory, repository and
 the previous command. Specified in `docs/ctrl-r/` (start at its README); built
-in phases. **Phases A ("Record"), D0 (benchmark corpora) and B ("Browse")
-are what exists today:** commands are recorded and imported, `psychic
-history` manages them, `psychic history` with no action flag is the Ctrl-R
-picker (heuristic ranking; the learned model is Phase C), and `psychic
-internal bench-history` builds and describes benchmark corpora. `--retrain`
-(Phase C) exits with "not built yet".
+in phases. **Phases A ("Record"), D0 (benchmark corpora), B ("Browse") and
+C ("Learn") are what exists today:** commands are recorded and imported,
+`psychic history` manages them, `psychic history` with no action flag is the
+Ctrl-R picker (a heuristic, and a learned model on top of it once one is
+trained), `psychic history --retrain` trains that model, and `psychic
+internal bench-history` builds and describes benchmark corpora. The relevance
+and latency benchmarks are Phase D.
 
 New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
 `history_mode` and `ToggleHistoryMode` already mean directory back/forward.
@@ -2778,9 +2779,12 @@ New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
 | `cmd/backfill.rs` | Import from Atuin, zsh, bash and fish history |
 | `cmd/bench.rs` | `psychic internal bench-history`: clap types, the data-dir guard's callee, `stats` |
 | `cmd/corpus.rs` | The seeded synthetic generator and the Claude Code transcript extractor |
-| `cmd/index.rs` | `CommandIndex`: every ranking statistic in memory, loaded at picker start (or, Phase C, filled by replay) |
+| `cmd/index.rs` | `CommandIndex`: every ranking statistic in memory, loaded at picker start or filled by replay (training) |
 | `cmd/worker.rs` | The picker's worker thread: requests and responses, the filter, narrowing and reuse, the `cmd_query` TIMING line |
-| `cmd/rank.rs` | The heuristic, `rank_commands` (partial sort) and the one total order |
+| `cmd/rank.rs` | The heuristic, `rank_commands` (partial sort) and the one total order; the model stage on top of the heuristic |
+| `cmd/model.rs` | `CmdModel`: whether a model may be used, its blend weight, prediction: `cmd_model.txt` read into a `Forest` whose trees are walked in Rust, LightGBM's scores bit for bit |
+| `cmd/features.rs` | The 23 command features: `COMMAND_FEATURE_REGISTRY`, `compute_all` (serving and training share it) |
+| `cmd/train.rs` | The replay that builds the training set, the fit, `cmd_model.txt`/`cmd_model_stats.json`, the lock, the detached retrain |
 | `cmd/app.rs` | The picker's UI thread: start-up, event loop, keys, pick output |
 | `cmd/render.rs` | List, preview, debug pane, help overlay (pure: no I/O, no clock) |
 | `cmd/keys.rs` | `CmdAction`, `CMD_KEYMAP` (its own table, not `keymap::KEYMAP`) |
@@ -2908,7 +2912,8 @@ One `cmd_query` TIMING line per query, after the answer, numbers only. The UI
 thread shows rank, a red `!` for a failed last run, `*` for "run here", the
 command (newlines as `↵`, control characters made safe) and its age; a preview
 with counts, last directories and what usually came before; Ctrl-O a debug
-pane with the heuristic's parts (`model: none` until Phase C); Ctrl-G help
+pane with the heuristic's parts, the 23 features of a model-scored row and the
+model's trees, groups, weight and top features (`model: none` without one); Ctrl-G help
 generated from `CMD_KEYMAP`. Tab cycles the scope (all, this directory, this
 repo, this session), Delete/Ctrl-X deletes a command after a `y`. A query on
 screen for 200 ms logs its visible rows as impressions; Enter logs the pick
@@ -2921,6 +2926,65 @@ release, rough): first results on screen 38-40 ms p50 / 46-52 ms p95 over three 
 so at the target, not under it), worker per keystroke 1.5 / 5.5 ms (B1 <= 8),
 keystroke to redraw 1.4 / 2.1-2.7 ms
 (B2 <= 16); the spec's section 12 has the breakdown.
+
+**The command model** (`docs/ctrl-r/03-learn.md`). A second LightGBM
+LambdaRank model, `cmd_model.txt` beside `model.txt`, trained by the same
+`training::fit_seeded` as the file model (same parameters, half-life and
+early stopping; `fit` is `fit_seeded(.., 42)`, and `bench/train_parity.py`
+still reads "identical, byte for byte") on a set `train.rs` builds by
+replaying everything recorded in time order into an empty `CommandIndex`
+through its mutators. Before each run is applied, a run of a command that ran
+before becomes a group: a synthetic query (the first 0, 1, 2 or 3 characters
+of its text, 40/20/20/20%, chosen by a seeded splitmix64 hash of the run id),
+the command as the positive, and up to 15 of the most recently run and 15
+random other commands that match the query as negatives, each row's 23
+features computed by the same `features::compute_all` serving uses (so
+train/serve skew would have to be in the index, and an integration test
+compares a replayed index with a loaded one feature by feature, bit for bit).
+A run within 300 s of a Ctrl-R pick of the same command in the same shell is
+that pick being executed and makes no group; the pick itself is a group of its
+picker's impressions, the picked command positive, weight 4. Imported runs
+weigh 0.3, hook runs 1. Only the newest 8,000 eligible runs make groups; below
+50 groups nothing is trained. The features: the query's fuzzy score and
+whether the command or a word of it starts with it; picks for this query and
+in episodes with it; time since the last run and runs in the last hour, day,
+week and 30 days, all runs, picks; the share of its runs made in this
+directory and repository, time since the last run here, runs here; the share
+of its runs that followed this shell's previous command's template, or any of
+its last three; success rate (NaN when unknown); failed in the last 2 minutes;
+last exit non-zero; length; argument count. A model is refused (heuristic
+only) when a file is missing or unreadable or the feature names in the stats
+or in the model file differ from the registry's, in order. A training whose
+history was purged or shrunk while it ran writes nothing; the lock it holds
+carries a token and is kept fresh by a heartbeat, so a long fit is not taken
+over. Serving is two-stage: the heuristic orders
+every match, the model scores the first 2,000 of that order (features on the
+rayon pool; prediction on the rayon pool too, not by LightGBM: `model.rs`
+reads `cmd_model.txt` into a `Forest` and walks its trees as LightGBM's
+`PredictRaw` does, giving the same scores bit for bit - the LightGBM that
+`lightgbm3-sys` builds has OpenMP off, so its one call is one thread at about
+4 us a row, its booster is neither `Send` nor safe to predict on from two
+threads at once, and it parses the file in 15 ms where the `Forest` takes
+4), and `(1 - w) * heuristic + w * logistic(score)` re-sorts
+them; the rest keep their heuristic order below. `w` is file mode's tanh blend
+on weighted groups / 10 (pick 4, hook 1, import 0.3): 0.5 at 300 hook groups.
+The model loads on the worker thread while a scoped thread loads the index,
+once (never reloaded); a failed prediction falls back to the heuristic for the
+rest of the process. Training never runs in the picker: after its first
+results the picker starts `psychic history --retrain --quiet` as a detached
+child (own process group) when the last attempt is an hour old and no fresh
+`cmd_train.lock` exists (`PSYCHIC_NO_RETRAIN` turns it off for tests and
+benchmarks); the new model is used from the next Ctrl-R. Reports go to stdout
+or, under `--quiet`, to `training.log`; neither they nor the model files hold
+command text. Measured on the 50,000-command perf DB: `--retrain` 8.5-8.8 s
+(8,000 groups, 234,227 rows, 132 trees; the file is 238 KB), model load
+3.8 ms p50 beside a 28 ms index load; with the model, worker per keystroke
+3.3-3.7 ms p50 / 6.8-7.8 ms p95 (stage 2: features 0.4, predict 1.1, blend
+0.4 ms p50), keystroke to redraw 1.5 / 3.0 ms, first results on screen
+39-41 ms p50 / 46-51 ms p95 (one run of three 0.9 ms over the 50 ms target;
+the model adds about 2 ms to the first query). On a held-out last 20% of that corpus (one
+seed, 600 lookups) the model's top-1 beat newest-first by 0.03-0.05 at query
+lengths 1-3 and lost 0.03 at length 0; Phase D measures it properly.
 
 **Ctrl-R widgets.** Appended to the three scripts, after the recording block.
 Each passes the line being edited as `--query=` (with `=`, so a line starting

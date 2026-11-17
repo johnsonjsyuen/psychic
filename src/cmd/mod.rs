@@ -8,7 +8,10 @@
 //! and the synthetic and agent-transcript corpus builders (`corpus`). Phase B,
 //! "Browse", is the picker: the in-memory statistics (`index`), the worker
 //! thread and its filter (`worker`), heuristic ranking (`rank`), the UI
-//! (`app`, `render`, `keys`) and impression/pick logging (`events`).
+//! (`app`, `render`, `keys`) and impression/pick logging (`events`). Phase
+//! C, "Learn", is the command model: its features (`features`), the
+//! replay-built training set, the fit and the retrain trigger (`train`), and
+//! the model stage of `rank`.
 //!
 //! Identifiers say `cmd`/`command`, never `history`: `src/history.rs` and
 //! `history_mode` already mean directory back/forward (ADR-1).
@@ -22,8 +25,10 @@ pub mod bench;
 pub mod cli;
 mod corpus;
 mod events;
+mod features;
 mod index;
 mod keys;
+mod model;
 mod privacy;
 mod rank;
 mod render;
@@ -31,6 +36,7 @@ mod repo;
 pub mod store;
 mod template;
 mod track;
+mod train;
 mod tuning;
 mod worker;
 
@@ -83,7 +89,7 @@ pub fn run_history(data_dir: &Path, args: cli::HistoryArgs) -> Result<()> {
         };
         purge(data_dir, &mut confirm, &mut out)
     } else if args.retrain {
-        bail!("psychic history: not built yet (Phase C)")
+        retrain(data_dir, args.quiet, &mut out)
     } else {
         drop(out);
         app::run(data_dir, &args)
@@ -230,8 +236,40 @@ fn status(data_dir: &Path, env: &Env, out: &mut dyn Write) -> Result<()> {
         counts.import_runs
     )?;
     writeln!(out, "picks: {}", counts.picks)?;
-    writeln!(out, "model: none")?;
+    writeln!(out, "{}", model_line(data_dir))?;
     Ok(())
+}
+
+/// `--retrain [--quiet]`: `03-learn.md` section 8. The report goes to stdout,
+/// or to `training.log` under `--quiet`.
+fn retrain(data_dir: &Path, quiet: bool, out: &mut dyn Write) -> Result<()> {
+    match train::retrain(data_dir, tuning::CMD_TRAIN_SEED, quiet)? {
+        train::RetrainOutcome::AlreadyRunning if !quiet => {
+            writeln!(out, "Another training run is in progress.")?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The `model:` line of `--status` (`03-learn.md` section 6.4).
+fn model_line(data_dir: &Path) -> String {
+    match model::CmdModel::load(data_dir) {
+        None => "model: none".to_string(),
+        Some(model) => {
+            let stats = &model.stats;
+            format!(
+                "model: trained {}, {} groups ({} picks, {} runs, {} imported), {} trees, ml weight {:.2}",
+                stats.trained_at,
+                stats.groups(),
+                stats.pick_groups,
+                stats.hook_groups,
+                stats.import_groups,
+                stats.best_iteration,
+                model.ml_weight
+            )
+        }
+    }
 }
 
 /// `--purge`: section 10.5. `confirm` is asked the question and says whether

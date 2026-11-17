@@ -73,6 +73,9 @@ pub struct TrainingSet {
     labels: Vec<f32>,
     episodes: Vec<i64>,
     timestamps: Vec<f64>,
+    /// A weight per row that multiplies its recency weight; 1.0 for every
+    /// row of a CSV.
+    row_weights: Vec<f64>,
 }
 
 impl TrainingSet {
@@ -140,6 +143,7 @@ impl TrainingSet {
             labels: Vec::with_capacity(rows.len()),
             episodes: Vec::with_capacity(rows.len()),
             timestamps: Vec::with_capacity(rows.len()),
+            row_weights: vec![1.0; rows.len()],
         };
         for row in rows {
             set.features.extend_from_slice(&row.values);
@@ -148,6 +152,47 @@ impl TrainingSet {
             set.timestamps.push(row.timestamp);
         }
         Ok(set)
+    }
+
+    /// A set built in memory rather than parsed: `labels.len()` rows of
+    /// `num_features` row-major `features`, sorted by `episodes`, each with a
+    /// timestamp and a weight that multiplies its recency weight.
+    pub fn from_parts(
+        num_features: usize,
+        features: Vec<f64>,
+        labels: Vec<f32>,
+        episodes: Vec<i64>,
+        timestamps: Vec<f64>,
+        row_weights: Vec<f64>,
+    ) -> Self {
+        assert_eq!(
+            features.len(),
+            labels.len() * num_features,
+            "features hold num_features values per row"
+        );
+        assert!(
+            episodes.len() == labels.len()
+                && timestamps.len() == labels.len()
+                && row_weights.len() == labels.len(),
+            "labels, episodes, timestamps and row weights have one entry per row"
+        );
+        assert!(episodes.is_sorted(), "rows are sorted by episode");
+        assert!(
+            row_weights.iter().all(|w| w.is_finite() && *w > 0.0),
+            "every row weight is finite and positive"
+        );
+        assert!(
+            labels.iter().all(|&l| l == 0.0 || l == 1.0),
+            "every label is 0 or 1"
+        );
+        TrainingSet {
+            features,
+            num_features,
+            labels,
+            episodes,
+            timestamps,
+            row_weights,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -174,7 +219,7 @@ struct ParsedRow {
 /// round count that `lgb.train` adds from its `num_boost_round` argument.
 ///
 /// The string is what LightGBM parses; key order does not matter to it.
-fn lightgbm_params(features: &[FeatureSpec], num_iterations: usize) -> String {
+fn lightgbm_params(features: &[FeatureSpec], num_iterations: usize, seed: u32) -> String {
     let monotone: Vec<String> = features.iter().map(|f| f.monotone.to_string()).collect();
     [
         "objective=lambdarank".to_owned(),
@@ -189,10 +234,10 @@ fn lightgbm_params(features: &[FeatureSpec], num_iterations: usize) -> String {
         "bagging_fraction=0.8".to_owned(),
         "bagging_freq=5".to_owned(),
         "verbose=-1".to_owned(),
-        "seed=42".to_owned(),
-        "bagging_seed=42".to_owned(),
-        "feature_fraction_seed=42".to_owned(),
-        "data_random_seed=42".to_owned(),
+        format!("seed={seed}"),
+        format!("bagging_seed={seed}"),
+        format!("feature_fraction_seed={seed}"),
+        format!("data_random_seed={seed}"),
         format!("num_iterations={num_iterations}"),
     ]
     .join(" ")
@@ -367,6 +412,11 @@ pub struct Fitted {
 /// most like what the user is about to search for; the held-out fit only
 /// decides how many trees it gets.
 pub fn fit(set: &TrainingSet, features: &[FeatureSpec]) -> Result<Fitted> {
+    fit_seeded(set, features, 42)
+}
+
+/// [`fit`] with `seed` as every LightGBM seed instead of 42.
+pub fn fit_seeded(set: &TrainingSet, features: &[FeatureSpec], seed: u32) -> Result<Fitted> {
     assert_eq!(
         set.num_features,
         features.len(),
@@ -374,6 +424,11 @@ pub fn fit(set: &TrainingSet, features: &[FeatureSpec]) -> Result<Fitted> {
     );
     let names: Vec<&str> = features.iter().map(|f| f.name).collect();
     let weights = recency_weights(&set.timestamps);
+    let weights: Vec<f64> = weights
+        .iter()
+        .zip(&set.row_weights)
+        .map(|(w, r)| w * r)
+        .collect();
     let split = time_split(&set.episodes)?;
 
     let dataset = |part: &Part, rows: Range<usize>, params: &str, reference| {
@@ -392,7 +447,7 @@ pub fn fit(set: &TrainingSet, features: &[FeatureSpec]) -> Result<Fitted> {
     };
 
     // The validated fit.
-    let params = lightgbm_params(features, MAX_ROUNDS);
+    let params = lightgbm_params(features, MAX_ROUNDS, seed);
     let train_part = Part::new(set, &weights, split.train.clone());
     let validation_part = Part::new(set, &weights, split.validation.clone());
     let train_data = dataset(&train_part, split.train.clone(), &params, None)?;
@@ -423,7 +478,7 @@ pub fn fit(set: &TrainingSet, features: &[FeatureSpec]) -> Result<Fitted> {
     drop(booster);
 
     // The refit, on everything, with nothing held out to stop against.
-    let params = lightgbm_params(features, best_iteration);
+    let params = lightgbm_params(features, best_iteration, seed);
     let all = 0..set.len();
     let all_part = Part::new(set, &weights, all.clone());
     let all_data = dataset(&all_part, all, &params, None)?;
@@ -539,7 +594,7 @@ pub fn train(features_csv: &Path, data_dir: &Path) -> Result<TrainingReport> {
 
 /// Write a temp file beside `target` and rename it over: on POSIX a reader
 /// sees the whole old file or the whole new one, never a truncated one.
-fn atomic_write(target: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(target: &Path, contents: &[u8]) -> Result<()> {
     let dir = target.parent().context("target has a directory")?;
     std::fs::create_dir_all(dir)?;
     let name = target.file_name().context("target has a name")?;

@@ -20,8 +20,10 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("psychic-leaks-{}", std::process::id()));
+    /// A scratch root of its own per test: tests run side by side.
+    fn new(tag: &str) -> Self {
+        let root =
+            std::env::temp_dir().join(format!("psychic-leaks-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("home/.local/share/atuin")).unwrap();
         Scratch { root }
@@ -96,7 +98,7 @@ fn is_database(path: &Path) -> bool {
 
 #[test]
 fn no_command_text_reaches_any_file_but_the_database() {
-    let scratch = Scratch::new();
+    let scratch = Scratch::new("record");
     let home = scratch.home();
     std::fs::write(
         home.join(".bash_history"),
@@ -196,4 +198,73 @@ fn no_command_text_reaches_any_file_but_the_database() {
         !home.join(".local/share/psychic").exists(),
         "nothing was written to the default data dir"
     );
+}
+
+/// Training (`03-learn.md` section 9: counts and feature names only): the
+/// report on stdout, `training.log`, `app.log` and the model files hold no
+/// command text, and neither does `--status` with a model.
+#[test]
+fn training_and_the_model_hold_no_command_text() {
+    let scratch = Scratch::new("train");
+    let data = scratch.data();
+    assert!(
+        scratch
+            .psychic(&["history", "--enable", "--no-import"])
+            .status
+            .success()
+    );
+    for i in 0..80 {
+        let text = format!("echo {SENTINEL} {}", i % 9);
+        let started_at = (1_700_000_000 + i * 120).to_string();
+        let output = scratch.psychic(&[
+            "track-command",
+            "--cwd",
+            "/w",
+            "--exit-code",
+            "0",
+            "--started-at",
+            &started_at,
+            "--session",
+            "s1",
+            "--",
+            &text,
+        ]);
+        assert!(output.status.success());
+    }
+    let trained = scratch.psychic(&["history", "--retrain"]);
+    assert!(trained.status.success());
+    let report = String::from_utf8_lossy(&trained.stdout);
+    assert!(report.starts_with("Trained on "), "{report}");
+    assert!(
+        scratch
+            .psychic(&["history", "--retrain", "--quiet"])
+            .status
+            .success()
+    );
+    let status = scratch.psychic(&["history", "--status"]);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("model: trained "),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    let others: Vec<PathBuf> = files(&data)
+        .into_iter()
+        .filter(|p| !is_database(p))
+        .collect();
+    for name in [
+        "cmd_model.txt",
+        "cmd_model_stats.json",
+        "cmd_train_attempt",
+        "training.log",
+        "app.log",
+    ] {
+        assert!(others.contains(&data.join(name)), "{name} was written");
+    }
+    for path in others {
+        assert!(
+            !contains(&std::fs::read(&path).unwrap(), SENTINEL),
+            "{} holds command text",
+            path.display()
+        );
+    }
 }

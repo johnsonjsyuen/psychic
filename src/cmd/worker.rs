@@ -1,18 +1,21 @@
 //! The picker's worker thread (`docs/ctrl-r/02-browse.md` section 6).
 //!
-//! It owns the [`CommandIndex`], the [`RankContext`], one fuzzy matcher and
-//! a [`CmdStore`] connection. The UI thread asks with [`CmdRequest`]s and is
-//! answered with [`CmdResponse`]s on its own event channel. No SQL runs per
-//! keystroke: a query is a filter over the index and a ranking, nothing else.
+//! It owns the [`CommandIndex`], the [`RankContext`], one fuzzy matcher, a
+//! [`CmdStore`] connection and, once trained, the command model. The UI
+//! thread asks with [`CmdRequest`]s and is answered with [`CmdResponse`]s on
+//! its own event channel. No SQL runs per keystroke: a query is a filter
+//! over the index and a ranking, nothing else.
 //!
 //! The filter and the narrowing rule are free functions so the benchmark
 //! (Phase D) can drive them without a thread.
 
 use super::index::{CommandIndex, LoadParams, RankContext};
+use super::model::CmdModel;
 use super::rank::{
     self, CmdRankTimings, CommandCandidate, CommandRanking, CommandScore, HeuristicParts,
 };
 use super::store::{CmdStore, DirUse, PrecededBy};
+use super::train::CmdModelStats;
 use super::tuning::{CMD_PAGE_ROWS, CMD_PAR_FILTER_MIN};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -97,6 +100,8 @@ pub(super) enum CmdResponse {
     Loaded {
         commands: usize,
         load_ms: f64,
+        /// The model ranking uses, for the debug pane; `None` = heuristic only.
+        model: Option<CmdModelStats>,
     },
     /// The index could not be loaded. Never contains command text.
     LoadFailed {
@@ -119,6 +124,9 @@ pub(super) enum CmdResponse {
     /// A `Delete` failed in the database; the `QueryUpdated` that follows
     /// still lists the command.
     DeleteFailed,
+    /// The model's prediction failed and the worker ranks by the heuristic
+    /// from now on (E-L-07). Sent once, before that query's `QueryUpdated`.
+    ModelDropped,
 }
 
 /// One row of the list, as the UI draws it.
@@ -315,6 +323,9 @@ struct Worker {
     ctx: RankContext,
     matcher: SkimMatcherV2,
     store: Option<CmdStore>,
+    /// Loaded once at start and never reloaded (ADR-11); dropped for good
+    /// after a failed prediction (E-L-07).
+    model: Option<CmdModel>,
     /// Commands not deleted.
     live: usize,
     /// The matches of the query being typed and of its prefixes, shortest
@@ -352,6 +363,7 @@ impl Worker {
         ctx: RankContext,
         store: Option<CmdStore>,
         matcher: SkimMatcherV2,
+        model: Option<CmdModel>,
     ) -> Self {
         let live = index.entries.iter().filter(|e| !e.deleted).count();
         Worker {
@@ -359,6 +371,7 @@ impl Worker {
             ctx,
             matcher,
             store,
+            model,
             live,
             trail: Vec::new(),
             current_query: String::new(),
@@ -368,6 +381,9 @@ impl Worker {
                 scores: Vec::new(),
                 sorted: 0,
                 timings: CmdRankTimings::default(),
+                model_failed: false,
+                features: Vec::new(),
+                feature_rows: Vec::new(),
             }),
             empty_rankings: Vec::new(),
         }
@@ -443,7 +459,8 @@ impl Worker {
         self.empty_rankings.clear();
     }
 
-    fn row(&self, score: &CommandScore) -> CmdRow {
+    /// The row at `rank` of the current ranking.
+    fn row(&self, rank: usize, score: &CommandScore) -> CmdRow {
         let entry = &self.index.entries[score.idx as usize];
         CmdRow {
             command_id: entry.db_id,
@@ -462,7 +479,7 @@ impl Worker {
             ml_score: score.ml_score,
             ml_weight: score.ml_weight,
             fuzzy_score: score.fuzzy_score,
-            features: score.features.clone(),
+            features: self.current.features_of(rank).to_vec(),
         }
     }
 
@@ -490,7 +507,8 @@ impl Worker {
         }
         self.current.scores[start..end]
             .iter()
-            .map(|s| self.row(s))
+            .enumerate()
+            .map(|(offset, score)| self.row(start + offset, score))
             .collect()
     }
 
@@ -518,13 +536,22 @@ impl Worker {
                 let filter_started = Instant::now();
                 let filtered = self.filter(&query, scope);
                 let filter_ms = filter_started.elapsed().as_secs_f64() * 1000.0;
-                let ranking = Arc::new(rank::rank_commands(
+                let ranking = rank::rank_commands(
                     &query,
                     &filtered.candidates,
                     &self.index,
                     &self.ctx,
                     CMD_PAGE_ROWS,
-                ));
+                    self.model.as_ref(),
+                );
+                if ranking.model_failed {
+                    log::warn!("command model prediction failed; using the heuristic");
+                    self.model = None;
+                    if event_tx.send(T::from(CmdResponse::ModelDropped)).is_err() {
+                        return false;
+                    }
+                }
+                let ranking = Arc::new(ranking);
                 let rank_timings = ranking.timings;
                 if query.is_empty() {
                     self.empty_rankings.push((scope, Arc::clone(&ranking)));
@@ -699,6 +726,18 @@ fn load(
     Ok((store, index, ctx))
 }
 
+/// The command model in `data_dir`, if there is a usable one, with its
+/// TIMING line.
+fn load_model(data_dir: &Path) -> Option<CmdModel> {
+    let started = Instant::now();
+    let model = CmdModel::load(data_dir)?;
+    log::info!(
+        "TIMING {{\"op\":\"cmd_model_load\",\"ms\":{}}}",
+        ms(started.elapsed().as_secs_f64() * 1000.0)
+    );
+    Some(model)
+}
+
 fn run<T: From<CmdResponse>>(
     data_dir: &Path,
     params: LoadParams,
@@ -707,16 +746,23 @@ fn run<T: From<CmdResponse>>(
 ) {
     // The rayon threads start, and each builds its matcher scratch space,
     // while the index loads: not inside the load's own parallel part, and
-    // not inside the first query.
+    // not inside the first query. The model loads on this thread meanwhile,
+    // so it costs the first results nothing unless it is slower than the
+    // index (about 4 ms against 30).
     let matcher = SkimMatcherV2::default();
     let load_started = Instant::now();
-    let loaded = std::thread::scope(|scope| {
+    let (loaded, model) = std::thread::scope(|scope| {
         scope.spawn(|| {
             rayon::broadcast(|_| {
                 let _ = matcher.fuzzy_match("warm up", "wu");
             })
         });
-        load(data_dir, &params)
+        let index = scope.spawn(|| load(data_dir, &params));
+        let model = load_model(data_dir);
+        let loaded = index
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (loaded, model)
     });
     let (store, index, ctx) = match loaded {
         Ok(loaded) => loaded,
@@ -733,11 +779,16 @@ fn run<T: From<CmdResponse>>(
         }
     };
     let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
-    let mut worker = Worker::new(index, ctx, Some(store), matcher);
+    let model_stats = model.as_ref().map(|model| model.stats.clone());
+    let mut worker = Worker::new(index, ctx, Some(store), matcher, model);
 
     let commands = worker.live;
     if event_tx
-        .send(T::from(CmdResponse::Loaded { commands, load_ms }))
+        .send(T::from(CmdResponse::Loaded {
+            commands,
+            load_ms,
+            model: model_stats,
+        }))
         .is_err()
     {
         return;
@@ -804,7 +855,7 @@ mod tests {
     fn tc_b_07_narrowing_starts_from_the_previous_matches() {
         let index = index_of(&["git status", "grep it", "ls"]);
         let ctx = context(NOW);
-        let mut worker = Worker::new(index, ctx, None, SkimMatcherV2::default());
+        let mut worker = Worker::new(index, ctx, None, SkimMatcherV2::default(), None);
 
         let g = worker.filter("g", Scope::All);
         assert!(!g.narrowed);
@@ -835,7 +886,7 @@ mod tests {
     #[test]
     fn deleting_back_to_an_earlier_query_reuses_its_matches() {
         let index = index_of(&["git status", "grep it", "ls"]);
-        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default());
+        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default(), None);
         let g = worker.filter("g", Scope::All);
         let gi = worker.filter("gi", Scope::All);
         assert!(gi.narrowed);
@@ -1239,11 +1290,206 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    // --- Phase C: the model in the worker ----------------------------------------
+
+    use crate::cmd::features::COMMAND_FEATURE_REGISTRY;
+    use crate::cmd::train::test_support::{
+        FIXTURE_ANCHOR, TempDir, trained_fixture, two_feature_model,
+    };
+
+    /// The fixture's context: its busiest directory and newest session.
+    fn fixture_params() -> LoadParams {
+        LoadParams {
+            now: FIXTURE_ANCHOR,
+            cwd: Some("/synth/repo0/dir0".to_string()),
+            repo_root: Some("/synth/repo0".to_string()),
+            shell_session: Some("synth:1".to_string()),
+        }
+    }
+
+    fn fixture_worker(data_dir: &Path, model: Option<CmdModel>) -> Worker {
+        let store = CmdStore::open(data_dir).unwrap();
+        let (index, ctx) = CommandIndex::load(&store, &fixture_params()).unwrap();
+        Worker::new(index, ctx, Some(store), SkimMatcherV2::default(), model)
+    }
+
+    fn query(worker: &mut Worker, text: &str, query_id: u64) -> Vec<CmdRow> {
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        assert!(worker.handle(
+            CmdRequest::UpdateQuery {
+                query: text.to_string(),
+                query_id,
+                scope: Scope::All,
+            },
+            &event_tx
+        ));
+        let CmdResponse::QueryUpdated { rows, .. } = next(&event_rx) else {
+            panic!("QueryUpdated");
+        };
+        rows
+    }
+
+    /// Every match of the current query, in rank order.
+    fn all_ids(worker: &mut Worker) -> Vec<i64> {
+        let total = worker.current.scores.len();
+        let mut ids = Vec::new();
+        let mut start = 0;
+        while start < total {
+            ids.extend(worker.rows(start).iter().map(|row| row.command_id));
+            start += CMD_PAGE_ROWS;
+        }
+        ids
+    }
+
+    #[test]
+    fn it_l_07_the_model_changes_the_order_only_inside_stage_2() {
+        let dir = TempDir::new("worker-model");
+        trained_fixture(&dir.0);
+        let mut plain = fixture_worker(&dir.0, None);
+        let mut learned = fixture_worker(&dir.0, CmdModel::load(&dir.0));
+        assert!(learned.model.is_some());
+        let queries = [
+            "", "g", "gi", "git", "git s", "m", "ma", "make", "c", "cd", "l", "ls", "d", "do",
+            "dock", "n", "np", "x", "s", "zzz",
+        ];
+        let mut reordered = 0;
+        for (i, text) in queries.iter().enumerate() {
+            let id = 2 + i as u64;
+            let without = query(&mut plain, text, id);
+            let with = query(&mut learned, text, id);
+            let (mut a, mut b) = (all_ids(&mut plain), all_ids(&mut learned));
+            if a != b {
+                reordered += 1;
+            }
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "{text:?}: the same matches");
+            assert!(
+                without
+                    .iter()
+                    .all(|row| row.ml_score.is_none() && row.features.is_empty())
+            );
+            let stage2 = learned.current.timings.stage2;
+            assert_eq!(
+                stage2,
+                learned
+                    .current
+                    .scores
+                    .len()
+                    .min(crate::cmd::tuning::CMD_STAGE2_K)
+            );
+            for row in &with[..stage2.min(with.len())] {
+                assert!(row.ml_score.is_some(), "{text:?}");
+                assert_eq!(row.features.len(), COMMAND_FEATURE_REGISTRY.len());
+            }
+        }
+        assert!(reordered > 0, "the model changed some order");
+    }
+
+    #[test]
+    fn it_l_04_without_a_usable_model_the_worker_answers_by_heuristic() {
+        let dir = TempDir::new("worker-no-model");
+        trained_fixture(&dir.0);
+        let model_file = dir.0.join("cmd_model.txt");
+        let stats_file = dir.0.join("cmd_model_stats.json");
+        let model = std::fs::read(&model_file).unwrap();
+        let stats = std::fs::read_to_string(&stats_file).unwrap();
+        let renamed = stats.replacen("\"fuzzy_score\"", "\"fuzzy_score_v0\"", 1);
+        assert_ne!(renamed, stats);
+        // A renamed feature; no stats; a truncated model.
+        let cases: [(&[u8], Option<&str>); 3] = [
+            (&model, Some(&renamed)),
+            (&model, None),
+            (&model[..model.len() / 3], Some(&stats)),
+        ];
+        for (case, (model_text, stats_text)) in cases.into_iter().enumerate() {
+            std::fs::write(&model_file, model_text).unwrap();
+            match stats_text {
+                Some(text) => std::fs::write(&stats_file, text).unwrap(),
+                None => std::fs::remove_file(&stats_file).unwrap(),
+            }
+            let (event_tx, event_rx) = mpsc::channel::<Event>();
+            let (tx, handle) = spawn(&dir.0, fixture_params(), event_tx);
+            let CmdResponse::Loaded {
+                commands, model, ..
+            } = next(&event_rx)
+            else {
+                panic!("Loaded comes first");
+            };
+            assert_eq!((commands, model.is_none()), (300, true), "case {case}");
+            tx.send(CmdRequest::UpdateQuery {
+                query: "g".to_string(),
+                query_id: 2,
+                scope: Scope::All,
+            })
+            .unwrap();
+            let CmdResponse::QueryUpdated { rows, .. } = next(&event_rx) else {
+                panic!("QueryUpdated");
+            };
+            assert!(!rows.is_empty());
+            assert!(
+                rows.iter()
+                    .all(|row| row.ml_score.is_none() && row.score == row.heuristic),
+                "case {case}"
+            );
+            tx.send(CmdRequest::Shutdown).unwrap();
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn the_worker_reports_the_model_it_loaded() {
+        let dir = TempDir::new("worker-loaded");
+        let stats = trained_fixture(&dir.0);
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        let (tx, handle) = spawn(&dir.0, fixture_params(), event_tx);
+        let CmdResponse::Loaded { model, .. } = next(&event_rx) else {
+            panic!("Loaded comes first");
+        };
+        // serde_json reads a float back to within its last bit, not exactly.
+        let model = model.expect("a model");
+        assert_eq!(
+            (model.trained_at, model.best_iteration, model.feature_names),
+            (stats.trained_at, stats.best_iteration, stats.feature_names)
+        );
+        tx.send(CmdRequest::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn e_l_07_a_failed_prediction_drops_the_model_for_good() {
+        let dir = TempDir::new("worker-failing");
+        let stats = trained_fixture(&dir.0);
+        let failing = CmdModel::from_parts(&two_feature_model(), stats);
+        let mut worker = fixture_worker(&dir.0, Some(failing));
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        assert!(worker.handle(
+            CmdRequest::UpdateQuery {
+                query: "g".to_string(),
+                query_id: 2,
+                scope: Scope::All,
+            },
+            &event_tx
+        ));
+        assert!(
+            matches!(next(&event_rx), CmdResponse::ModelDropped),
+            "the UI hears first"
+        );
+        let CmdResponse::QueryUpdated { rows, .. } = next(&event_rx) else {
+            panic!("QueryUpdated");
+        };
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row.ml_score.is_none()));
+        assert!(worker.model.is_none());
+        let rows = query(&mut worker, "gi", 3);
+        assert!(rows.iter().all(|row| row.ml_score.is_none()));
+    }
+
     #[test]
     fn e_b_07_a_failed_delete_keeps_the_command_and_says_so() {
         let mut index = index_of(&["a", "b"]);
         index.record_run(0, NOW - 1, None, None, Some(0), None);
-        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default());
+        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default(), None);
         let (event_tx, event_rx) = mpsc::channel::<Event>();
         worker.current_query = String::new();
         assert!(worker.handle(
@@ -1270,7 +1516,7 @@ mod tests {
         for i in 0..refs.len() as u32 {
             index.record_run(i, NOW - i64::from(i) * 7, None, None, Some(0), None);
         }
-        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default());
+        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default(), None);
         let (event_tx, event_rx) = mpsc::channel::<Event>();
         let ask = |worker: &mut Worker, query: &str, query_id: u64| {
             worker.handle(
@@ -1330,6 +1576,7 @@ mod tests {
             context(NOW),
             Some(store),
             SkimMatcherV2::default(),
+            None,
         );
         let details = worker.details(1);
         assert_eq!(
@@ -1365,7 +1612,7 @@ mod tests {
         let texts: Vec<String> = (0..CMD_PAGE_ROWS + 30).map(|i| format!("c{i}")).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let index = index_of(&refs);
-        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default());
+        let mut worker = Worker::new(index, context(NOW), None, SkimMatcherV2::default(), None);
         let (event_tx, event_rx) = mpsc::channel::<Event>();
         worker.handle(update(5), &event_tx);
         let _ = next(&event_rx);

@@ -255,12 +255,13 @@ pub(super) enum CmdRequest {
     Shutdown,
 }
 pub(super) enum CmdResponse {
-    Loaded { commands: usize, load_ms: f64 },
+    Loaded { commands: usize, load_ms: f64, model: Option<CmdModelStats> },   // model: Phase C (03 section 7.4)
     LoadFailed { message: String },                      // never contains command text
     QueryUpdated { query_id: u64, query: String, total_matched: usize, total_commands: usize, rows: Vec<CmdRow>, rank_ms: f64 },
     Rows { query_id: u64, start: usize, rows: Vec<CmdRow> },
     Details(CmdDetails),
     DeleteFailed,                                        // E-B-07; the QueryUpdated that follows still lists the command
+    ModelDropped,                                        // Phase C, E-L-07: sent once, before that query's QueryUpdated
 }
 pub(super) struct CmdRow {
     pub command_id: i64, pub text: Arc<str>, pub last_run_at: i64,
@@ -281,6 +282,8 @@ pub(super) fn spawn<T>(data_dir: &Path, params: LoadParams, event_tx: Sender<T>)
 1. `CmdStore::open`, `CommandIndex::load`. On error send `LoadFailed`, then
    answer every later `UpdateQuery` (and `Delete`) with an empty `QueryUpdated`,
    and `Details` with empty vectors, until `Shutdown`.
+1a. (Phase C) The index load of step 1 runs on a scoped thread while this
+   thread loads the command model ([03 section 7.1](03-learn.md#71-loading-the-model)).
 2. On a scoped thread, while step 1 runs:
    `rayon::broadcast(|_| { let _ = matcher.fuzzy_match("warm up", "wu"); })` - the
    rayon pool starts, and every rayon thread creates its matcher scratch space,
@@ -350,8 +353,9 @@ query: nothing lazily initialised, no lock, no allocation other than the output
 | `Delete` | `store.delete_command(id, text, now)`; `index.remove(idx)`; clear the trail; re-run `current_query`/`current_scope` under the given `query_id`. On a database error: `DeleteFailed` first, the index untouched (E-B-07) | `QueryUpdated` |
 | `Shutdown` | Return from the thread | - |
 
-Building a `CmdRow` from a `CommandScore` clones the `Arc<str>` (no text copy)
-and reads `runs_here` from `dir_stat(idx, ctx.dir)`.
+Building a `CmdRow` from a `CommandScore` clones the `Arc<str>` (no text copy),
+reads `runs_here` from `dir_stat(idx, ctx.dir)`, and copies the row's
+`features_of(rank)` (Phase C).
 
 ### 6.5 TIMING line
 
@@ -383,15 +387,21 @@ pub(super) struct CommandCandidate { pub idx: u32, pub fuzzy_score: i64 }
 pub(super) struct HeuristicParts { pub recency: f64, pub dir: f64, pub repo: f64, pub fuzzy: f64 }
 pub(super) struct CommandScore {
     pub idx: u32, pub score: f64, pub heuristic: f64, pub parts: HeuristicParts,
-    pub ml_score: Option<f64>, pub ml_weight: f64, pub fuzzy_score: i64, pub features: Vec<f64>,
+    pub ml_score: Option<f64>, pub ml_weight: f64, pub fuzzy_score: i64,
 }
 pub(super) struct CmdRankTimings { pub heuristic_ms: f64, pub features_ms: Option<f64>, pub predict_ms: Option<f64>, pub blend_ms: Option<f64>, pub stage2: usize }
 pub(super) struct CommandRanking {
     pub scores: Vec<CommandScore>,   // scores[..sorted] in rank order; the rest after them, unordered
     pub sorted: usize,
     pub timings: CmdRankTimings,
+    pub model_failed: bool,          // Phase C (03 section 7.2)
+    pub features: Vec<f64>,          // Phase C: the model-scored rows' features, row-major
+    pub feature_rows: Vec<u32>,      // Phase C: rank -> row of `features`
 }
-impl CommandRanking { pub(super) fn sort_rest(&mut self, index: &CommandIndex); }   // sorted = scores.len() afterwards
+impl CommandRanking {
+    pub(super) fn sort_rest(&mut self, index: &CommandIndex);   // sorted = scores.len() afterwards
+    pub(super) fn features_of(&self, rank: usize) -> &[f64];    // registry order; empty when not model-scored
+}
 
 pub(super) fn heuristic(index: &CommandIndex, ctx: &RankContext, c: &CommandCandidate, max_fuzzy: i64) -> HeuristicParts;
 pub(super) fn rank_commands(query: &str, candidates: &[CommandCandidate], index: &CommandIndex, ctx: &RankContext,
@@ -411,7 +421,7 @@ For candidate `c` with entry `e` (`ln` is the natural logarithm):
 
 `rank_commands` in this phase: compute `max_fuzzy`; compute `heuristic` for
 every candidate (rayon `par_iter` when there are at least `CMD_PAR_FILTER_MIN`);
-`score = heuristic`, `ml_score = None`, `ml_weight = 0.0`, `features = vec![]`;
+`score = heuristic`, `ml_score = None`, `ml_weight = 0.0`, `features` empty;
 order by the total order **`score` descending (`f64::total_cmp`), then
 `last_run_at` descending, then `db_id` descending** - exactly for the first
 `head` rows, `sorted = min(head, len)`: `select_nth_unstable_by(sorted - 1)`,
@@ -790,7 +800,7 @@ Targets B1-B3, B5. The decisions that make them reachable:
 | Narrowing and reuse | Typing a longer query re-matches only the matches of its longest prefix typed before; deleting back to a query typed before reuses its matches; the empty query's ranking is kept per scope until a delete (section 6.3) |
 | Sort only what is shown | `select_nth` + sort of the first `CMD_PAGE_ROWS` 32-byte keys; the rest is sorted only when a page reaches it (section 7) |
 | No cold global in the parallel loop | One matcher, warmed on every rayon thread at start (section 6.2, step 2); the registry of Phase C is a `static` array, not a `Lazy` |
-| No per-row allocation on the query path | `Arc<str>` texts; `features` empty unless model-scored; `CmdRow`s built only for the 200 sent |
+| No per-row allocation on the query path | `Arc<str>` texts; the model-scored rows' features in one buffer of the ranking, not a vector per row; `CmdRow`s built only for the 200 sent |
 | One log write per query, after the send | Section 6.5 |
 | Render is pure | `draw(&mut Frame, &CmdApp)`; time-ago uses `list_clock`; `~` uses `app.home` |
 
@@ -803,7 +813,7 @@ Start-up allowances per stage; they sum to the B3 target:
 | `CmdStore::open` | 1 ms | worker |
 | R1 over 50,000 rows, split over `CMD_LOAD_READERS`, entries built | 20 ms | worker + readers |
 | R2-R8 | 6 ms | one reader, during R1 (not on the critical path) |
-| Model load (Phase C) | 3 ms | worker |
+| Model load (Phase C) | 3 ms (measured 3.8 ms p50, 5.3 ms p95; beside the index load, so off the critical path) | worker, while a scoped thread loads the index |
 | First query: 50,000 heuristics + sort (+ stage 2 in Phase C) | 8 ms | worker |
 | First full draw | 4 ms | main |
 
@@ -831,6 +841,18 @@ other work; ranges over the last three runs of the final code):
 B3 is at its target, not under it with room: one run of three was 2.4 ms over
 at p95 (an earlier run of the same design, before the review fixes, read 44 ms);
 the load is most of it, R1 being 50,000 rows however it is split.
+
+Measured at Phase C with the model active (same driver, corpus and context;
+a model trained on the perf DB: 8,000 groups, 132 trees, ml weight 1.0;
+load average 1.5-2.5 from other work; three runs of the final code): B1
+`cmd_query.total_ms` 3.3-3.7 ms p50, 6.8-7.8 ms p95 (target 8); stage 2 alone
+(2,000 rows) features 0.41 / 0.90, predict 1.13 / 1.99, blend 0.42 / 0.69 ms
+(p50 / p95); B2 1.5-1.6 / 2.9-3.0 ms; B3 38.7-41.0 ms p50 and 46.1, 47.5,
+50.9 ms p95 (one run of three 0.9 ms over the 50 ms target; an earlier run of
+the same design under a load average of 3 read 46-61 ms, the spread being the
+index load's); the first query 4.4-5.0 ms p50 against 2.4-2.7 ms without a
+model. See [03 section 7.2](03-learn.md#72-rank_commands-with-a-model) for
+why prediction is not a LightGBM call.
 
 By query: one letter (typed over all 50,000, 37,000 match; or deleted back
 to, reused) 2.4-2.5 ms p50, 3.8-4.3 ms p95; two letters, narrowed, 2.0-2.4 /
