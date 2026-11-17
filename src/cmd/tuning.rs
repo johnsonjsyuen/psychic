@@ -60,6 +60,11 @@ pub(super) const CMD_IMPRESSION_AGE_MS: u64 = 200;
 /// Tick thread sleep, in milliseconds; each tick wakes the event loop once.
 pub(super) const CMD_TICK_MS: u64 = 1000;
 
+/// At exit, after the pick is printed, how long the picker waits for its
+/// worker to finish a `Delete` it was sent, in milliseconds. A delete still
+/// waiting for another process's write lock after this is lost.
+pub(super) const CMD_EXIT_DELETE_WAIT_MS: u64 = 1000;
+
 /// Terminals narrower than this stack the list over the preview.
 pub(super) const CMD_STACK_BELOW_COLS: u16 = 120;
 

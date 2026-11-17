@@ -75,6 +75,7 @@ fzf's order, section 7.)
 | `CMD_PAGE_PREFETCH` | `usize` | `50` | Request the next page when the selection is this close to the last loaded row |
 | `CMD_IMPRESSION_AGE_MS` | `u64` | `200` | A query on screen this long counts as seen (same value as [src/analytics.rs:22](../../src/analytics.rs)) |
 | `CMD_TICK_MS` | `u64` | `1000` | Tick thread sleep; each tick wakes the event loop once (file mode's idle redraw rate, [src/main.rs:840-848](../../src/main.rs)) |
+| `CMD_EXIT_DELETE_WAIT_MS` | `u64` | `1000` | At exit after a `Delete`, how long the picker waits for the worker to finish it (section 4 step 8); a delete still waiting for another process's write lock after this is lost |
 | `CMD_STACK_BELOW_COLS` | `u16` | `120` | Narrower terminals stack list over preview (as [src/render.rs:401](../../src/render.rs)) |
 
 ## 4. Picker invocation
@@ -132,11 +133,22 @@ loads while the terminal is being set up):
    panic in its first draw; it exists for E-B-20's test.
 6. Open the UI thread's own `CmdStore` for event logging, with `busy_timeout = CMD_EVENT_WAIT_MS` (section 10); spawn the tick thread.
 7. Event loop (section 8.2).
-8. On exit: `input.shutdown()`, `PickerTerminal::leave()`; on `Ended::Signal`, die of
-   the signal (above); else print the pick if there is one (and flush); then send `CmdRequest::Shutdown` and join
-   the worker only if it has already finished. The worker may be busy (a load,
-   a `Delete` waiting on another process's lock for up to `busy_timeout`); the
-   terminal and the shell must not wait for it, and the process exits next.
+8. On exit: `input.shutdown()`, `PickerTerminal::leave()`; on `Ended::Signal`, stop
+   the worker (below) and die of the signal (above); else print the pick if there is one
+   (and flush), then stop the worker (`stop_worker_at_exit`): send `CmdRequest::Shutdown`;
+   if no `Delete` was sent this session, join the worker only if it has already
+   finished, since it may be busy (a load, a query) and the shell must not wait
+   for that. If a `Delete` was sent (`deleted_any`), wait up to
+   `CMD_EXIT_DELETE_WAIT_MS` (1 s) for the worker to finish, polling
+   `JoinHandle::is_finished` every millisecond, then join it: the worker
+   handles requests in order, so it has then finished every delete; a delete it
+   was still inside when the process exited would be rolled back (Esc right
+   after `y`, IT-B-15). The pick is already on stdout by then; the shell's
+   `$(...)` still waits for the exit, so the prompt can be up to 1 s late, and
+   only after a delete. The worker waits up to `busy_timeout` (5 s) for another
+   process's write lock, so a delete still waiting after the 1 s is lost: a
+   `log::warn!`, and the command is still there next time. A `TIMING` line
+   `cmd_exit_delete_wait` records the wait.
    (The error paths of steps 4-5 still stop and join it.) If a `Delete` was
    sent this session (`deleted_any`), `events.truncate_log()` then runs D6 once
    more on the UI thread's connection, without waiting: the write-ahead log is
@@ -639,7 +651,7 @@ pub(super) struct CmdApp {
     pub next_query_id: u64,              // starts at 2 (1 is the initial query)
     pub rows_requested_to: usize,        // highest `start` already asked for with GetRows
     pub confirm_delete: Option<i64>,     // command_id awaiting the one-key confirm
-    pub deleted_any: bool,               // a Delete was sent: D6 again at exit (section 4 step 8)
+    pub deleted_any: bool,               // a Delete was sent: wait for the worker, then D6 again at exit (section 4 step 8)
     pub help_visible: bool, pub debug_visible: bool,
     pub details: FxHashMap<i64, CmdDetails>, pub details_requested: FxHashSet<i64>,
     pub list_clock: i64,                 // "now" for time-ago; steps once a minute on Tick
@@ -1158,14 +1170,15 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 | IT-B-04 | Render | `ratatui::backend::TestBackend` 140x30 and 100x30 with a `CmdApp` holding 3 rows (one failed, one run here, one multi-line) | 140 wide: list and preview side by side; 100 wide: stacked; the failed row has `!`, the here row `*`, the multi-line row `↵`; the preview shows `Runs` and `Last exit` lines; debug on shows `model: none`; help overlay lists 12 key rows | none |
 | IT-B-05 | Picker end to end (`tests/picker.rs`, pty helper `tests/support/mod.rs`) | Temp data dir with `echo one`, `echo two` (newer); spawn `psychic --data-dir T history --cwd /tmp` on a pty with stdout redirected to a file | Environment includes `PSYCHIC_NO_RETRAIN=1`. Before every key, wait until the pty has been quiet for 300 ms (the list is drawn). Send Enter: exit 0, file is `echo two\n`. Second run, send `one`, wait for quiet again, then Enter: `echo one\n`. Third run, send Esc: exit 0, file empty. `app.log` in T contains `cmd_first_full_render` and no `echo` | `remove_dir_all` |
 | IT-B-06 | Widget blocks ship | Output of `psychic zsh`, `psychic bash`, `psychic fish` | Each contains `__psychic_history_widget`, `PSYCHIC_NO_CTRL_R`, `__psychic_history_enabled`, and `--query=`; none contains `--query "` | none |
-| IT-B-12 | Enter under another process's write lock (`tests/picker.rs`) | `echo locked-one` recorded; the test holds `BEGIN IMMEDIATE` on a second connection for the picker's whole run | Enter to exit under 1 s (before: `busy_timeout` 5 s per write); stdout `echo locked-one\n`, exit 0; no pick row; `app.log` has `command event logging failed: starting a transaction failed: database busy` | Scratch dropped |
-| IT-B-13 | A panic gives the terminal back (`tests/picker.rs`, E-B-20) | The picker on a pty with `PSYCHIC_HISTORY_TEST_PANIC=1` | Exit 101; after the last `\x1b[?1049h`, in order: `\x1b[<1u`, `\x1b[?1000l`, `\x1b[?1049l`, `\x1b[?25h`; the panic message after them; the pty's slave termios has `ICANON` and `ECHO`; stdout empty. Fails without the hook (the guard alone restores after the message) | Scratch dropped |
-| IT-B-14 | SIGTERM and SIGHUP give the terminal back (`tests/picker.rs`, E-B-21) | The picker on a pty, settled; `kill(pid, SIGTERM)`, then a fresh one with `SIGHUP` | Killed by that signal; the restore sequences and cooked termios as IT-B-13; stdout empty. Fails without `TerminationSignals` | Scratch dropped |
 | IT-B-07 | No query text in logs | IT-B-05's second run with the query `SENTINELq` | `app.log` does not contain `SENTINELq` | `remove_dir_all` |
 | IT-B-08 | Ctrl-R in each shell (`tests/picker.rs`) | zsh, bash and fish on a pty with the script, recording on by the marker; `echo alpha`, `echo beta` recorded in session `seed` | Type `beta`, Ctrl-R, Enter (picker), Enter (shell): `echo beta` runs, is recorded once in the shell's session, and the one pick event has `query = beta`, the shell's session and cwd, and a timestamp 0-300 s before that run (the link `follows_pick` of [03 section 5.1](03-learn.md#51-inputs-and-the-replayer) makes, `CMD_PICK_RUN_SECS`). Then `echo kept`, Ctrl-R, Esc, Enter: `echo kept` runs as typed and no second pick is logged | Scratch dropped |
 | IT-B-09 | Binding guards | Each shell: recording on; `PSYCHIC_NO_CTRL_R=1`; recording off; the user's own Ctrl-R bound before the script (bash: a readline function, and `bind -x` as fzf does; fish: both modes, and insert mode only) | The widget is bound in the first case only; fish with only insert mode taken binds the default mode and leaves insert alone | Scratch dropped |
-| IT-B-11 | The line goes over verbatim | Each shell; `echo -x '$HOME'` recorded; type `-x '$H`, Ctrl-R, Enter, Enter | The pick event's query is `-x '$H` exactly; `-x $HOME` is printed | Scratch dropped |
 | IT-B-10 | A failing or missing picker | Each shell with `PSYCHIC_BIN=false`; fish also with a binary that does not exist | Ctrl-R then Enter runs the typed line unchanged; fish prints nothing about the missing binary | Scratch dropped |
+| IT-B-11 | The line goes over verbatim | Each shell; `echo -x '$HOME'` recorded; type `-x '$H`, Ctrl-R, Enter, Enter | The pick event's query is `-x '$H` exactly; `-x $HOME` is printed | Scratch dropped |
+| IT-B-12 | Enter under another process's write lock (`tests/picker.rs`) | `echo locked-one` recorded; the test holds `BEGIN IMMEDIATE` on a second connection for the picker's whole run | Enter to exit under 1 s (before: `busy_timeout` 5 s per write); stdout `echo locked-one\n`, exit 0; no pick row; `app.log` has `command event logging failed: starting a transaction failed: database busy` | Scratch dropped |
+| IT-B-13 | A panic gives the terminal back (`tests/picker.rs`, E-B-20) | The picker on a pty with `PSYCHIC_HISTORY_TEST_PANIC=1` | Exit 101; after the last `\x1b[?1049h`, in order: `\x1b[<1u`, `\x1b[?1000l`, `\x1b[?1049l`, `\x1b[?25h`; the panic message after them; the pty's slave termios has `ICANON` and `ECHO`; stdout empty. Fails without the hook (the guard alone restores after the message) | Scratch dropped |
+| IT-B-14 | SIGTERM and SIGHUP give the terminal back (`tests/picker.rs`, E-B-21) | The picker on a pty, settled; `kill(pid, SIGTERM)`, then a fresh one with `SIGHUP` | Killed by that signal; the restore sequences and cooked termios as IT-B-13; stdout empty. Fails without `TerminationSignals` | Scratch dropped |
+| IT-B-15 | Esc right after a delete still deletes (`tests/picker.rs`) | `echo keep-me` and `echo delete-me` recorded; the picker on a pty, settled; the test takes the write lock (`BEGIN IMMEDIATE` on its own connection), presses Delete, `y`, Esc, holds the lock 300 ms more and rolls back. Second test: the lock held until the picker exits | First: exit 0, nothing printed, `commands` holds only `echo keep-me` and `deleted_commands` one row. Second: Esc to exit takes 0.9-2.5 s (`CMD_EXIT_DELETE_WAIT_MS`, not the worker's 5 s `busy_timeout`), exit 0, and `app.log` has the warning that a delete may not have finished | Scratch dropped |
 
 `tests/support/mod.rs` holds the pty helper shared by `tests/shell_hooks.rs`
 and `tests/picker.rs` ([01 section 15.3](01-record.md#153-shell-level-tests-testsshell_hooksrs)).
@@ -1189,12 +1202,13 @@ and `tests/picker.rs` ([01 section 15.3](01-record.md#153-shell-level-tests-test
 | E-B-13 | Command text contains control or escape characters | - | `path_display::printable` in rows and preview | - | None |
 | E-B-14 | Query contains characters invalid for the matcher (any Unicode) | - | Passed through; the filter keeps or drops the command (section 6.3) | - | None |
 | E-B-15 | The picker binary fails or is killed under the widget | Non-zero exit / empty stdout | zsh, fish: buffer untouched, prompt repainted. bash: `\|\| return` leaves `READLINE_LINE` untouched. The terminal itself is given back by the picker (E-B-20, E-B-21), except on SIGKILL, which nothing can catch | - | None |
-| E-B-20 | The UI thread panics | Panic hook (UI thread only) | The hook restores the terminal (`leave_tui`'s sequence, raw mode off), then the default hook prints the message; unwinding drops `PickerTerminal`, which does nothing more | Exit 101, nothing on stdout; widget as E-B-15 | The panic message on stderr |
-| E-B-21 | SIGTERM, SIGHUP or SIGINT while the picker runs | `TerminationSignals` | `CmdEvent::Terminate`: the loop ends, the terminal is restored, nothing is printed, the process dies of the same signal | A second signal kills at once (the default action) | `log::info!` with the signal number |
 | E-B-16 | `psychic` not on PATH under the widget | zsh, bash: shell error "command not found" on the terminal. fish: `command -q` fails | Buffer untouched; fish prints nothing | - | None |
 | E-B-17 | Recording is off and nothing is recorded | `total_commands == 0 && !recording_on` | The two-line hint of section 8.3 | Esc/Enter exit 0 | None |
 | E-B-18 | `tty_input::spawn` fails | `Err` | As E-B-02 | - | stderr via `main` |
 | E-B-19 | The UI thread's `CmdStore::open` fails (section 4 step 6) | `Err` | `CmdEvents` is built with `store = None` | No impressions or picks are logged this session; the picker works | `log::error!` |
+| E-B-20 | The UI thread panics | Panic hook (UI thread only) | The hook restores the terminal (`leave_tui`'s sequence, raw mode off), then the default hook prints the message; unwinding drops `PickerTerminal`, which does nothing more | Exit 101, nothing on stdout; widget as E-B-15 | The panic message on stderr |
+| E-B-21 | SIGTERM, SIGHUP or SIGINT while the picker runs | `TerminationSignals` | `CmdEvent::Terminate`: the loop ends, the terminal is restored, nothing is printed, the process dies of the same signal | A second signal kills at once (the default action) | `log::info!` with the signal number |
+| E-B-22 | Exit (Esc, Enter, a signal) while the worker is still inside a `Delete` (its transaction, or waiting for another process's write lock) | `deleted_any` at section 4 step 8 | Pick printed first; then wait up to `CMD_EXIT_DELETE_WAIT_MS` for the worker to stop, so the delete commits before the process exits | Still busy after the wait: the process exits, the delete is rolled back and the command stays (the user deletes it again) | `log::warn!` (no text); `TIMING` `cmd_exit_delete_wait` |
 
 ## 16. References
 

@@ -2891,7 +2891,10 @@ zeroed. Deleting one command in the picker leaves a tombstone so a later import
 does not restore it, then checkpoints and truncates the write-ahead log without
 waiting, so its text is in neither `events.db` nor `events.db-wal`; if another
 process is in the log at that moment, the picker tries again at exit, and
-otherwise the next checkpoint clears it. Shell history files are never edited.
+otherwise the next checkpoint clears it. The worker runs the delete; at exit
+the picker prints the pick first, then waits up to 1 s (`CMD_EXIT_DELETE_WAIT_MS`)
+for the worker to finish when a delete was sent, so Esc right after `y` does
+not roll the delete back. Shell history files are never edited.
 
 **Import** (`--import`, and the first `--enable` unless `--no-import`):
 Atuin's `history.db` first (opened read-only; true cwd, exit codes and

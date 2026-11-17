@@ -768,7 +768,8 @@ checkpointing (a `track-command` mid-flight, a second picker loading, an
 but its text can stay in `events.db-wal`, and in the pages of `events.db` the
 log has not yet been copied over (E-R-25). It is then cleared by the first of:
 the same picker's exit (D6 again on the UI thread's connection, after the pick
-is printed, when anything was deleted in that session; still busy is logged),
+is printed and the worker has finished its deletes, [02 section 4](02-browse.md#4-picker-invocation)
+step 8, when anything was deleted in that session; still busy is logged),
 the next delete, the last connection to the database closing (SQLite
 checkpoints and deletes the log then), `track-command`'s W1 once the log
 passes `CMD_WAL_TRUNCATE_BYTES`, or `--purge`. Nothing tells the user in the

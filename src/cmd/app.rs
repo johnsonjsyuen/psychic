@@ -14,7 +14,7 @@ use super::render;
 use super::store::CmdStore;
 use super::terminal::{self, PickerTerminal, TerminationSignals, Tui};
 use super::train::{self, CmdModelStats};
-use super::tuning::{CMD_PAGE_PREFETCH, CMD_TICK_MS};
+use super::tuning::{CMD_EXIT_DELETE_WAIT_MS, CMD_PAGE_PREFETCH, CMD_TICK_MS};
 use super::worker::{self, CmdDetails, CmdRequest, CmdResponse, CmdRow, Scope};
 use super::{cli, privacy, repo};
 use anyhow::Result;
@@ -100,8 +100,9 @@ pub(super) struct CmdApp {
     pub rows_requested_to: usize,
     /// Command awaiting the one-key confirmation of a delete.
     pub confirm_delete: Option<i64>,
-    /// A `Delete` was sent this session: at exit the write-ahead log is
-    /// emptied once more, in case the worker's own try found it busy.
+    /// A `Delete` was sent this session: at exit the picker waits (bounded)
+    /// for the worker to finish it, then empties the write-ahead log once
+    /// more, in case the worker's own try found it busy.
     pub deleted_any: bool,
     pub help_visible: bool,
     pub debug_visible: bool,
@@ -496,6 +497,40 @@ fn stop_worker(worker_tx: &Sender<CmdRequest>, handle: JoinHandle<()>) -> bool {
     }
 }
 
+/// At exit, once the terminal is given back and the pick printed: ask the
+/// worker to stop. If a `Delete` was sent this session (`deleted_any`), wait
+/// up to [`CMD_EXIT_DELETE_WAIT_MS`] for the worker to stop: it handles its
+/// requests in order, so once stopped it has finished every delete, and a
+/// delete it is still inside would otherwise be rolled back when the process
+/// exits. Without a delete it is joined only if already finished: nothing it
+/// still does (a load, a query) must hold up the shell.
+fn stop_worker_at_exit(worker_tx: &Sender<CmdRequest>, handle: JoinHandle<()>, deleted_any: bool) {
+    let _ = worker_tx.send(CmdRequest::Shutdown);
+    if deleted_any {
+        let started = Instant::now();
+        let limit = Duration::from_millis(CMD_EXIT_DELETE_WAIT_MS);
+        while !handle.is_finished() && started.elapsed() < limit {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        log::info!(
+            "TIMING {{\"op\":\"cmd_exit_delete_wait\",\"ms\":{:.3}}}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    if !handle.is_finished() {
+        if deleted_any {
+            log::warn!(
+                "the history worker was still busy {} ms after exit; a delete may not have finished",
+                CMD_EXIT_DELETE_WAIT_MS
+            );
+        }
+        return;
+    }
+    if handle.join().is_err() {
+        log::error!("the history worker panicked");
+    }
+}
+
 /// `psychic history` with no action flag: the picker.
 pub(super) fn run(data_dir: &Path, args: &cli::HistoryArgs) -> Result<()> {
     // 1. Inputs, resolved once.
@@ -592,14 +627,15 @@ pub(super) fn run(data_dir: &Path, args: &cli::HistoryArgs) -> Result<()> {
     let result = event_loop(&mut terminal, &mut app, &event_rx, &worker_handle, data_dir);
 
     // 8. Give the terminal back and print first: the worker may be busy
-    // (a load, a delete waiting on a lock) and the shell waits for nothing
-    // it does. Then ask it to stop; it is joined only if already done, as
-    // the process is about to exit anyway.
+    // (a load, a delete waiting on a lock) and neither the terminal nor the
+    // pick waits for it. Then stop it, waiting a bounded time only for a
+    // delete (`stop_worker_at_exit`).
     input.shutdown();
     terminal.leave()?;
     let printed = match result {
         Ok(Ended::Signal(signal)) => {
             log::info!("the picker got signal {}; nothing is printed", signal);
+            stop_worker_at_exit(&worker_tx, worker_handle, app.deleted_any);
             terminal::die_of(signal);
         }
         Ok(Ended::Pick(Some(text))) => {
@@ -612,10 +648,7 @@ pub(super) fn run(data_dir: &Path, args: &cli::HistoryArgs) -> Result<()> {
         Ok(Ended::Pick(None)) => Ok(()),
         Err(error) => Err(error),
     };
-    let _ = worker_tx.send(CmdRequest::Shutdown);
-    if worker_handle.is_finished() && worker_handle.join().is_err() {
-        log::error!("the history worker panicked");
-    }
+    stop_worker_at_exit(&worker_tx, worker_handle, app.deleted_any);
     if app.deleted_any {
         app.events.truncate_log();
     }

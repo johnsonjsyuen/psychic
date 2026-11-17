@@ -209,6 +209,83 @@ fn it_b_12_enter_prints_the_pick_at_once_while_another_process_holds_the_write_l
     );
 }
 
+#[test]
+fn it_b_15_escape_right_after_a_delete_still_deletes() {
+    let scratch = Scratch::empty("picker", "delete-then-esc");
+    seed(&scratch, "echo keep-me", 100, "/w");
+    seed(&scratch, "echo delete-me", 50, "/w");
+    let mut pty = start_picker(&scratch, &[]);
+    settle(&pty, "the picker");
+
+    // Another process holds the write lock, so the worker's delete waits in
+    // it (busy_timeout, 5 s) while Esc is pressed: what a slow delete
+    // transaction does, made certain.
+    let other = rusqlite::Connection::open(scratch.db()).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    pty.write(b"\x1b[3~").unwrap(); // Delete: the newest row, "echo delete-me"
+    settle(&pty, "the delete question");
+    pty.write(b"y").unwrap();
+    settle(&pty, "the confirmed delete");
+    pty.write(ESC).unwrap();
+    std::thread::sleep(HOLD);
+    other.execute_batch("ROLLBACK").unwrap();
+    drop(other);
+
+    let status = pty
+        .wait(Duration::from_secs(10))
+        .unwrap_or_else(|| panic!("the picker did not exit:\n{}", pty.output()));
+    assert!(status.success(), "{}", pty.output());
+    assert_eq!(std::fs::read_to_string(scratch.path("out")).unwrap(), "");
+    assert_eq!(
+        query(&scratch.db(), "SELECT text FROM commands ORDER BY id"),
+        ["echo keep-me"],
+        "the delete finished before the picker exited"
+    );
+    assert_eq!(
+        query(&scratch.db(), "SELECT COUNT(*) FROM deleted_commands"),
+        ["1"]
+    );
+}
+
+#[test]
+fn it_b_15_the_wait_for_a_delete_at_exit_is_bounded() {
+    let scratch = Scratch::empty("picker", "delete-bounded");
+    seed(&scratch, "echo keep-me", 100, "/w");
+    seed(&scratch, "echo delete-me", 50, "/w");
+    let mut pty = start_picker(&scratch, &[]);
+    settle(&pty, "the picker");
+
+    // The lock is held for longer than the picker waits at exit.
+    let other = rusqlite::Connection::open(scratch.db()).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    pty.write(b"\x1b[3~").unwrap();
+    settle(&pty, "the delete question");
+    pty.write(b"y").unwrap();
+    settle(&pty, "the confirmed delete");
+    let pressed = std::time::Instant::now();
+    pty.write(ESC).unwrap();
+    let status = pty
+        .wait(Duration::from_secs(4))
+        .unwrap_or_else(|| panic!("the picker did not exit:\n{}", pty.output()));
+    let took = pressed.elapsed();
+    other.execute_batch("ROLLBACK").unwrap();
+
+    assert!(status.success(), "{}", pty.output());
+    // CMD_EXIT_DELETE_WAIT_MS (1 s), then the exit; well short of the
+    // worker's own busy_timeout (5 s).
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_millis(2500),
+        "Esc to exit took {took:?}"
+    );
+    let log = std::fs::read_to_string(scratch.path("data/app.log")).unwrap();
+    assert!(log.contains("a delete may not have finished"), "{log}");
+}
+
+/// How long [`it_b_15_escape_right_after_a_delete_still_deletes`] holds the
+/// lock after Esc: well inside the picker's exit wait for a delete
+/// (`CMD_EXIT_DELETE_WAIT_MS`, 1 s).
+const HOLD: Duration = Duration::from_millis(300);
+
 /// What `input::leave_tui` writes, in its order: keyboard flags popped,
 /// mouse capture off (its last sequence), main screen, cursor shown.
 const RESTORE: [&str; 4] = ["\x1b[<1u", "\x1b[?1000l", "\x1b[?1049l", "\x1b[?25h"];
