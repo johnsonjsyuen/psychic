@@ -85,6 +85,15 @@ pub enum BenchCommand {
     Latency {
         #[arg(long, default_value_t = 300)]
         keystrokes: usize,
+        /// Sleep this long before each recorded key, as a typist pauses
+        #[arg(long, default_value_t = 0)]
+        pause_ms: u64,
+        /// Rank as of this Unix second instead of now (to compare two builds)
+        #[arg(long)]
+        now: Option<i64>,
+        /// Write digests of each key's candidates and ranking here (no text)
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
 }
 
@@ -189,8 +198,24 @@ pub(super) fn run(
             }
         }
         BenchCommand::Twostage { queries } => perf::twostage(data_dir, queries, out)?,
-        BenchCommand::Latency { keystrokes } => {
-            perf::latency(data_dir, keystrokes, env.home.as_deref(), env.now, out)?
+        BenchCommand::Latency {
+            keystrokes,
+            pause_ms,
+            now,
+            dump,
+        } => {
+            let options = perf::LatencyOptions {
+                keystrokes,
+                pause: std::time::Duration::from_millis(pause_ms),
+                dump,
+            };
+            perf::latency(
+                data_dir,
+                &options,
+                env.home.as_deref(),
+                now.unwrap_or(env.now),
+                out,
+            )?
         }
     }
     Ok(())

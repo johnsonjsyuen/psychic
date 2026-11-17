@@ -6,7 +6,9 @@
 
 use super::super::index::{CommandIndex, LoadParams};
 use super::super::model::CmdModel;
-use super::super::rank::{CommandCandidate, CommandScore, Stage2, rank_commands, rank_with};
+use super::super::rank::{
+    CommandCandidate, CommandRanking, CommandScore, Stage2, rank_commands, rank_with,
+};
 use super::super::repo;
 use super::super::store::CmdStore;
 use super::super::train::{ReplayInput, replay};
@@ -15,9 +17,10 @@ use super::super::worker::{Scope, filter_candidates, narrowing_applies};
 use anyhow::{Context, Result, bail};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use serde::Deserialize;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
-use std::path::Path;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// B8 (00-blueprint.md section 2): mean top-10 overlap and top-1 agreement.
 const B8_OVERLAP: f64 = 0.98;
@@ -242,13 +245,66 @@ struct KeyTimes {
     query_len: usize,
 }
 
+/// How `latency` runs.
+pub(super) struct LatencyOptions {
+    /// Keys recorded, after one unrecorded cycle.
+    pub keystrokes: usize,
+    /// Slept before each recorded key, as a typist pauses.
+    pub pause: Duration,
+    /// Where to write one line per recorded key with digests of its
+    /// candidates and ranking (ids and scores, never text), to compare two
+    /// builds; `None` = no dump.
+    pub dump: Option<PathBuf>,
+}
+
+/// One dump line: the key's number, query length, matches, a digest of the
+/// candidates (idx, fuzzy score) in order, how many rows are sorted, and a
+/// digest of every score in ranking order.
+fn dump_line(
+    key: usize,
+    query_len: usize,
+    candidates: &[CommandCandidate],
+    ranking: &CommandRanking,
+) -> String {
+    let mut matched = DefaultHasher::new();
+    for c in candidates {
+        (c.idx, c.fuzzy_score).hash(&mut matched);
+    }
+    let mut ranked = DefaultHasher::new();
+    for s in &ranking.scores {
+        (
+            s.idx,
+            s.score.to_bits(),
+            s.heuristic.to_bits(),
+            s.ml_score.map(f64::to_bits),
+            s.fuzzy_score,
+        )
+            .hash(&mut ranked);
+    }
+    format!(
+        "{key}\t{query_len}\t{}\t{:016x}\t{}\t{:016x}",
+        candidates.len(),
+        matched.finish(),
+        ranking.sorted,
+        ranked.finish()
+    )
+}
+
 pub(super) fn latency(
     data_dir: &Path,
-    keystrokes: usize,
+    options: &LatencyOptions,
     home: Option<&Path>,
     now: i64,
     out: &mut dyn Write,
 ) -> Result<()> {
+    let (keystrokes, pause) = (options.keystrokes, options.pause);
+    let mut dump = match &options.dump {
+        Some(path) => Some(std::io::BufWriter::new(
+            std::fs::File::create(path)
+                .with_context(|| format!("could not create {}", path.display()))?,
+        )),
+        None => None,
+    };
     let context_path = data_dir.join("bench-context.json");
     let Ok(context) = std::fs::read_to_string(&context_path) else {
         bail!("run ./bench/history.py setup first");
@@ -281,6 +337,9 @@ pub(super) fn latency(
     let mut times = Vec::with_capacity(keystrokes);
     for i in 0..KEY_CYCLE.len() + keystrokes {
         apply_key(&mut query, KEY_CYCLE[i % KEY_CYCLE.len()]);
+        if i >= KEY_CYCLE.len() && !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
         let started = Instant::now();
         // The worker's narrowing rule; nothing earlier is reused.
         let base: Option<Vec<u32>> =
@@ -299,6 +358,10 @@ pub(super) fn latency(
         );
         let total = started.elapsed().as_secs_f64() * 1000.0;
         let t = ranking.timings;
+        if let Some(dump) = dump.as_mut() {
+            let line = dump_line(i, query.chars().count(), &candidates, &ranking);
+            writeln!(dump, "{line}")?;
+        }
         if i >= KEY_CYCLE.len() {
             times.push(KeyTimes {
                 filter,
@@ -329,9 +392,10 @@ pub(super) fn latency(
     )?;
     writeln!(
         out,
-        "keystrokes: {} after a {}-key warm-up; filter + rank on this thread, head {CMD_PAGE_ROWS}",
+        "keystrokes: {} after a {}-key warm-up, {} ms pause before each; filter + rank on this thread, head {CMD_PAGE_ROWS}",
         times.len(),
-        KEY_CYCLE.len()
+        KEY_CYCLE.len(),
+        pause.as_millis()
     )?;
     writeln!(out, "stage (ms)          mean      p50      p95      max")?;
     let column =
@@ -370,16 +434,22 @@ pub(super) fn latency(
             continue;
         }
         let total = column(|k| k.total, &of);
+        let filter = column(|k| k.filter, &of);
         let matched: Vec<f64> = of.iter().map(|k| k.matched as f64).collect();
         writeln!(
             out,
-            "len {len}: n {:3}  total p50 {:7.3} p95 {:7.3}  matched p50 {:6.0}  stage2 {}",
+            "len {len}: n {:3}  total p50 {:7.3} p95 {:7.3}  filter p50 {:7.3} p95 {:7.3}  matched p50 {:6.0}  stage2 {}",
             of.len(),
             percentile(&total, 0.5),
             percentile(&total, 0.95),
+            percentile(&filter, 0.5),
+            percentile(&filter, 0.95),
             percentile(&matched, 0.5),
             of[0].stage2
         )?;
+    }
+    if let Some(mut dump) = dump {
+        dump.flush()?;
     }
     Ok(())
 }

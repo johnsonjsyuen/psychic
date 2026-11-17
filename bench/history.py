@@ -42,7 +42,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from harness import COLS, REPO, ROWS, Version, drain_for, read_until_quiet, spawn  # noqa: E402
 
-BINARY = REPO / "target/release/psychic"
+# PSYCHIC_BENCH_BINARY measures another build (a copy of an earlier one, to
+# compare two commits interleaved on the same perf DB); it is not checked
+# against the sources.
+BINARY_OVERRIDE = os.environ.get("PSYCHIC_BENCH_BINARY")
+BINARY = Path(BINARY_OVERRIDE) if BINARY_OVERRIDE else REPO / "target/release/psychic"
 
 # 00-blueprint.md section 2 is the definition of every target; these are copies.
 TARGETS = {
@@ -114,6 +118,8 @@ def check_binary():
     """E-N-14: a binary older than the newest Rust source measures old code."""
     if not BINARY.exists():
         fail(f"{BINARY} does not exist: run just build")
+    if BINARY_OVERRIDE:
+        return
     newest = max(p.stat().st_mtime for p in (REPO / "src").rglob("*.rs"))
     if BINARY.stat().st_mtime < newest:
         fail("binary older than sources: run just build")
@@ -395,6 +401,8 @@ def keystroke(b, n, pause=0.0):
     line("worker per keystroke (B1)", total)
     line("  of those not reused", [q["total_ms"] for q in fresh])
     line("  first letter (full scan)", first_letter)
+    line("  first letter, reused or not", [q["total_ms"] for q in queries
+                                           if q["query_len"] == 1 and not q["narrowed"]])
     stages = {}
     for key in ("filter_ms", "heuristic_ms", "features_ms", "predict_ms", "blend_ms"):
         values = [q[key] for q in fresh if q[key] is not None]
@@ -488,10 +496,11 @@ def twostage(b):
     return {"B8": {**values, "verdict": "PASS" if ok else "FAIL"}}
 
 
-def latency(b, n):
+def latency(b, n, pause=0.0):
     """6.6: filter + rank without a terminal (an iteration aid, not a bar)."""
     b.pin_model()
-    print(b.psychic("internal", "bench-history", "latency", "--keystrokes", str(n)).stdout.strip())
+    print(b.psychic("internal", "bench-history", "latency", "--keystrokes", str(n),
+                    "--pause-ms", str(round(pause * 1000))).stdout.strip())
     print(f"load {load_average()}")
 
 
@@ -554,6 +563,8 @@ def main():
         parsers[name].add_argument("n", nargs="?", type=int, default=default)
     parsers["keystroke"].add_argument("--pause", type=float, default=0.0,
                                       help="seconds to wait before each key (impressions are due after 0.2 s)")
+    parsers["latency"].add_argument("--pause", type=float, default=0.0,
+                                    help="seconds to sleep before each recorded key (threads and clocks go idle)")
     for name in ("size", "twostage", "all"):
         sub.add_parser(name)
     args = parser.parse_args()
@@ -579,7 +590,7 @@ def main():
     elif args.mode == "twostage":
         twostage(b)
     elif args.mode == "latency":
-        latency(b, args.n)
+        latency(b, args.n, args.pause)
     elif args.mode == "all":
         run_all(b)
 

@@ -558,6 +558,7 @@ verdict is the worse of the two runs.
 | **worker time per keystroke (B1)** | `total_ms` of every `cmd_query` TIMING line of this run except the first (the Backspaces are answered by the worker's reuse rules, [02 section 6.3](02-browse.md#63-filter), as a user's are; `reused` says which) |
 | worker per keystroke, not reused | the lines with `reused: false` (each did a filter and a ranking) |
 | first letter | the lines with `reused: false`, `narrowed: false` and `query_len` 1: a scan of every command |
+| first letter, reused or not | the lines with `narrowed: false` and `query_len` 1 (a seeded letter, 02 section 6.3, is a reuse) |
 | filter / heuristic / features / predict / blend (p50, p95) | the lines with `reused: false` |
 | matched, stage2 (p50, max) | the same lines |
 
@@ -589,14 +590,24 @@ share of lookups with `matched > CMD_STAGE2_K`, and PASS/FAIL against B8.
 
 ### 6.6 `latency` (iteration aid, no terminal)
 
-`bench-history latency --keystrokes 300`: `CommandIndex::load` for the context
+`bench-history latency --keystrokes 300 [--pause-ms 0] [--now SECS] [--dump FILE]`: `CommandIndex::load` for the context
 in `--data-dir/bench-context.json` (written by 6.1; missing file ->
 `bail!("run ./bench/history.py setup first")`), the model, then the key cycle of 6.3 driven straight through
 `filter_candidates` (with the worker's narrowing rule; it reuses nothing, so it measures every key; its "total" is filter plus ranking, without the building of the result rows the worker's `total_ms` also counts) and `rank_commands` (`head = CMD_PAGE_ROWS`, as the worker) on the calling thread, after one unrecorded cycle that warms the thread pool; prints the mean, p50, p95 and max of the
 total and of each stage (filter, heuristic, features, predict, blend, and
 `sort`: `CmdRankTimings.sort_ms`, the selection and sort inside the heuristic
-and blend stages), and per query length. Not a pass bar: B1 is judged from
-6.3. `history.py latency [N]` runs it on the perf DB with the pinned model.
+and blend stages), and per query length (total and filter). Not a pass bar: B1 is judged from
+6.3. `--pause-ms` sleeps that long before each recorded key, as a typist
+pauses: the cores clock down and the caches go cold, as in the picker (every
+stage takes about twice as long after 170 ms, on one thread as on the pool).
+`--now` ranks as of a fixed second; `--dump` writes, per recorded key, the
+query length, the match count, a digest of the candidates (idx, fuzzy score)
+in order, the sorted-row count and a digest of every score in ranking order
+(ids and numbers only): two builds rank identically when their dumps are
+byte-equal. `history.py latency [N] [--pause S]` runs it on the perf DB with
+the pinned model. `PSYCHIC_BENCH_BINARY=<path>` makes `history.py` measure
+another build (a saved copy of an earlier commit) on the same perf DB, to
+compare two builds interleaved.
 
 ### 6.7 `train`, `size`, `all`
 
