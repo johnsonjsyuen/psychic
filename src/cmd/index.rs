@@ -10,12 +10,14 @@
 //! Positions in `entries` are called `idx` (`u32`) everywhere; database ids
 //! are `db_id` (`i64`). No accessor touches the database or allocates.
 
+use super::fuzzy;
 use super::store::{CmdStore, CountRow, CwdRunsRow, FollowerRow, IdRange, PickRow, RecentRunRow};
 use super::template;
 use super::tuning::{CMD_EVENT_WINDOW_SECS, CMD_LOAD_READERS};
 use anyhow::Result;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Strings (directories, repository roots, templates) as small ids.
 #[derive(Default)]
@@ -58,6 +60,9 @@ pub(super) struct CommandEntry {
     pub chars: u32,
     /// `template::word_count(text)`.
     pub words: u32,
+    /// `fuzzy::text_classes(text)`: which bytes the text holds, for the
+    /// filter's prefilter.
+    pub classes: u64,
     pub last_run_at: i64,
     pub run_count: u32,
     pub success_count: u32,
@@ -81,6 +86,7 @@ impl CommandEntry {
             text_lower: text.to_lowercase().into_boxed_str(),
             chars: text.chars().count() as u32,
             words: template::word_count(text) as u32,
+            classes: fuzzy::text_classes(text),
             last_run_at: 0,
             run_count: 0,
             success_count: 0,
@@ -117,20 +123,16 @@ fn split_ids(ids: IdRange, parts: usize) -> Vec<IdRange> {
 
 /// R1 over `range`, as entries.
 fn read_entries(store: &CmdStore, range: IdRange) -> Result<Vec<CommandEntry>> {
-    Ok(store
-        .load_commands_in(range)?
-        .into_iter()
-        .map(|row| {
-            let mut entry = CommandEntry::new(row.id, &row.text);
-            entry.last_run_at = row.last_run_at;
-            entry.run_count = row.run_count;
-            entry.success_count = row.success_count;
-            entry.fail_count = row.fail_count;
-            entry.pick_count = row.pick_count;
-            entry.last_exit_code = row.last_exit_code;
-            entry
-        })
-        .collect())
+    store.load_commands_in(range, |row| {
+        let mut entry = CommandEntry::new(row.id, row.text);
+        entry.last_run_at = row.last_run_at;
+        entry.run_count = row.run_count;
+        entry.success_count = row.success_count;
+        entry.fail_count = row.fail_count;
+        entry.pick_count = row.pick_count;
+        entry.last_exit_code = row.last_exit_code;
+        entry
+    })
 }
 
 /// What R2-R8 return, read before the index exists.
@@ -189,6 +191,9 @@ type PickTimes = FxHashMap<u32, Vec<i64>>;
 pub(super) struct CommandIndex {
     /// Position = idx.
     pub entries: Vec<CommandEntry>,
+    /// Position = idx: the entry's `classes`, plus `fuzzy::LIVE` while it is
+    /// not deleted. The filter's first test reads only this array.
+    filter_classes: Vec<u64>,
     by_db_id: FxHashMap<i64, u32>,
     pub dirs: Interner,
     pub repos: Interner,
@@ -225,6 +230,10 @@ pub(super) struct LoadParams {
     pub shell_session: Option<String>,
 }
 
+fn ms_since(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
 /// Insert `at` keeping `times` ascending.
 fn insert_sorted(times: &mut Vec<i64>, at: i64) {
     let position = times.partition_point(|&t| t <= at);
@@ -254,6 +263,7 @@ impl CommandIndex {
         let idx = u32::try_from(self.entries.len()).expect("fewer than 2^32 commands");
         let previous = self.by_db_id.insert(entry.db_id, idx);
         assert!(previous.is_none(), "command {} added twice", entry.db_id);
+        self.filter_classes.push(entry.classes | fuzzy::LIVE);
         self.entries.push(entry);
         idx
     }
@@ -339,6 +349,7 @@ impl CommandIndex {
     /// Hide `idx` from every later filter.
     pub(super) fn remove(&mut self, idx: u32) {
         self.entries[idx as usize].deleted = true;
+        self.filter_classes[idx as usize] &= !fuzzy::LIVE;
     }
 
     // --- Load (picker start) ---------------------------------------------------
@@ -352,18 +363,24 @@ impl CommandIndex {
     pub(super) fn load(store: &CmdStore, p: &LoadParams) -> Result<(CommandIndex, RankContext)> {
         let file = store.file();
         let readers = if file.is_some() { CMD_LOAD_READERS } else { 1 };
+        let started = Instant::now();
         let ranges = match store.command_ids()? {
             Some(ids) => split_ids(ids, readers),
             None => Vec::new(),
         };
-        let (parts, context) = std::thread::scope(|scope| {
+        let (parts, context, context_ms) = std::thread::scope(|scope| {
             let file = file.as_deref();
             let open = move || -> Result<CmdStore> {
                 let side = CmdStore::open_file(file.expect("only with a file"))?;
                 side.map_for_reading()?;
                 Ok(side)
             };
-            let context = file.map(|_| scope.spawn(move || ContextRows::read(&open()?, p)));
+            let context = file.map(|_| {
+                scope.spawn(move || {
+                    let rows = ContextRows::read(&open()?, p);
+                    Ok::<_, anyhow::Error>((rows?, ms_since(started)))
+                })
+            });
             let others: Vec<_> = ranges
                 .iter()
                 .skip(1)
@@ -378,12 +395,16 @@ impl CommandIndex {
                     .into_iter()
                     .map(|reader| reader.join().expect("a reader does not panic")),
             );
-            let context = match context {
-                Some(reader) => reader.join().expect("a reader does not panic"),
-                None => ContextRows::read(store, p),
+            let (context, context_ms) = match context {
+                Some(reader) => match reader.join().expect("a reader does not panic") {
+                    Ok((rows, at)) => (Ok(rows), at),
+                    Err(error) => (Err(error), ms_since(started)),
+                },
+                None => (ContextRows::read(store, p), ms_since(started)),
             };
-            (parts, context)
+            (parts, context, context_ms)
         });
+        let read_ms = ms_since(started);
 
         let mut index = CommandIndex::default();
         let total = parts
@@ -391,13 +412,24 @@ impl CommandIndex {
             .map(|part| part.as_ref().map_or(0, Vec::len))
             .sum();
         index.entries.reserve(total);
+        index.filter_classes.reserve(total);
         index.by_db_id.reserve(total);
         for part in parts {
             for entry in part? {
                 index.push_entry(entry);
             }
         }
+        let pushed_ms = ms_since(started);
         let ctx = index.apply(context?, p);
+        // Each stage ends this many ms after the load started; numbers only.
+        log::info!(
+            "TIMING {{\"op\":\"cmd_index_stages\",\"readers\":{},\"context_ms\":{:.3},\"read_ms\":{:.3},\"pushed_ms\":{:.3},\"applied_ms\":{:.3}}}",
+            readers,
+            context_ms,
+            read_ms,
+            pushed_ms,
+            ms_since(started)
+        );
         Ok((index, ctx))
     }
 
@@ -464,6 +496,17 @@ impl CommandIndex {
     }
 
     // --- Accessors (the only readers) --------------------------------------------
+
+    /// Per idx: the byte classes of the text, with `fuzzy::LIVE` unless
+    /// deleted.
+    pub(super) fn filter_classes(&self) -> &[u64] {
+        debug_assert_eq!(
+            self.filter_classes.len(),
+            self.entries.len(),
+            "entries are added only by push_entry"
+        );
+        &self.filter_classes
+    }
 
     /// The idx of a database id.
     pub(super) fn idx_of(&self, db_id: i64) -> Option<u32> {

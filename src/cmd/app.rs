@@ -647,14 +647,17 @@ fn event_loop(
     loop {
         app.log_impressions_if_due();
         let mut layout = render::CmdLayout { visible_rows: 0 };
+        let draw_started = Instant::now();
         terminal.draw(|f| layout = render::draw(f, app))?;
         app.set_visible_rows(layout.visible_rows);
         if let Some(sent) = results_to_draw.take() {
             // Query sent (on the key) to its results drawn: what the user
-            // waits for after a keystroke (bench/history.py, 04 section 6.3).
+            // waits for after a keystroke (bench/history.py, 04 section 6.3),
+            // and how much of it the draw itself took.
             log::info!(
-                "TIMING {{\"op\":\"cmd_key_to_results\",\"ms\":{:.3}}}",
-                sent.elapsed().as_secs_f64() * 1000.0
+                "TIMING {{\"op\":\"cmd_key_to_results\",\"ms\":{:.3},\"draw_ms\":{:.3}}}",
+                sent.elapsed().as_secs_f64() * 1000.0,
+                draw_started.elapsed().as_secs_f64() * 1000.0
             );
         }
         log_once(&mut first_render, "cmd_first_render");

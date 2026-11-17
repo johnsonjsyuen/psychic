@@ -118,6 +118,7 @@ selection --> println!(command) on stdout, exit 0 --> widget replaces the prompt
 | `index.rs` | `CommandIndex`: in-memory statistics, filled from SQL or by replay | B | [02 section 5](02-browse.md#5-commandindex) |
 | `rank.rs` | `CommandCandidate`, heuristic, `rank_commands`, two-stage, blend | B, C | [02 section 7](02-browse.md#7-heuristic-ranking), [03 section 7](03-learn.md#7-serving-two-stage-rank-and-blend) |
 | `worker.rs` | Worker thread, requests/responses, filter, narrowing, TIMING line | B | [02 section 6](02-browse.md#6-worker) |
+| `fuzzy.rs` | The filter's per-command test: byte-class prefilter, then the one scorer call | B (perf) | [02 section 6.3](02-browse.md#63-filter) |
 | `events.rs` | Impression and pick logging | B | [02 section 10](02-browse.md#10-event-logging) |
 | `keys.rs` | `CmdAction`, `CMD_KEYMAP` | B | [02 section 9](02-browse.md#9-keys) |
 | `app.rs` | UI state, event loop, input handling | B | [02 section 8](02-browse.md#8-ui-thread) |
