@@ -30,8 +30,8 @@ use super::index::{CommandIndex, RankContext};
 use super::rank::{fzf_score, recency_rank};
 use super::store::{CmdStore, CommandRecord, EventRecord, RunRecord, Source};
 use super::tuning::{
-    CMD_HOOK_WEIGHT, CMD_IMPORT_WEIGHT, CMD_PICK_RUN_SECS, CMD_PICK_WEIGHT, CMD_RECENCY_RANK_CAP,
-    CMD_RETRAIN_MIN_INTERVAL_SECS, CMD_STAGE2_K, CMD_TRAIN_FRAGMENT_SHARE,
+    CMD_HOOK_WEIGHT, CMD_IMPORT_WEIGHT, CMD_MODEL_MAX_TREES, CMD_PICK_RUN_SECS, CMD_PICK_WEIGHT,
+    CMD_RECENCY_RANK_CAP, CMD_RETRAIN_MIN_INTERVAL_SECS, CMD_STAGE2_K, CMD_TRAIN_FRAGMENT_SHARE,
     CMD_TRAIN_LOCK_STALE_SECS, CMD_TRAIN_MAX_RUN_GROUPS, CMD_TRAIN_MIN_GROUPS, CMD_TRAIN_QLEN_MIX,
     CMD_TRAIN_RANDOM_NEGATIVES, CMD_TRAIN_RANDOM_TRIES, CMD_TRAIN_RECENT_NEGATIVES,
     CMD_TRAIN_RECENT_SCAN,
@@ -808,13 +808,19 @@ pub(super) fn replay(input: &ReplayInput, until: Option<i64>) -> Replayer {
     replayer
 }
 
-/// The command model's fit: the shared one (`crate::training`). Training
-/// and the relevance benchmark both fit through here.
+/// The command model's fit: the shared one (`crate::training`), at most
+/// `CMD_MODEL_MAX_TREES` trees. Training and the relevance benchmark both
+/// fit through here.
 pub(super) fn fit_command_model(
     set: &crate::training::TrainingSet,
     seed: u64,
 ) -> Result<crate::training::Fitted> {
-    crate::training::fit_seeded(set, &command_feature_specs(), seed as u32)
+    crate::training::fit_capped(
+        set,
+        &command_feature_specs(),
+        seed as u32,
+        CMD_MODEL_MAX_TREES,
+    )
 }
 
 /// The groups of a replay, in time order.

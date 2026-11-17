@@ -338,11 +338,16 @@ fn group_sizes(episodes: &[i64]) -> Vec<i32> {
 struct EarlyStopping {
     /// (best score, 0-based iteration it was reached at), per metric.
     best: Vec<(f64, usize)>,
+    /// Rounds at most: training stops at the last one.
+    max_rounds: usize,
 }
 
 impl EarlyStopping {
-    fn new() -> Self {
-        EarlyStopping { best: Vec::new() }
+    fn with_max_rounds(max_rounds: usize) -> Self {
+        EarlyStopping {
+            best: Vec::new(),
+            max_rounds,
+        }
     }
 
     /// Record iteration `iteration`'s validation scores. Returns the number
@@ -362,7 +367,7 @@ impl EarlyStopping {
             if !first_time && score > best.0 {
                 *best = (score, iteration);
             }
-            if iteration - best.1 >= STOPPING_ROUNDS || iteration == MAX_ROUNDS - 1 {
+            if iteration - best.1 >= STOPPING_ROUNDS || iteration + 1 == self.max_rounds {
                 return Some(best.1 + 1);
             }
         }
@@ -417,6 +422,19 @@ pub fn fit(set: &TrainingSet, features: &[FeatureSpec]) -> Result<Fitted> {
 
 /// [`fit`] with `seed` as every LightGBM seed instead of 42.
 pub fn fit_seeded(set: &TrainingSet, features: &[FeatureSpec], seed: u32) -> Result<Fitted> {
+    fit_capped(set, features, seed, MAX_ROUNDS)
+}
+
+/// [`fit_seeded`] with at most `max_rounds` trees: early stopping still
+/// decides the count below the cap. For a model whose prediction time per
+/// tree counts (the command model, `docs/ctrl-r/03-learn.md` section 6).
+pub fn fit_capped(
+    set: &TrainingSet,
+    features: &[FeatureSpec],
+    seed: u32,
+    max_rounds: usize,
+) -> Result<Fitted> {
+    assert!(max_rounds > 0, "at least one tree");
     assert_eq!(
         set.num_features,
         features.len(),
@@ -447,7 +465,7 @@ pub fn fit_seeded(set: &TrainingSet, features: &[FeatureSpec], seed: u32) -> Res
     };
 
     // The validated fit.
-    let params = lightgbm_params(features, MAX_ROUNDS, seed);
+    let params = lightgbm_params(features, max_rounds, seed);
     let train_part = Part::new(set, &weights, split.train.clone());
     let validation_part = Part::new(set, &weights, split.validation.clone());
     let train_data = dataset(&train_part, split.train.clone(), &params, None)?;
@@ -460,10 +478,10 @@ pub fn fit_seeded(set: &TrainingSet, features: &[FeatureSpec], seed: u32) -> Res
     let mut booster = lgbm::Booster::new(&train_data, &params, set.num_features)?;
     booster.add_valid(&validation_data)?;
 
-    let mut stopping = EarlyStopping::new();
+    let mut stopping = EarlyStopping::with_max_rounds(max_rounds);
     let mut history: Vec<Vec<f64>> = Vec::new();
     let mut best_iteration = None;
-    for iteration in 0..MAX_ROUNDS {
+    for iteration in 0..max_rounds {
         booster.update_one_iter()?;
         let scores = booster.eval(1)?;
         let stop = stopping.observe(iteration, &scores);
@@ -703,7 +721,7 @@ label,episode_id,timestamp,query,b,a
 
     #[test]
     fn test_early_stopping_waits_for_every_metric() {
-        let mut stopping = EarlyStopping::new();
+        let mut stopping = EarlyStopping::with_max_rounds(MAX_ROUNDS);
         // Metric 0 peaks at iteration 2; metric 1 keeps improving until 30.
         let mut stopped = None;
         for i in 0..MAX_ROUNDS {
@@ -720,15 +738,23 @@ label,episode_id,timestamp,query,b,a
 
     #[test]
     fn test_early_stopping_ties_do_not_count_as_improvement() {
-        let mut stopping = EarlyStopping::new();
+        let mut stopping = EarlyStopping::with_max_rounds(MAX_ROUNDS);
         let stopped = (0..MAX_ROUNDS).find_map(|i| stopping.observe(i, &[0.5]));
         assert_eq!(stopped, Some(1));
     }
 
     #[test]
     fn test_early_stopping_at_the_last_round() {
-        let mut stopping = EarlyStopping::new();
+        let mut stopping = EarlyStopping::with_max_rounds(MAX_ROUNDS);
         let stopped = (0..MAX_ROUNDS).find_map(|i| stopping.observe(i, &[i as f64]));
         assert_eq!(stopped, Some(MAX_ROUNDS));
+        // A cap ends it there, keeping the best round below it.
+        let mut capped = EarlyStopping::with_max_rounds(120);
+        let stopped = (0..MAX_ROUNDS).find_map(|i| capped.observe(i, &[i as f64]));
+        assert_eq!(stopped, Some(120));
+        let mut capped = EarlyStopping::with_max_rounds(120);
+        let peak = |i: usize| if i <= 90 { i as f64 } else { 90.0 };
+        let stopped = (0..MAX_ROUNDS).find_map(|i| capped.observe(i, &[peak(i)]));
+        assert_eq!(stopped, Some(91));
     }
 }

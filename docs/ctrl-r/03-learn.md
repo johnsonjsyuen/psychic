@@ -61,6 +61,7 @@ Appended to `src/cmd/tuning.rs`. All are tuning candidates
 | Constant | Type | Value | Meaning |
 |---|---|---|---|
 | `CMD_STAGE2_K` | `usize` | `2000` | Rows, taken from the top of the heuristic order, that the model scores |
+| `CMD_MODEL_MAX_TREES` | `usize` | `100` | Trees of the command model at most (`fit_capped`, section 6.1); early stopping decides the count below it. Prediction walks every tree for every stage-2 row on every keystroke: a model that stopped at 200 trees doubled the predict stage. Set 2026-11-17 (results.md): the round count early stopping picks varies 20-200 with the seed at the same relevance, and a cap of 100 changed model top-1 by under 0.002 on every headline cell (60 cost 0.003-0.005) |
 | `CMD_BLEND_SCALE` | `f64` | `10.0` | `blend_examples` are divided by this before the file blend formula; crossover at 300, saturation near 600 |
 | `CMD_PICK_WEIGHT` | `f64` | `4.0` | Sample weight of every row of a Ctrl-R pick group |
 | `CMD_HOOK_WEIGHT` | `f64` | `1.0` | Sample weight of rows of a group built from a hook-recorded run |
@@ -81,8 +82,9 @@ Appended to `src/cmd/tuning.rs`. All are tuning candidates
 | `CMD_PICK_RUN_SECS` | `i64` | `300` | A run this soon after a Ctrl-R pick of the same command in the same shell session is that pick being executed; it gets no group of its own |
 | `CMD_TRAIN_LOCK_STALE_SECS` | `u64` | `900` | A lock file older than this is taken over |
 
-Unchanged from file training because the same function fits both models:
-half-life 180 days, `MAX_ROUNDS` 1000, `STOPPING_ROUNDS` 50
+Unchanged from file training because the same function fits both models
+(the command model passes only its own round cap, `CMD_MODEL_MAX_TREES`):
+half-life 180 days, `STOPPING_ROUNDS` 50, `MAX_ROUNDS` 1000 for the file model
 ([src/training/mod.rs:30-36](../../src/training/mod.rs)) and every LightGBM
 parameter of `lightgbm_params` ([src/training/mod.rs:177-199](../../src/training/mod.rs)),
 including `lambdarank_truncation_level=30`.
@@ -304,12 +306,12 @@ is the proof and is in "done when").
 | `TrainingSet` ([:68-76](../../src/training/mod.rs)) | Add field `row_weights: Vec<f64>` (one per row). `from_csv` ([:137-149](../../src/training/mod.rs)) fills it with `1.0` per row (`row_weights: vec![1.0; rows.len()]` in the struct literal) |
 | after `from_csv` | Add `pub fn from_parts(num_features: usize, features: Vec<f64>, labels: Vec<f32>, episodes: Vec<i64>, timestamps: Vec<f64>, row_weights: Vec<f64>) -> Self`. Asserts: `features.len() == labels.len() * num_features`; the four per-row vectors have equal length; `episodes.is_sorted()`; every weight is finite and `> 0`; every label is 0.0 or 1.0 |
 | `lightgbm_params` ([:177](../../src/training/mod.rs)) | New third parameter `seed: u32`, passed at both call sites ([:395](../../src/training/mod.rs), [:426](../../src/training/mod.rs)); the four lines `seed=42`, `bagging_seed=42`, `feature_fraction_seed=42`, `data_random_seed=42` ([:192-195](../../src/training/mod.rs)) use it |
-| `fit` ([:369](../../src/training/mod.rs)) | Body moves to `pub fn fit_seeded(set: &TrainingSet, features: &[FeatureSpec], seed: u32) -> Result<Fitted>`; `pub fn fit(set, features)` becomes `fit_seeded(set, features, 42)` |
+| `fit` ([:369](../../src/training/mod.rs)) | Body moves to `pub fn fit_capped(set: &TrainingSet, features: &[FeatureSpec], seed: u32, max_rounds: usize) -> Result<Fitted>` (the validated fit's `num_iterations` and loop bound are `max_rounds`; `EarlyStopping::with_max_rounds` stops at the last of them); `pub fn fit_seeded(set, features, seed)` is `fit_capped(.., MAX_ROUNDS)` and `pub fn fit(set, features)` is `fit_seeded(set, features, 42)`, so the file model is unchanged |
 | in `fit_seeded`, after `let weights = recency_weights(&set.timestamps);` ([:376](../../src/training/mod.rs)) | `let weights: Vec<f64> = weights.iter().zip(&set.row_weights).map(\|(w, r)\| w * r).collect();` (`w * 1.0` is exactly `w`, so the file model's weights are unchanged) |
 | `atomic_write` ([:542](../../src/training/mod.rs)) | `fn` -> `pub(crate) fn` |
 
-`train` ([:490](../../src/training/mod.rs)), `registry_features`, `time_split`,
-`EarlyStopping` and `mod lgbm` are not touched.
+`train` ([:490](../../src/training/mod.rs)), `registry_features`, `time_split`
+and `mod lgbm` are not touched; `EarlyStopping` only gains its round bound.
 
 ### 6.2 `retrain`
 
@@ -324,7 +326,7 @@ pub(super) enum RetrainOutcome { Trained(Box<CmdModelStats>), NotEnoughData { gr
 | 2 | `CmdStore::open`; `counts()` (for step 6); `ReplayInput::read` (the connection is closed once read) |
 | 3 | `build_training_set(&input, &BuildOptions { seed, max_run_groups: CMD_TRAIN_MAX_RUN_GROUPS, until: None })` |
 | 4 | Total groups `< CMD_TRAIN_MIN_GROUPS` -> `NotEnoughData`; no file is written or removed |
-| 5 | `train::fit_command_model(&set, seed)` = `crate::training::fit_seeded(&set, &command_feature_specs(), seed as u32)` (the relevance benchmark fits through it too). An `Err` whose message starts with `every split needs rows` -> `NotEnoughData`; any other `Err` propagates |
+| 5 | `train::fit_command_model(&set, seed)` = `crate::training::fit_capped(&set, &command_feature_specs(), seed as u32, CMD_MODEL_MAX_TREES)` (the relevance benchmark fits through it too). An `Err` whose message starts with `every split needs rows` -> `NotEnoughData`; any other `Err` propagates |
 | 6 | `write_unless_shrunk`: write the model text and `serde_json::to_string_pretty(&stats)` beside their targets as `<name>.<pid>.pending`; unless the history shrank since step 2 (fewer commands or runs in `CmdStore::counts`; E-L-15), rename them into place, `cmd_model.txt` first, then `cmd_model_stats.json` (the write-then-rename of `training::atomic_write`, with the check between); `privacy::tighten_permissions(data_dir)`; check once more |
 | 7 | Report: `quiet == false` -> print to stdout; `quiet == true` -> append to `data_dir/"training.log"` under `\n=== Command model training run at <local time> ===` (format as [src/ranker.rs:880-895](../../src/ranker.rs)). An `Err` from any step is logged (`log::error!`) and, under `quiet`, appended the same way as `Training failed: <error>`, then returned (E-L-03) |
 

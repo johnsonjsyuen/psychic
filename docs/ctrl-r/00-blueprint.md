@@ -144,7 +144,7 @@ selection --> println!(command) on stdout, exit 0 --> widget replaces the prompt
 | `src/import/shell_history.rs` | Visibility of 4 items; extract `command_words` and `cwd_step`; add `replay_cwds` and `parse_bash_entries` | A | [01 section 12.2](01-record.md#122-changes-to-srcimport) |
 | `src/shell_init.rs` | One extra `println!` after the "Done." line | A | [01 section 10.2](01-record.md#102-what-psychic-init-prints) |
 | `shell/psychic.zsh`, `.bash`, `.fish` | Append a recording block (A) and a Ctrl-R widget block (B); bash's `__psychic_hook` returns the status it received (A) | A, B | [01 section 11](01-record.md#11-shell-hooks), [02 section 11](02-browse.md#11-shell-widgets) |
-| `src/training/mod.rs` | `TrainingSet::from_parts`, `row_weights` field, `fit_seeded`, `pub(crate) atomic_write` | C | [03 section 6.1](03-learn.md#61-refactor-of-srctrainingmodrs) |
+| `src/training/mod.rs` | `TrainingSet::from_parts`, `row_weights` field, `fit_seeded`, `fit_capped` (a round cap for the command model; `fit_seeded` is it at `MAX_ROUNDS`), `pub(crate) atomic_write` | C | [03 section 6.1](03-learn.md#61-refactor-of-srctrainingmodrs) |
 | `src/ranker.rs` | `compute_blend_weights` and `logistic` become `pub(crate)` | C | [03 section 7.3](03-learn.md#73-blend) |
 | `docs/how-it-works.md` | A "Shell history search" section, updated in each phase's commit ([llm.md:30-35](../../llm.md)) | A-D | - |
 
