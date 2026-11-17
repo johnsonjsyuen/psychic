@@ -1,18 +1,21 @@
-//! Ranking the commands that matched: the heuristic
+//! Ranking the commands that matched: the cold-start order
 //! (`docs/ctrl-r/02-browse.md` section 7) and, when a model is loaded, the
 //! model stage on top of it (`03-learn.md` section 7).
 //!
-//! Two stages: the heuristic orders every candidate; the model re-scores
-//! only the first `CMD_STAGE2_K` of that order, blends its score with the
-//! heuristic by the file-mode tanh weight, and re-sorts them. Rows past the
-//! cut keep their heuristic order below the model-scored ones.
+//! The cold-start order ("the heuristic") is fzf's Ctrl-R order: fzf's match
+//! score under `--scheme=history` first ([`super::fzf`]), ties newest first,
+//! and newest first for an empty query. Two stages: the heuristic orders
+//! every candidate; the model re-scores only the first `CMD_STAGE2_K` of
+//! that order, blends its score with the heuristic by the file-mode tanh
+//! weight, and re-sorts them. Rows past the cut keep their heuristic order
+//! below the model-scored ones.
 
 use super::features::{COMMAND_FEATURE_REGISTRY, CommandFeatureInputs, compute_all};
+use super::fzf::FzfQuery;
 use super::index::{CommandIndex, RankContext};
 use super::model::CmdModel;
 use super::tuning::{
-    CMD_H_DIR_SATURATION, CMD_H_RECENCY_SCALE_SECS, CMD_H_W_DIR, CMD_H_W_FUZZY, CMD_H_W_RECENCY,
-    CMD_H_W_REPO, CMD_PAR_FILTER_MIN, CMD_STAGE2_K,
+    CMD_H_RECENCY_SCALE_SECS, CMD_PAR_FILTER_MIN, CMD_RECENCY_RANK_CAP, CMD_STAGE2_K,
 };
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -28,14 +31,19 @@ pub(super) struct CommandCandidate {
     pub fuzzy_score: i64,
 }
 
-/// The four terms of the heuristic, each in [0, 1].
+/// What the heuristic orders by.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct HeuristicParts {
+    /// `1 / (1 + age / CMD_H_RECENCY_SCALE_SECS)`, in (0, 1]: decides ties.
     pub recency: f64,
-    pub dir: f64,
-    pub repo: f64,
-    pub fuzzy: f64,
+    /// fzf's score for the query (0 for an empty one); `NO_FZF_MATCH` when
+    /// fzf would not match a command the filter let through.
+    pub fzf: i32,
 }
+
+/// The fzf score of a candidate fzf itself would not match (the filter's
+/// matcher and fzf differ on a few texts, 02 section 7): below every match.
+pub(super) const NO_FZF_MATCH: i32 = -1;
 
 /// One ranked command.
 #[derive(Clone)]
@@ -108,47 +116,55 @@ impl CommandRanking {
     }
 }
 
-/// `(runs here / runs) * min(1, ln(1 + runs here) / ln(1 + saturation))`:
-/// the share of the command's runs made here, damped while there are few.
-fn place_term(runs_here: u32, run_count: u32) -> f64 {
-    if run_count == 0 || runs_here == 0 {
-        return 0.0;
-    }
-    let share = f64::from(runs_here) / f64::from(run_count);
-    let confidence = (f64::from(runs_here).ln_1p() / CMD_H_DIR_SATURATION.ln_1p()).min(1.0);
-    share.min(1.0) * confidence
+/// fzf's score of `text` for `query`, or `NO_FZF_MATCH`.
+pub(super) fn fzf_score(query: &FzfQuery, text: &str) -> i32 {
+    query.score(text).unwrap_or(NO_FZF_MATCH)
 }
 
-/// The heuristic terms of one candidate. `max_fuzzy` is the largest
-/// `fuzzy_score` among the candidates of this ranking; 0 means "no query".
+/// The heuristic terms of one candidate whose fzf score is `fzf`.
 pub(super) fn heuristic(
     index: &CommandIndex,
     ctx: &RankContext,
-    c: &CommandCandidate,
-    max_fuzzy: i64,
+    idx: u32,
+    fzf: i32,
 ) -> HeuristicParts {
-    let entry = &index.entries[c.idx as usize];
+    let entry = &index.entries[idx as usize];
     let age = (ctx.now - entry.last_run_at).max(0) as f64;
-    let runs_here = index.dir_stat(c.idx, ctx.dir).map_or(0, |d| d.runs);
     HeuristicParts {
         recency: 1.0 / (1.0 + age / CMD_H_RECENCY_SCALE_SECS),
-        dir: place_term(runs_here, entry.run_count),
-        repo: place_term(index.runs_in_repo(c.idx, ctx.repo), entry.run_count),
-        fuzzy: if max_fuzzy > 0 {
-            c.fuzzy_score as f64 / max_fuzzy as f64
-        } else {
-            0.0
-        },
+        fzf,
     }
 }
 
-/// The weighted mean of the four terms.
-pub(super) fn combine(parts: &HeuristicParts) -> f64 {
-    (CMD_H_W_RECENCY * parts.recency
-        + CMD_H_W_DIR * parts.dir
-        + CMD_H_W_REPO * parts.repo
-        + CMD_H_W_FUZZY * parts.fuzzy)
-        / (CMD_H_W_RECENCY + CMD_H_W_DIR + CMD_H_W_REPO + CMD_H_W_FUZZY)
+/// The heuristic value, in (0, 1]: `(fzf - lo + recency) / (hi - lo + 1)`
+/// with `lo..=hi` the range of fzf scores among the candidates. Its order
+/// is exactly fzf's score, then the newer last run: scores are integers
+/// and `recency` lies in (0, 1]. It is a value rather than a pair so that
+/// the model stage can blend it (03 section 7.3).
+pub(super) fn combine(parts: &HeuristicParts, lo: i32, hi: i32) -> f64 {
+    (f64::from(parts.fzf - lo) + parts.recency) / (f64::from(hi - lo) + 1.0)
+}
+
+/// The `cap` newest of `keys` as `(last_run_at, db_id)`, newest first (the
+/// recency order of the newest-first baseline). One pass; no allocation
+/// beyond the `cap` entries.
+pub(super) fn newest_of(keys: impl Iterator<Item = (i64, i64)>, cap: usize) -> Vec<(i64, i64)> {
+    let mut newest: Vec<(i64, i64)> = Vec::with_capacity(cap + 1);
+    for key in keys {
+        if newest.len() == cap && newest.last().is_some_and(|last| key <= *last) {
+            continue;
+        }
+        let at = newest.partition_point(|k| *k > key);
+        newest.insert(at, key);
+        newest.truncate(cap);
+    }
+    newest
+}
+
+/// How many matching commands ran more recently than `(last_run_at, db_id)`,
+/// at most `newest.len()` (the cap, when there are that many candidates).
+pub(super) fn recency_rank(newest: &[(i64, i64)], key: (i64, i64)) -> u32 {
+    newest.partition_point(|k| *k > key) as u32
 }
 
 /// What the one total order of every ranking compares: `score`
@@ -241,9 +257,17 @@ pub(super) fn rank_with(
 ) -> CommandRanking {
     // Stage 2 takes the heuristic's top k as a set: it sorts them itself.
     let select = stage2.as_ref().map_or(head, |s| head.max(s.k));
-    let mut ranking = rank_heuristic(query, candidates, index, ctx, select, head);
+    let (mut ranking, newest) = rank_heuristic(
+        query,
+        candidates,
+        index,
+        ctx,
+        select,
+        head,
+        stage2.is_some(),
+    );
     if let Some(stage2) = stage2 {
-        apply_model(query, index, ctx, &stage2, &mut ranking);
+        apply_model(query, index, ctx, &stage2, &newest, &mut ranking);
     }
     ranking
 }
@@ -256,6 +280,7 @@ fn apply_model(
     index: &CommandIndex,
     ctx: &RankContext,
     stage2: &Stage2<'_>,
+    newest: &[(i64, i64)],
     ranking: &mut CommandRanking,
 ) {
     // `rank_heuristic` selected at least this many from the top.
@@ -275,6 +300,11 @@ fn apply_model(
             idx: score.idx,
             entry: &index.entries[score.idx as usize],
             fuzzy_score: score.fuzzy_score,
+            fzf_score: score.parts.fzf,
+            recency_rank: {
+                let entry = &index.entries[score.idx as usize];
+                recency_rank(newest, (entry.last_run_at, entry.db_id))
+            },
             index,
             ctx,
         };
@@ -351,8 +381,9 @@ fn ms_since(started: Instant) -> f64 {
 
 /// Rank `candidates` for `query` by the heuristic alone: ordered by
 /// [`rank_order`], the first `head` (or all, if fewer) exactly and the rest
-/// after them unsorted ([`CommandRanking::sort_rest`] sorts them). The query
-/// only switches the fuzzy term on; matching happened in the filter.
+/// after them unsorted ([`CommandRanking::sort_rest`] sorts them). Matching
+/// happened in the filter; the query here only gives each candidate its fzf
+/// score.
 ///
 /// A screen shows a few dozen rows, so sorting 50,000 to show them is most
 /// of the cost of an empty query: the head is selected in linear time and
@@ -368,27 +399,49 @@ fn rank_heuristic(
     ctx: &RankContext,
     select: usize,
     head: usize,
-) -> CommandRanking {
+    with_newest: bool,
+) -> (CommandRanking, Vec<(i64, i64)>) {
     assert!(select >= head, "the sorted head lies inside the selection");
     assert!(
         u32::try_from(candidates.len()).is_ok(),
         "fewer than 2^32 candidates"
     );
     let started = Instant::now();
-    let max_fuzzy = if query.is_empty() {
-        0
-    } else {
-        candidates.iter().map(|c| c.fuzzy_score).max().unwrap_or(0)
-    };
+    let fzf = FzfQuery::new(query);
     let parallel = candidates.len() >= CMD_PAR_FILTER_MIN;
-    let score = |(at, c): (usize, &CommandCandidate)| {
-        let parts = heuristic(index, ctx, c, max_fuzzy);
-        (sort_key(index, combine(&parts), c.idx, at as u32), parts)
+    let part = |c: &CommandCandidate| {
+        let score = fzf_score(&fzf, &index.entries[c.idx as usize].text);
+        heuristic(index, ctx, c.idx, score)
     };
-    let (mut keys, parts): (Vec<SortKey>, Vec<HeuristicParts>) = if parallel {
-        candidates.par_iter().enumerate().map(score).unzip()
+    let parts: Vec<HeuristicParts> = if parallel {
+        candidates.par_iter().map(part).collect()
     } else {
-        candidates.iter().enumerate().map(score).unzip()
+        candidates.iter().map(part).collect()
+    };
+    let (lo, hi) = parts.iter().fold((i32::MAX, i32::MIN), |(lo, hi), p| {
+        (lo.min(p.fzf), hi.max(p.fzf))
+    });
+    let key = |(at, (c, p)): (usize, (&CommandCandidate, &HeuristicParts))| {
+        sort_key(index, combine(p, lo, hi), c.idx, at as u32)
+    };
+    let mut keys: Vec<SortKey> = if parallel {
+        candidates
+            .par_iter()
+            .zip(parts.par_iter())
+            .enumerate()
+            .map(key)
+            .collect()
+    } else {
+        candidates.iter().zip(&parts).enumerate().map(key).collect()
+    };
+    // The model's recency_rank feature counts within these.
+    let newest = if with_newest {
+        newest_of(
+            keys.iter().map(|k| (k.last_run_at, k.db_id)),
+            CMD_RECENCY_RANK_CAP,
+        )
+    } else {
+        Vec::new()
     };
     let sort_started = Instant::now();
     let selected = select.min(keys.len());
@@ -424,7 +477,7 @@ fn rank_heuristic(
     } else {
         keys.iter().map(build).collect()
     };
-    CommandRanking {
+    let ranking = CommandRanking {
         scores,
         sorted,
         timings: CmdRankTimings {
@@ -435,7 +488,8 @@ fn rank_heuristic(
         model_failed: false,
         features: Vec::new(),
         feature_rows: Vec::new(),
-    }
+    };
+    (ranking, newest)
 }
 
 #[cfg(test)]
@@ -469,68 +523,69 @@ mod tests {
             .collect()
     }
 
+    // TC-B-01, 02, 03 and 05 were rewritten when the heuristic became fzf's
+    // order (02 section 7): the directory, repository and relative-fuzzy
+    // terms are gone, so their expected values went with them.
+
     #[test]
     fn tc_b_01_recency() {
         let mut index = index_of(&["a", "b"]);
         index.record_run(0, NOW - 10, None, None, Some(0), None);
         index.record_run(1, NOW + 50, None, None, Some(0), None);
         let ctx = context(NOW);
-        let parts = heuristic(&index, &ctx, &candidate(0), 0);
+        let parts = heuristic(&index, &ctx, 0, 0);
         assert!(close(parts.recency, 0.99723), "{parts:?}");
-        assert!(close(combine(&parts), 0.43358), "{}", combine(&parts));
+        // With every fzf score equal, the value is the recency term.
+        assert!(close(combine(&parts, 0, 0), 0.99723));
         // A run in the future (clock skew) counts as now.
-        assert_eq!(heuristic(&index, &ctx, &candidate(1), 0).recency, 1.0);
-    }
-
-    /// B of TC-B-02: 10 runs, all in `dir`, the newest 172,800 s ago.
-    fn directory_regular(index: &mut CommandIndex, idx: u32, dir: u32) {
-        for i in 0..10 {
-            index.record_run(idx, NOW - 172_800 - i * 100, Some(dir), None, Some(0), None);
-        }
+        assert_eq!(heuristic(&index, &ctx, 1, 0).recency, 1.0);
     }
 
     #[test]
-    fn tc_b_02_directory() {
-        let mut index = index_of(&["b", "c"]);
-        let dir = index.dirs.intern("/w");
-        directory_regular(&mut index, 0, dir);
-        let mut ctx = context(NOW);
-        ctx.dir = Some(dir);
-        let parts = heuristic(&index, &ctx, &candidate(0), 0);
-        assert!(close(parts.recency, 0.02041), "{parts:?}");
-        assert_eq!(parts.dir, 1.0);
-        assert!(close(combine(&parts), 0.22626), "{}", combine(&parts));
-
-        // 1 of 10 runs here.
-        index.record_run(1, NOW - 50, Some(dir), None, Some(0), None);
-        for _ in 0..9 {
-            index.record_run(1, NOW - 60, None, None, Some(0), None);
-        }
-        assert!(close(
-            heuristic(&index, &ctx, &candidate(1), 0).dir,
-            0.02891
-        ));
-
-        ctx.dir = None;
-        assert_eq!(heuristic(&index, &ctx, &candidate(0), 0).dir, 0.0);
+    fn tc_b_02_the_fzf_score_decides_then_the_newer_run() {
+        // "gi": a word start in both "git status" and "tig git" (the same
+        // score under the history scheme), scattered in "grep -i x".
+        let mut index = index_of(&["git status", "tig git", "grep -i x"]);
+        index.record_run(0, NOW - 7200, None, None, Some(0), None);
+        index.record_run(1, NOW - 60, None, None, Some(0), None);
+        index.record_run(2, NOW - 1, None, None, Some(0), None);
+        let ctx = context(NOW);
+        let all: Vec<CommandCandidate> = (0..3).map(candidate).collect();
+        assert_eq!(order(&index, &ctx, "gi", &all), [2, 1, 3]);
+        // No query: newest first.
+        assert_eq!(order(&index, &ctx, "", &all), [3, 2, 1]);
+        let ranking = rank_commands("gi", &all, &index, &ctx, usize::MAX, None);
+        let fzf: Vec<i32> = ranking.scores.iter().map(|s| s.parts.fzf).collect();
+        assert_eq!(fzf[0], fzf[1]);
+        assert!(fzf[1] > fzf[2]);
     }
 
     #[test]
-    fn tc_b_03_an_old_directory_regular_beats_a_command_run_here_never_once_it_is_an_hour_old() {
-        let mut index = index_of(&["a", "b", "a2"]);
-        let dir = index.dirs.intern("/w");
-        index.record_run(0, NOW - 10, None, None, Some(0), None);
-        directory_regular(&mut index, 1, dir);
-        index.record_run(2, NOW - 7200, None, None, Some(0), None);
-        let mut ctx = context(NOW);
-        ctx.dir = Some(dir);
-        assert_eq!(
-            order(&index, &ctx, "", &[candidate(0), candidate(1)]),
-            [1, 2]
-        );
-        assert_eq!(
-            order(&index, &ctx, "", &[candidate(1), candidate(2)]),
-            [2, 3]
+    fn tc_b_03_the_value_orders_exactly_like_score_then_recency() {
+        // One point of fzf score outweighs any recency.
+        let newest = HeuristicParts {
+            recency: 1.0,
+            fzf: 10,
+        };
+        let oldest = HeuristicParts {
+            recency: 1e-9,
+            fzf: 11,
+        };
+        assert!(combine(&oldest, 10, 11) > combine(&newest, 10, 11));
+        let parts = HeuristicParts {
+            recency: 0.5,
+            fzf: 11,
+        };
+        assert!(close(combine(&parts, 10, 11), 0.75));
+        assert!(
+            combine(
+                &HeuristicParts {
+                    recency: 1.0,
+                    fzf: 11
+                },
+                10,
+                11
+            ) <= 1.0
         );
     }
 
@@ -564,28 +619,22 @@ mod tests {
     }
 
     #[test]
-    fn tc_b_05_fuzzy_term_is_relative_to_the_best_match() {
-        let mut index = index_of(&["git status", "git stash"]);
-        index.record_run(0, NOW - 100, None, None, Some(0), None);
+    fn tc_b_05_a_candidate_fzf_does_not_match_ranks_below_every_match() {
+        // The filter's matcher and fzf can disagree (02 section 7); a
+        // candidate fzf rejects gets NO_FZF_MATCH, below any match.
+        let mut index = index_of(&["abc", "zz top"]);
+        index.record_run(0, NOW - 1, None, None, Some(0), None);
         index.record_run(1, NOW - 100, None, None, Some(0), None);
         let ctx = context(NOW);
-        let candidates = [
-            CommandCandidate {
-                idx: 0,
-                fuzzy_score: 40,
-            },
-            CommandCandidate {
-                idx: 1,
-                fuzzy_score: 80,
-            },
-        ];
-        let ranking = rank_commands("gs", &candidates, &index, &ctx, usize::MAX, None);
-        let fuzzy: Vec<(u32, f64)> = ranking
+        let both = [candidate(0), candidate(1)];
+        let ranking = rank_commands("zz", &both, &index, &ctx, usize::MAX, None);
+        let fzf: Vec<(u32, i32)> = ranking
             .scores
             .iter()
-            .map(|s| (s.idx, s.parts.fuzzy))
+            .map(|s| (s.idx, s.parts.fzf))
             .collect();
-        assert_eq!(fuzzy, [(1, 1.0), (0, 0.5)]);
+        assert_eq!(fzf[0].0, 1);
+        assert_eq!(fzf[1], (0, NO_FZF_MATCH));
         assert!(
             ranking
                 .scores
@@ -595,19 +644,6 @@ mod tests {
         assert!(ranking.features.is_empty() && ranking.features_of(0).is_empty());
         assert_eq!(ranking.timings.stage2, 0);
         assert_eq!(ranking.timings.features_ms, None);
-
-        let non_positive = [
-            CommandCandidate {
-                idx: 0,
-                fuzzy_score: 0,
-            },
-            CommandCandidate {
-                idx: 1,
-                fuzzy_score: -3,
-            },
-        ];
-        let ranking = rank_commands("gs", &non_positive, &index, &ctx, usize::MAX, None);
-        assert!(ranking.scores.iter().all(|s| s.parts.fuzzy == 0.0));
     }
 
     #[test]
@@ -668,6 +704,19 @@ mod tests {
     fn reversing(flat: &[f64], features: usize) -> anyhow::Result<Vec<f64>> {
         assert_eq!(features, COMMAND_FEATURE_REGISTRY.len());
         Ok((0..flat.len() / features).map(|row| row as f64).collect())
+    }
+
+    #[test]
+    fn newest_keeps_the_cap_newest_and_ranks_count_newer_ones() {
+        let keys = [(5, 1), (9, 2), (7, 3), (9, 1), (1, 4)];
+        let newest = newest_of(keys.into_iter(), 3);
+        assert_eq!(newest, [(9, 2), (9, 1), (7, 3)]);
+        assert_eq!(recency_rank(&newest, (9, 2)), 0);
+        assert_eq!(recency_rank(&newest, (7, 3)), 2);
+        // Older than the cap: the cap.
+        assert_eq!(recency_rank(&newest, (1, 4)), 3);
+        assert_eq!(newest_of(keys[..2].iter().copied(), 3), [(9, 2), (5, 1)]);
+        assert!(newest_of(std::iter::empty(), 3).is_empty());
     }
 
     #[test]

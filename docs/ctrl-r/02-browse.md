@@ -60,17 +60,14 @@ Reused as they are, with no edit:
 
 ## 3. Constants (Phase B)
 
-Appended to `src/cmd/tuning.rs`. The heuristic constants are starting values;
-they are the first tuning candidates of [04 section 9](04-bench.md#9-tuning-candidates-in-priority-order).
+Appended to `src/cmd/tuning.rs`. (The hand-weighted heuristic's
+`CMD_H_W_RECENCY`, `CMD_H_W_DIR`, `CMD_H_W_REPO`, `CMD_H_W_FUZZY` and
+`CMD_H_DIR_SATURATION` were removed on 2026-11-17 when the heuristic became
+fzf's order, section 7.)
 
 | Constant | Type | Value | Meaning |
 |---|---|---|---|
-| `CMD_H_W_RECENCY` | `f64` | `1.0` | Heuristic weight of recency |
-| `CMD_H_W_DIR` | `f64` | `0.5` | Heuristic weight of "run in this directory" |
-| `CMD_H_W_REPO` | `f64` | `0.2` | Heuristic weight of "run in this repository" |
-| `CMD_H_W_FUZZY` | `f64` | `0.6` | Heuristic weight of the normalised fuzzy score |
-| `CMD_H_RECENCY_SCALE_SECS` | `f64` | `3600.0` | Age at which the recency term is 0.5 |
-| `CMD_H_DIR_SATURATION` | `f64` | `10.0` | Runs in a directory at which the directory term stops growing |
+| `CMD_H_RECENCY_SCALE_SECS` | `f64` | `3600.0` | Age at which the recency term is 0.5; it breaks fzf-score ties and shapes the value the model blends with (section 7) |
 | `CMD_LOAD_READERS` | `usize` | `4` | Connections that read R1 at picker start, each a slice of the id range (section 5.2) |
 | `CMD_PAR_FILTER_MIN` | `usize` | `2000` | Base-set size from which the filter (with a non-empty query) and the heuristic use rayon |
 | `CMD_PAGE_ROWS` | `usize` | `200` | Rows per `QueryUpdated` / `Rows` response |
@@ -379,12 +376,68 @@ file-mode line.
 
 ## 7. Heuristic ranking
 
-`src/cmd/rank.rs`. In this phase it is the whole ranking; Phase C adds a model
-stage on top ([03 section 7](03-learn.md#7-serving-two-stage-rank-and-blend)).
+`src/cmd/rank.rs` and `src/cmd/fzf.rs`. Without a model this is the whole
+ranking (the "cold start"); Phase C adds a model stage on top of it
+([03 section 7](03-learn.md#7-serving-two-stage-rank-and-blend)), and this
+order is its stage 1.
+
+**The heuristic is fzf's Ctrl-R order.** fzf's own history widgets
+(`shell/key-bindings.{bash,zsh,fish}` of fzf) list the history newest first
+with duplicates removed (keeping the newest) and run fzf with
+`--scheme=history`; that scheme sorts by match score only (`parseScheme` in
+`src/options.go`: criteria `[byScore]`), so equal scores keep the input
+order, newest first, and an empty query shows the list as given, newest
+first. The commands of the index are already distinct, so the order here is:
+**fzf's score descending, then `last_run_at` descending, then `db_id`
+descending**, and for an empty query newest first. It replaced, on
+2026-11-17, a hand-weighted mean of recency, directory, repository and
+relative fuzzy terms that lost to plain newest-first on most cells of the
+benchmark (R3 -0.262; [results.md](results.md)).
+
+### 7.1 fzf's score (`src/cmd/fzf.rs`)
+
+A reimplementation from the source of **fzf v0.74.5 (commit `c0a193e`, MIT
+licence, (c) Junegunn Choi)**, credited in the module comment; nothing is
+copied. What it computes:
+
+| Part | fzf source | Here |
+|---|---|---|
+| Match and score of one term | `FuzzyMatchV2` (`src/algo/algo.go`): a Smith-Waterman variant without omissions; score = 16 per matched character, gap -3 to open and -1 to extend, plus a bonus per matched character: 8 at a word boundary, 8 for a non-word character, 7 for camelCase/digit starts, at least 4 inside a consecutive chunk (a chunk carries its first character's bonus), and the first pattern character's bonus doubled | Same, score only (no positions) |
+| `--scheme=history` | `Init("history")`: the boundary bonus after whitespace and after a delimiter (`/,:;|`) is 8, the same as any other word boundary; the default scheme gives 10 and 9, so there the start of the text and a word after a space outrank a word after `/` | The history scheme. Consequence: the start of a command is worth exactly as much as the start of any later word |
+| Long texts | V2 falls back to the greedy `FuzzyMatchV1` + `calculateScore` when `text chars * pattern chars > 100 * 1024` (the slab) or the pattern is over 1,000 characters | Same thresholds, same fallback |
+| Query | Extended search (`BuildPattern`, `parseTerms` in `src/pattern.go`): leading spaces and unescaped trailing spaces dropped, split on runs of spaces, `\ ` a literal space; each term smart-case (case-sensitive only if it has an upper-case letter); a command must match every term; the score is the sum of the terms' scores | Same, for fuzzy terms |
+| Case folding | ASCII `A-Z` lower-cased; other upper-case letters by a one-character mapping | Same |
+
+Not adopted, with the reason:
+
+| fzf behaviour | Why not |
+|---|---|
+| Latin-script normalisation (`é` matches `e`; on by default, `--literal` turns it off) | The candidate filter (`worker::filter_candidates`, Skim's matcher) does not normalise, so a normalised query would not reach those commands anyway. A command fzf would match only through normalisation scores as fzf with `--literal` |
+| Extended-search operators: `'exact`, `^prefix`, `suffix$`, `!negation`, `|` (OR) | They change which commands match, and matching is the filter's, in `worker.rs` (section 6.3), which keeps Skim's semantics. Every term here is a fuzzy term matched literally. Recommendation in [results.md](results.md) |
+| `--tiebreak=index` as an option | `--scheme=history` already has no tiebreak criterion; the newest-first input order is the tiebreak |
+
+The filter and fzf agree on which commands match a one-term query: both
+match the query's characters in order, smart-case. They can differ on (a)
+accented letters (fzf normalises, the filter does not) and (b) multi-term
+queries, where the filter matches the whole query, spaces included, as one
+subsequence, so its matches are a subset of fzf's. A candidate fzf would not
+match gets the score `NO_FZF_MATCH = -1`, below every match (unreachable for
+(b), reachable in principle for (a)).
+
+Checked against the fzf 0.74.5 release binary (`fzf --filter=QUERY
+--scheme=history`, empty `FZF_DEFAULT_OPTS`): the orders of 333 queries
+(substrings, scattered subsequences, multi-term, smart-case) over 3,504
+synthetic command lines were identical; the only differences, before the one
+line with accented letters was removed, came from normalisation. fzf's own
+`algo_test.go` score vectors (default scheme) pass for V1 and V2. Fixed
+vectors from the binary are TC-B-22.
+
+### 7.2 Types and the value
 
 ```rust
-pub(super) struct CommandCandidate { pub idx: u32, pub fuzzy_score: i64 }
-pub(super) struct HeuristicParts { pub recency: f64, pub dir: f64, pub repo: f64, pub fuzzy: f64 }
+pub(super) struct CommandCandidate { pub idx: u32, pub fuzzy_score: i64 }   // from the filter (Skim's score, kept for the debug pane and the model)
+pub(super) struct HeuristicParts { pub recency: f64, pub fzf: i32 }
+pub(super) const NO_FZF_MATCH: i32 = -1;
 pub(super) struct CommandScore {
     pub idx: u32, pub score: f64, pub heuristic: f64, pub parts: HeuristicParts,
     pub ml_score: Option<f64>, pub ml_weight: f64, pub fuzzy_score: i64,
@@ -403,46 +456,54 @@ impl CommandRanking {
     pub(super) fn features_of(&self, rank: usize) -> &[f64];    // registry order; empty when not model-scored
 }
 
-pub(super) fn heuristic(index: &CommandIndex, ctx: &RankContext, c: &CommandCandidate, max_fuzzy: i64) -> HeuristicParts;
+pub(super) struct FzfQuery { .. }                              // src/cmd/fzf.rs
+impl FzfQuery { pub(super) fn new(query: &str) -> Self; pub(super) fn score(&self, text: &str) -> Option<i32>; }
+pub(super) fn fzf_score(query: &FzfQuery, text: &str) -> i32;  // score, or NO_FZF_MATCH
+pub(super) fn heuristic(index: &CommandIndex, ctx: &RankContext, idx: u32, fzf: i32) -> HeuristicParts;
+pub(super) fn combine(parts: &HeuristicParts, lo: i32, hi: i32) -> f64;
 pub(super) fn rank_commands(query: &str, candidates: &[CommandCandidate], index: &CommandIndex, ctx: &RankContext,
                             head: usize) -> CommandRanking;
 pub(super) fn rank_order(index: &CommandIndex, a: &CommandScore, b: &CommandScore) -> std::cmp::Ordering;   // the total order below
 ```
 
-For candidate `c` with entry `e` (`ln` is the natural logarithm):
+For candidate `c` with entry `e`:
 
 | Term | Formula | Range |
 |---|---|---|
+| `fzf` | `fzf_score(FzfQuery::new(query), e.text)`; 0 for an empty query | integer, usually 16-400 |
 | `recency` | `1 / (1 + max(0, now - e.last_run_at) / CMD_H_RECENCY_SCALE_SECS)` | (0, 1] |
-| `dir` | `(d.runs / e.run_count) * min(1, ln(1 + d.runs) / ln(1 + CMD_H_DIR_SATURATION))` with `d = dir_stat(idx, ctx.dir)`; 0 when `None` or `run_count == 0` | [0, 1] |
-| `repo` | Same with `r = runs_in_repo(idx, ctx.repo)` in place of `d.runs` | [0, 1] |
-| `fuzzy` | `c.fuzzy_score / max_fuzzy` when the query is non-empty and `max_fuzzy > 0`, else 0; `max_fuzzy` = the largest `fuzzy_score` among the candidates of this call | [0, 1] for non-negative scores |
-| `heuristic` | `(W_RECENCY*recency + W_DIR*dir + W_REPO*repo + W_FUZZY*fuzzy) / (W_RECENCY + W_DIR + W_REPO + W_FUZZY)` | [0, 1] |
+| `heuristic` | `(fzf - lo + recency) / (hi - lo + 1)`, `lo..=hi` the range of `fzf` among this call's candidates | (0, 1] |
 
-`rank_commands` in this phase: compute `max_fuzzy`; compute `heuristic` for
-every candidate (rayon `par_iter` when there are at least `CMD_PAR_FILTER_MIN`);
-`score = heuristic`, `ml_score = None`, `ml_weight = 0.0`, `features` empty;
-order by the total order **`score` descending (`f64::total_cmp`), then
-`last_run_at` descending, then `db_id` descending** - exactly for the first
-`head` rows, `sorted = min(head, len)`: `select_nth_unstable_by(sorted - 1)`,
-then sort `[..sorted]`; with `head >= len` the whole list (`par_sort_unstable_by`
-from `CMD_PAR_FILTER_MIN`). What is selected and sorted is a 32-byte key per
-candidate (`score`, `last_run_at`, `db_id`, position); the `CommandScore`s are
-built once, in key order, afterwards. The worker passes `head = CMD_PAGE_ROWS`:
-a screen shows a few dozen rows, and sorting 50,000 to show them was most of
-an empty query's cost. A caller that needs the full order (the benchmark's
+Because scores are integers and `recency` lies in (0, 1], ordering by
+`heuristic` is exactly ordering by `fzf`, then by the newer last run; the
+value exists so that the model stage has a heuristic to blend with
+([03 section 7.3](03-learn.md#73-blend)). Equal values (the same score and a
+recency equal in `f64`) fall to `last_run_at` and `db_id`.
+
+`rank_commands` in this phase: build the `FzfQuery` once; compute the parts
+for every candidate (rayon `par_iter` from `CMD_PAR_FILTER_MIN`
+candidates); `lo`, `hi`; `score = heuristic`, `ml_score = None`,
+`ml_weight = 0.0`, `features` empty; order by the total order **`score`
+descending (`f64::total_cmp`), then `last_run_at` descending, then `db_id`
+descending** - exactly for the first `head` rows, `sorted = min(head, len)`:
+`select_nth_unstable_by(sorted - 1)`, then sort `[..sorted]`; with
+`head >= len` the whole list (`par_sort_unstable_by` from
+`CMD_PAR_FILTER_MIN`). What is selected and sorted is a 32-byte key per
+candidate (`score`, `last_run_at`, `db_id`, position); the `CommandScore`s
+are built once, in key order, afterwards. The worker passes
+`head = CMD_PAGE_ROWS`; a caller that needs the full order (the benchmark's
 relevance mode) passes `usize::MAX`, or calls `sort_rest`.
 
-Consequences of the starting constants, with an empty query (`fuzzy = 0`):
-
-| Statement | Derivation |
-|---|---|
-| Row 1 is the most recently run command `M` unless some command `D` satisfies `0.5*(dir_D - dir_M) + 0.2*(repo_D - repo_M) > recency_M - recency_D` | Definition of `heuristic` |
-| If `M` ran within the last 300 seconds, no command last run more than 4 hours ago displaces it | The left side is at most 0.7; `recency_M >= 0.923` and `recency_D <= 0.2`, a gap of at least 0.723 |
-| A command with all of its >= 10 runs in this directory (`dir = 1`, `repo = 0`) and last run long ago displaces an `M` never run here once `M` is older than 3,600 s | `recency_M < 0.5` |
-
-With a non-empty query the ordering is recency plus directory plus `0.6 *`
-relative match quality; metric R3 holds it to at least the newest-first baseline.
+What psychic's own signals add on top of fzf, without a model: nothing.
+Six were measured as tie-breakers inside equal fzf scores (all-time runs at
+two weights, runs in 30 days, the directory share, recency in this
+directory, a 900 s recency scale), on the five tuning corpora, both query
+styles, every cell of `all`/`gt10min`/`other_dir` x lengths x four
+metrics (results.md, 2026-11-17). The bar for adding one is that it is
+below pure fzf on no cell; every one was below somewhere (the mildest,
+recency in this directory, by 0.006; frequency by 0.09-0.17 at length 0 on
+the repetitive corpora, where the newest command is the answer half the
+time). So the cold start is pure fzf; the model uses those signals.
 
 ## 8. UI thread
 
@@ -567,8 +628,8 @@ Preview pane for the selected row, top to bottom:
 | blank line, `Last directories` | Up to 5 `DirUse`: path (leading `home` shown as `~`, truncated), `<runs> runs`, time-ago. While the details are not in `app.details`: `...` |
 | blank line, `Usually after` | Up to 3 `PrecededBy`: template, `<runs> times`. Omitted when empty |
 
-Debug pane (Ctrl-O), for the selected row: `score`, `heuristic`, the four
-`heuristic_parts`, `ml_score`, `ml_weight`, `fuzzy_score`; then one line per
+Debug pane (Ctrl-O), for the selected row: `score`, `heuristic`, its two
+`heuristic_parts` (`fzf`, `recency`), `ml_score`, `ml_weight`, `fuzzy_score`; then one line per
 feature `name = value` when `features` is non-empty (names from
 [03 section 4](03-learn.md#4-features)), else `model: none`; then model stats
 (Phase C, [03 section 7.4](03-learn.md#74-what-the-debug-pane-shows)); then
@@ -892,6 +953,7 @@ before the partial sort and the reuse rules B1 was 4.9 / 11.7 ms.
 | `--query "$BUFFER"` with a space | `--query="$BUFFER"` | A buffer beginning with `-` would parse as an option |
 | Use tuples for multi-field results (`(String, u32, i64)`) | Named structs (`DirUse`, `PrecededBy`, `Shown`) | [llm.md:5](../../llm.md) |
 | Hard-code a heuristic weight or page size in `rank.rs`/`worker.rs` | `tuning.rs` constants (section 3) | The benchmark tunes them in one place |
+| Add a hand-weighted term to the cold-start order | Measure it as a tie-break inside equal fzf scores against pure fzf on every corpus and both query styles (04 section 9); add it only if it loses nowhere | The hand-weighted heuristic lost to newest-first; fzf's order is the floor |
 
 ## 14. Test case specifications
 
@@ -901,11 +963,11 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 
 | ID | Component | Input | Expected | Edge cases covered |
 |---|---|---|---|---|
-| TC-B-01 | `heuristic` recency | Command last run 10 s ago, never here, empty query | `recency = 0.99723`, `heuristic = 0.43358` (+-1e-5) | `last_run_at > now` -> `recency = 1.0` |
-| TC-B-02 | `heuristic` directory | 10 runs, all in `ctx.dir`, last run 172,800 s ago | `recency = 0.02041`, `dir = 1.0`, `heuristic = 0.22626` (+-1e-5) | `ctx.dir = None` -> `dir = 0`; 1 of 10 runs here -> `dir = 0.1 * ln2/ln11 = 0.02891` |
-| TC-B-03 | `rank_commands` empty query | A (10 s ago, not here), B (TC-B-02) | Order A, B | Replace A by A2 run 7,200 s ago -> order B, A2 |
+| TC-B-01 | `heuristic` recency | Command last run 10 s ago, empty query | `recency = 0.99723`, `heuristic = combine(.., 0, 0) = 0.99723` (+-1e-5) | `last_run_at > now` -> `recency = 1.0` |
+| TC-B-02 | `rank_commands` fzf order | `git status` (7,200 s ago), `tig git` (60 s), `grep -i x` (1 s); query `gi` | `tig git`, `git status`, `grep -i x` (equal scores newest first, then the scattered match); empty query: newest first | - |
+| TC-B-03 | `combine` | parts (recency 1.0, fzf 10) and (1e-9, 11) with `lo = 10`, `hi = 11` | the second is higher; (0.5, 11) gives 0.75; never above 1 | - |
 | TC-B-04 | `rank_commands` tie-break | Two commands, identical stats, `db_id` 5 and 9 | 9 before 5 | Same `score`, different `last_run_at` -> newer first |
-| TC-B-05 | `rank_commands` fuzzy term | Query `gs`; candidates with `fuzzy_score` 40 and 80, same recency | `fuzzy` parts 0.5 and 1.0; the 80 first | All `fuzzy_score <= 0` -> `fuzzy = 0` for all |
+| TC-B-05 | `rank_commands`, fzf rejects | `abc` (1 s ago) and `zz top` (100 s ago) passed as candidates of `zz` | `zz top` first, `abc` has `fzf = NO_FZF_MATCH`; no model fields set | - |
 | TC-B-06 | `filter` | Texts `git status`, `cargo build`, `ls`; query `gs` (not `cargo test`: its `g`...`s` is a fuzzy match) | Only `git status` | Empty query keeps all 3 with `fuzzy_score = 0`; a `deleted` entry is never returned |
 | TC-B-07 | `filter` narrowing | Queries `g` then `gi` then `x` on 3 texts | Second call's base-set size equals the first call's match count; the third call's base set is all entries | Scope change between calls disables narrowing; result of narrowed `gi` equals un-narrowed `gi` |
 | TC-B-08 | `filter` scopes | A run here only, B in repo only, C in session only, D none | `Directory` -> [A]; `Repo` -> [B]; `Session` -> [C]; `All` -> 4 | `ctx.dir = None` with `Directory` -> empty |
@@ -921,6 +983,7 @@ Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
 | TC-B-18 | filter reuse | Queries `g`, `gi`, `g`, `""`, `g`; then `g` in another scope; then a delete | The second `g` is `reused` (base set 0, same candidates), also after `""`; not in another scope or after `forget_narrowing`; `gr` after `gi` narrows from `g` and equals a fresh filter | - |
 | TC-B-19 | partial order | 2,500 commands, `head` in {0, 1, 200, len-1} | `scores[..head]` equal the full order's head; the rest holds the same commands; after `sort_rest` the whole order equals the full one | - |
 | TC-B-20 | empty-query cache | `""`, `c1`, `""` on 230 commands; `GetRows` past 200; delete | The second `""` answers with the same `Arc` (no ranking); the page past the head is in rank order and the cache holds the sorted copy; a delete empties the cache | - |
+| TC-B-22 | `fzf.rs` | fzf's `TestFuzzyMatch` vectors (default scheme, V1 and V2, 20 matches and 3 non-matches); the history scheme on `git status` / `tig git` / `tig/git` for `gi`; extended-search splitting and smart case; a 60,000-character text; 17 queries over a 12-line list | The scores of fzf's tests; equal history-scheme scores (48 each), default 10 > 9; the V1 fallback's score; the orders the fzf 0.74.5 binary printed (`src/cmd/fzf/expected.rs`) | An ignored test writes this module's orders for a list and queries, to diff against `fzf --filter` (section 7.1) |
 | TC-B-21 | id split | `split_ids` of `1..=10` in 4, `5..=6` in 4, `i64::MIN..=i64::MAX` in 4 | `[1-3, 4-6, 7-9, 10]`; `[5, 6]`; 4 contiguous parts covering both ends | - |
 
 ### 14.2 Integration tests

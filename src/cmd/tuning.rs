@@ -37,23 +37,9 @@ pub(super) const CMD_WAL_TRUNCATE_BYTES: u64 = 2 * 1024 * 1024;
 // Phase B: the picker (`docs/ctrl-r/02-browse.md` section 3)
 // ---------------------------------------------------------------------------
 
-/// Heuristic weight of recency.
-pub(super) const CMD_H_W_RECENCY: f64 = 1.0;
-
-/// Heuristic weight of "run in this directory".
-pub(super) const CMD_H_W_DIR: f64 = 0.5;
-
-/// Heuristic weight of "run in this repository".
-pub(super) const CMD_H_W_REPO: f64 = 0.2;
-
-/// Heuristic weight of the normalised fuzzy score.
-pub(super) const CMD_H_W_FUZZY: f64 = 0.6;
-
-/// Age, in seconds, at which the recency term is 0.5.
+/// Age, in seconds, at which the recency term is 0.5. It only breaks ties
+/// of the fzf score and shapes the value the model blends with (02 section 7).
 pub(super) const CMD_H_RECENCY_SCALE_SECS: f64 = 3600.0;
-
-/// Runs in a directory at which the directory term stops growing.
-pub(super) const CMD_H_DIR_SATURATION: f64 = 10.0;
 
 /// Connections that read the commands (R1) at picker start, each a slice
 /// of the id range, on a thread of its own.
@@ -80,6 +66,9 @@ pub(super) const CMD_STACK_BELOW_COLS: u16 = 120;
 // ---------------------------------------------------------------------------
 // Phase C: the model (`docs/ctrl-r/03-learn.md` section 3)
 // ---------------------------------------------------------------------------
+
+/// The `recency_rank` feature counts newer matching commands up to this.
+pub(super) const CMD_RECENCY_RANK_CAP: usize = 15;
 
 /// Rows, from the top of the heuristic order, that the model scores.
 pub(super) const CMD_STAGE2_K: usize = 2000;
@@ -109,14 +98,20 @@ pub(super) const CMD_TRAIN_MIN_GROUPS: usize = 50;
 /// Percent of run groups with synthetic query length 0, 1, 2, 3.
 pub(super) const CMD_TRAIN_QLEN_MIX: [u32; 4] = [40, 20, 20, 20];
 
-/// Negatives taken from the most recently run matching commands.
-pub(super) const CMD_TRAIN_RECENT_NEGATIVES: usize = 15;
+/// Percent of run groups with a non-empty query whose query is a fragment
+/// of a later word rather than a prefix.
+pub(super) const CMD_TRAIN_FRAGMENT_SHARE: u32 = 25;
+
+/// Negatives taken from the most recently run matching commands. 0: the
+/// newest commands as fixed negatives skewed every recency feature
+/// (03 section 5.2, results.md 2026-11-17).
+pub(super) const CMD_TRAIN_RECENT_NEGATIVES: usize = 0;
 
 /// Distinct recent commands examined to find them.
 pub(super) const CMD_TRAIN_RECENT_SCAN: usize = 500;
 
 /// Negatives drawn at random from all matching commands.
-pub(super) const CMD_TRAIN_RANDOM_NEGATIVES: usize = 15;
+pub(super) const CMD_TRAIN_RANDOM_NEGATIVES: usize = 30;
 
 /// Draws allowed to find them.
 pub(super) const CMD_TRAIN_RANDOM_TRIES: usize = 200;
@@ -156,12 +151,7 @@ pub(super) fn snapshot() -> serde_json::Map<String, serde_json::Value> {
         CMD_OWN_COMMANDS,
         CMD_PATH_ARG_COMMANDS,
         CMD_WAL_TRUNCATE_BYTES,
-        CMD_H_W_RECENCY,
-        CMD_H_W_DIR,
-        CMD_H_W_REPO,
-        CMD_H_W_FUZZY,
         CMD_H_RECENCY_SCALE_SECS,
-        CMD_H_DIR_SATURATION,
         CMD_LOAD_READERS,
         CMD_PAR_FILTER_MIN,
         CMD_PAGE_ROWS,
@@ -169,6 +159,7 @@ pub(super) fn snapshot() -> serde_json::Map<String, serde_json::Value> {
         CMD_IMPRESSION_AGE_MS,
         CMD_TICK_MS,
         CMD_STACK_BELOW_COLS,
+        CMD_RECENCY_RANK_CAP,
         CMD_STAGE2_K,
         CMD_BLEND_SCALE,
         CMD_PICK_WEIGHT,
@@ -178,6 +169,7 @@ pub(super) fn snapshot() -> serde_json::Map<String, serde_json::Value> {
         CMD_TRAIN_MAX_RUN_GROUPS,
         CMD_TRAIN_MIN_GROUPS,
         CMD_TRAIN_QLEN_MIX,
+        CMD_TRAIN_FRAGMENT_SHARE,
         CMD_TRAIN_RECENT_NEGATIVES,
         CMD_TRAIN_RECENT_SCAN,
         CMD_TRAIN_RANDOM_NEGATIVES,

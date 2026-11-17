@@ -26,6 +26,7 @@ pub mod cli;
 mod corpus;
 mod events;
 mod features;
+mod fzf;
 mod index;
 mod keys;
 mod model;

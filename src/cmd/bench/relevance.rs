@@ -16,15 +16,18 @@
 //!
 //! No command or query text leaves this module: counts, shares and ranks.
 
+use super::super::corpus::splitmix64;
 use super::super::features::command_feature_specs;
+use super::super::fzf::FzfQuery;
 use super::super::index::{CommandIndex, RankContext};
 use super::super::model::CmdModel;
-use super::super::rank::{CommandCandidate, rank_commands};
+use super::super::rank::{CommandCandidate, fzf_score, rank_commands};
 use super::super::store::{CmdStore, RunRecord, Source};
 use super::super::train::{
     BuildOptions, CmdModelStats, ReplayInput, Replayer, Step, Timeline, build_training_set,
+    fragment_query,
 };
-use super::super::tuning::{CMD_TRAIN_MAX_RUN_GROUPS, CMD_TRAIN_MIN_GROUPS};
+use super::super::tuning::{CMD_STAGE2_K, CMD_TRAIN_MAX_RUN_GROUPS, CMD_TRAIN_MIN_GROUPS};
 use super::super::worker::{Scope, filter_candidates};
 use super::CorpusStats;
 use anyhow::{Context, Result};
@@ -54,8 +57,12 @@ const LOW_N: usize = 200;
 const MIN_SEEDS: usize = 3;
 /// A history with fewer runs is not split (E-N-05).
 const MIN_RUNS: usize = 100;
-/// Query lengths measured, in characters.
+/// Prefix query lengths measured, in characters: the headline style.
 const LENGTHS: [usize; 4] = [0, 1, 2, 3];
+/// Fragment query lengths measured, in characters (section 5.2).
+const FRAGMENT_LENGTHS: [usize; 4] = [1, 2, 3, 5];
+/// Mixed into a run id to choose the word of its fragment queries.
+const FRAGMENT_SALT: u64 = 0x5EED_F4A6_0000_0001;
 /// The reference line of section 5.6.
 const FILE_REFERENCE: &str = "file search on its own benchmark: top-1 0.7960, MRR 0.8656 \
                               (different task; see 00-blueprint.md section 2)";
@@ -72,24 +79,85 @@ const NOT_ENOUGH_FOR_A_SPLIT: &str = "every split needs rows";
 pub(super) enum Ranker {
     Recency,
     FzfScored,
+    /// fzf's own Ctrl-R order: its `--scheme=history` score, then newest.
+    Fzf,
     Heuristic,
     Model,
+    /// Information: the share of lookups whose target the heuristic puts in
+    /// the first `CMD_STAGE2_K` rows, the only rows the model scores.
+    Stage1Recall,
 }
 
-const RANKERS: [Ranker; 4] = [
+const RANKERS: [Ranker; 5] = [
     Ranker::Recency,
     Ranker::FzfScored,
+    Ranker::Fzf,
     Ranker::Heuristic,
     Ranker::Model,
 ];
+
+/// The information rows printed under the rankers.
+const INFO_ROWS: [Ranker; 1] = [Ranker::Stage1Recall];
 
 impl Ranker {
     fn key(self) -> &'static str {
         match self {
             Ranker::Recency => "recency",
             Ranker::FzfScored => "fzf_scored",
+            Ranker::Fzf => "fzf",
             Ranker::Heuristic => "heuristic",
             Ranker::Model => "model",
+            Ranker::Stage1Recall => "stage1_recall",
+        }
+    }
+}
+
+/// How a lookup's query is made from its target's text (section 5.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QueryStyle {
+    /// The first characters of the text: the headline style.
+    Prefix,
+    /// The first characters of a word inside the text.
+    Fragment,
+}
+
+impl QueryStyle {
+    fn key(self) -> &'static str {
+        match self {
+            QueryStyle::Prefix => "prefix",
+            QueryStyle::Fragment => "fragment",
+        }
+    }
+
+    fn lengths(self) -> [usize; 4] {
+        match self {
+            QueryStyle::Prefix => LENGTHS,
+            QueryStyle::Fragment => FRAGMENT_LENGTHS,
+        }
+    }
+}
+
+/// Every (style, length) measured, in output order.
+const QUERIES: [(QueryStyle, usize); 8] = [
+    (QueryStyle::Prefix, 0),
+    (QueryStyle::Prefix, 1),
+    (QueryStyle::Prefix, 2),
+    (QueryStyle::Prefix, 3),
+    (QueryStyle::Fragment, 1),
+    (QueryStyle::Fragment, 2),
+    (QueryStyle::Fragment, 3),
+    (QueryStyle::Fragment, 5),
+];
+
+/// The query of `style` and `len` for a target, or `None` when the text
+/// is too short for it.
+fn make_query(style: QueryStyle, text: &str, len: usize, run_id: i64) -> Option<String> {
+    match style {
+        QueryStyle::Prefix => {
+            (text.chars().count() >= len).then(|| text.chars().take(len).collect())
+        }
+        QueryStyle::Fragment => {
+            fragment_query(text, len, splitmix64(run_id as u64 ^ FRAGMENT_SALT))
         }
     }
 }
@@ -200,6 +268,32 @@ pub(super) fn fzf_scored_order(
     b.fuzzy_score
         .cmp(&a.fuzzy_score)
         .then_with(|| recency_order(index, a, b))
+}
+
+/// `fzf`: fzf's score under `--scheme=history` first (`fzf::FzfQuery`, a
+/// candidate fzf rejects last), then as `recency`. 1-based rank of `target`.
+fn fzf_rank(
+    index: &CommandIndex,
+    candidates: &[CommandCandidate],
+    query: &str,
+    target: u32,
+) -> u32 {
+    let fzf = FzfQuery::new(query);
+    let score = |c: &CommandCandidate| fzf_score(&fzf, &index.entries[c.idx as usize].text);
+    let Some(t) = candidates.iter().find(|c| c.idx == target) else {
+        return NOT_MATCHED;
+    };
+    let target_score = score(t);
+    1 + candidates
+        .iter()
+        .filter(|c| {
+            score(c)
+                .cmp(&target_score)
+                .reverse()
+                .then_with(|| recency_order(index, c, t))
+                == Ordering::Less
+        })
+        .count() as u32
 }
 
 /// 1-based rank of `target` among `candidates` under a total `order`: one
@@ -353,6 +447,7 @@ fn round6(value: f64) -> Value {
 pub(super) struct Cell {
     pub ranker: Ranker,
     pub slice: Slice,
+    pub style: QueryStyle,
     pub len: usize,
     pub n: usize,
     /// In `METRICS` order.
@@ -366,7 +461,7 @@ impl Cell {
 
     fn to_json(&self) -> Value {
         let mut cell = json!({ "ranker": self.ranker.key(), "slice": self.slice.key(),
-                               "len": self.len, "n": self.n });
+                               "style": self.style.key(), "len": self.len, "n": self.n });
         for metric in METRICS {
             cell[metric.key()] = self.values[metric as usize].to_json();
         }
@@ -457,9 +552,9 @@ impl Verdicts {
 /// R1-R3 from the holdout cells; `seeds` is how many trained.
 pub(super) fn verdicts(cells: &[Cell], seeds: usize) -> Verdicts {
     let find = |ranker: Ranker, slice: Slice, len: usize| {
-        cells
-            .iter()
-            .find(|c| c.ranker == ranker && c.slice == slice && c.len == len)
+        cells.iter().find(|c| {
+            c.ranker == ranker && c.slice == slice && c.style == QueryStyle::Prefix && c.len == len
+        })
     };
     let diff = |ranker: Ranker, slice: Slice, len: usize, metric: Metric| -> (usize, f64) {
         match (find(ranker, slice, len), find(Ranker::Recency, slice, len)) {
@@ -737,11 +832,11 @@ fn train_at(
 // The test replay (step 4)
 // ---------------------------------------------------------------------------
 
-/// The ranks of every sampled lookup of one split, per query length.
+/// The ranks of every sampled lookup of one split, per query of `QUERIES`.
 #[derive(Default)]
 struct Ranks {
-    /// Per length: (slice bits, rank per ranker except the model, model rank per seed).
-    lookups: [Vec<Lookup>; 4],
+    /// Per position in `QUERIES`.
+    lookups: [Vec<Lookup>; QUERIES.len()],
     /// Lookups whose target did not match its own prefix.
     not_matched: usize,
     /// Sampled runs skipped because they execute a pick.
@@ -752,6 +847,16 @@ struct Lookup {
     slices: u8,
     recency: u32,
     fzf_scored: u32,
+    fzf: u32,
+    heuristic: u32,
+    model: Vec<u32>,
+}
+
+/// What `rank_lookup` measured.
+struct LookupRanks {
+    recency: u32,
+    fzf_scored: u32,
+    fzf: u32,
     heuristic: u32,
     model: Vec<u32>,
 }
@@ -772,11 +877,12 @@ fn rank_lookup(
     ctx: &RankContext,
     query: &str,
     target: u32,
-) -> (u32, u32, u32, Vec<u32>) {
+) -> LookupRanks {
     let index = &replayer.index;
     let candidates = filter_candidates(index, ctx, matcher, query, Scope::All, None);
     let recency = rank_by(&candidates, target, |a, b| recency_order(index, a, b));
-    let fzf = rank_by(&candidates, target, |a, b| fzf_scored_order(index, a, b));
+    let fzf_scored = rank_by(&candidates, target, |a, b| fzf_scored_order(index, a, b));
+    let fzf = fzf_rank(index, &candidates, query, target);
     let heuristic = position(
         &rank_commands(query, &candidates, index, ctx, usize::MAX, None).scores,
         target,
@@ -790,7 +896,13 @@ fn rank_lookup(
             )
         })
         .collect();
-    (recency, fzf, heuristic, model)
+    LookupRanks {
+        recency,
+        fzf_scored,
+        fzf,
+        heuristic,
+        model,
+    }
 }
 
 /// Walk the test window from the state at the cut: rank each sampled run's
@@ -849,20 +961,21 @@ fn replay_window(
                     Some(&run.shell_session),
                 );
                 let text = std::sync::Arc::clone(&entry.text);
-                let chars = text.chars().count();
-                for len in LENGTHS.into_iter().filter(|&len| len <= chars) {
-                    let query: String = text.chars().take(len).collect();
-                    let (recency, fzf_scored, heuristic, model) =
-                        rank_lookup(&replayer, &matcher, models, &ctx, &query, target);
-                    if recency == NOT_MATCHED {
+                for (at, &(style, len)) in QUERIES.iter().enumerate() {
+                    let Some(query) = make_query(style, &text, len, run.id) else {
+                        continue;
+                    };
+                    let measured = rank_lookup(&replayer, &matcher, models, &ctx, &query, target);
+                    if measured.recency == NOT_MATCHED {
                         ranks.not_matched += 1;
                     }
-                    ranks.lookups[len].push(Lookup {
+                    ranks.lookups[at].push(Lookup {
                         slices,
-                        recency,
-                        fzf_scored,
-                        heuristic,
-                        model,
+                        recency: measured.recency,
+                        fzf_scored: measured.fzf_scored,
+                        fzf: measured.fzf,
+                        heuristic: measured.heuristic,
+                        model: measured.model,
                     });
                 }
             }
@@ -877,20 +990,23 @@ fn replay_window(
 fn cells_of(ranks: &Ranks, seeds: usize) -> Vec<Cell> {
     let mut cells = Vec::new();
     for slice in SLICES {
-        for len in LENGTHS {
-            let lookups: Vec<&Lookup> = ranks.lookups[len]
+        for (at, &(style, len)) in QUERIES.iter().enumerate() {
+            let lookups: Vec<&Lookup> = ranks.lookups[at]
                 .iter()
                 .filter(|l| l.slices & slice.bit() != 0)
                 .collect();
             let n = lookups.len();
+            let spread = |metrics: Metrics| METRICS.map(|m| Spread::of(&[metrics.get(m)]));
             let unseeded = |pick: fn(&Lookup) -> u32| {
-                let metrics = Metrics::of(&lookups.iter().map(|l| pick(l)).collect::<Vec<_>>());
-                METRICS.map(|m| Spread::of(&[metrics.get(m)]))
+                spread(Metrics::of(
+                    &lookups.iter().map(|l| pick(l)).collect::<Vec<_>>(),
+                ))
             };
             let mut push = |ranker, values| {
                 cells.push(Cell {
                     ranker,
                     slice,
+                    style,
                     len,
                     n,
                     values,
@@ -898,6 +1014,7 @@ fn cells_of(ranks: &Ranks, seeds: usize) -> Vec<Cell> {
             };
             push(Ranker::Recency, unseeded(|l| l.recency));
             push(Ranker::FzfScored, unseeded(|l| l.fzf_scored));
+            push(Ranker::Fzf, unseeded(|l| l.fzf));
             push(Ranker::Heuristic, unseeded(|l| l.heuristic));
             let per_seed: Vec<Metrics> = (0..seeds)
                 .map(|s| Metrics::of(&lookups.iter().map(|l| l.model[s]).collect::<Vec<_>>()))
@@ -907,6 +1024,20 @@ fn cells_of(ranks: &Ranks, seeds: usize) -> Vec<Cell> {
                 Spread::of(&values)
             });
             push(Ranker::Model, values);
+            // In stage 2 counts as rank 1: all four metrics are the recall.
+            let in_stage2 = |l: &&Lookup| {
+                if (l.heuristic as usize) <= CMD_STAGE2_K {
+                    1
+                } else {
+                    NOT_MATCHED
+                }
+            };
+            push(
+                Ranker::Stage1Recall,
+                spread(Metrics::of(
+                    &lookups.iter().map(in_stage2).collect::<Vec<_>>(),
+                )),
+            );
         }
     }
     cells
@@ -1170,7 +1301,15 @@ fn markdown(
             continue;
         }
         for slice in SLICES {
-            write_slice_table(&mut md, label, result, slice);
+            write_slice_table(&mut md, label, result, slice, QueryStyle::Prefix);
+        }
+        let _ = writeln!(
+            md,
+            "\nFragment queries: the first characters of a word inside the command \
+             (section 5.2), information beside the prefix headline."
+        );
+        for slice in [Slice::All, Slice::Gt10min, Slice::OtherDir] {
+            write_slice_table(&mut md, label, result, slice, QueryStyle::Fragment);
         }
     }
     let _ = writeln!(md, "\n## Verdicts ({label}, holdout)\n");
@@ -1184,15 +1323,22 @@ fn markdown(
     md
 }
 
-fn write_slice_table(md: &mut String, label: &str, result: &SplitResult, slice: Slice) {
+fn write_slice_table(
+    md: &mut String,
+    label: &str,
+    result: &SplitResult,
+    slice: Slice,
+    style: QueryStyle,
+) {
     let cell = |ranker: Ranker, len: usize| {
         result
             .cells
             .iter()
-            .find(|c| c.ranker == ranker && c.slice == slice && c.len == len)
+            .find(|c| c.ranker == ranker && c.slice == slice && c.style == style && c.len == len)
             .expect("every cell is computed")
     };
-    let ns: Vec<String> = LENGTHS
+    let lengths = style.lengths();
+    let ns: Vec<String> = lengths
         .iter()
         .map(|&len| {
             let n = cell(Ranker::Recency, len).n;
@@ -1202,13 +1348,14 @@ fn write_slice_table(md: &mut String, label: &str, result: &SplitResult, slice: 
         .collect();
     let _ = writeln!(
         md,
-        "\n### slice {} ({label}; n by length: {})\n",
+        "\n### slice {}, {} queries ({label}; n by length: {})\n",
         slice.key(),
+        style.key(),
         ns.join(", ")
     );
     let mut header = String::from("| ranker |");
     let mut rule = String::from("|---|");
-    for len in LENGTHS {
+    for len in lengths {
         for metric in METRICS {
             let _ = write!(header, " L{len} {} |", metric.key());
             rule.push_str("---|");
@@ -1218,11 +1365,13 @@ fn write_slice_table(md: &mut String, label: &str, result: &SplitResult, slice: 
     for ranker in RANKERS {
         let name = match ranker {
             Ranker::Model => format!("model ({} seeds)", result.seeds),
-            Ranker::FzfScored => "fzf_scored (info)".into(),
+            Ranker::FzfScored => "fzf_scored (skim approximation, info)".into(),
+            Ranker::Fzf => "fzf (--scheme=history, info)".into(),
+            Ranker::Heuristic => "heuristic (cold start)".into(),
             _ => ranker.key().into(),
         };
         let mut row = format!("| {name} |");
-        for len in LENGTHS {
+        for len in lengths {
             for metric in METRICS {
                 let _ = write!(row, " {} |", fmt3(cell(ranker, len).mean(metric)));
             }
@@ -1230,7 +1379,7 @@ fn write_slice_table(md: &mut String, label: &str, result: &SplitResult, slice: 
         let _ = writeln!(md, "{row}");
     }
     let mut row = String::from("| model +- sd |");
-    for len in LENGTHS {
+    for len in lengths {
         for metric in METRICS {
             let _ = write!(
                 row,
@@ -1240,17 +1389,26 @@ fn write_slice_table(md: &mut String, label: &str, result: &SplitResult, slice: 
         }
     }
     let _ = writeln!(md, "{row}");
+    for info in INFO_ROWS {
+        let mut row = format!("| {} (info) |", info.key());
+        for len in lengths {
+            for metric in METRICS {
+                let _ = write!(row, " {} |", fmt3(cell(info, len).mean(metric)));
+            }
+        }
+        let _ = writeln!(md, "{row}");
+    }
 }
 
 fn write_fold_table(md: &mut String, label: &str, results: &[SplitResult]) {
     let _ = writeln!(md, "\n## Folds: top-1 at length 2 ({label})\n");
     let _ = writeln!(
         md,
-        "| split | slice | n | recency | fzf_scored | heuristic | model mean | model sd |\n|---|---|---|---|---|---|---|---|"
+        "| split | slice | n | recency | fzf_scored | fzf | heuristic | model mean | model sd |\n|---|---|---|---|---|---|---|---|---|"
     );
     for result in results {
         if result.skipped.is_some() {
-            let _ = writeln!(md, "| {} | - | skipped | | | | | |", result.split.name);
+            let _ = writeln!(md, "| {} | - | skipped | | | | | | |", result.split.name);
             continue;
         }
         for slice in [Slice::All, Slice::Gt10min] {
@@ -1258,18 +1416,24 @@ fn write_fold_table(md: &mut String, label: &str, results: &[SplitResult]) {
                 result
                     .cells
                     .iter()
-                    .find(|c| c.ranker == ranker && c.slice == slice && c.len == 2)
+                    .find(|c| {
+                        c.ranker == ranker
+                            && c.slice == slice
+                            && c.style == QueryStyle::Prefix
+                            && c.len == 2
+                    })
                     .expect("every cell is computed")
             };
             let model = cell(Ranker::Model).values[Metric::Top1 as usize];
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 result.split.name,
                 slice.key(),
                 thousands(cell(Ranker::Recency).n),
                 fmt3(cell(Ranker::Recency).mean(Metric::Top1)),
                 fmt3(cell(Ranker::FzfScored).mean(Metric::Top1)),
+                fmt3(cell(Ranker::Fzf).mean(Metric::Top1)),
                 fmt3(cell(Ranker::Heuristic).mean(Metric::Top1)),
                 fmt3(model.mean),
                 fmt3(model.sd)

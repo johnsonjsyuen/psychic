@@ -355,22 +355,32 @@ For each split, with `t_s` its training cut:
 4. Walk the test window in timeline order. For each run, before applying it:
    - not reachable: count it in `unreachable` (by source) and continue to "apply";
    - `replayer.follows_pick(run)` holds: never sampled (the pick that caused it is already in the index); continue to "apply";
-   - sampled: for `len` in 0, 1, 2, 3 (skipping a `len` greater than the text's
-     character count): `query` = first `len` characters of the run's command
-     text; `ctx = replayer.context(run.started_at, run.cwd, run.repo_root, Some(session))`;
+   - sampled: for each (style, `len`) of the table below (skipping one the text
+     is too short for): `query` as the table says;
+     `ctx = replayer.context(run.started_at, run.cwd, run.repo_root, Some(session))`;
      candidates = **all** commands in `replayer.index` that match `query`:
      `filter_candidates(.., Scope::All, None)` of [02 section 6.3](02-browse.md#63-filter); rank them with every ranker of 5.3; record the 1-based rank of
      the run's command per ranker (and per seed for `model`);
    - apply: `replayer.apply_run(run)`; events in the window are applied with
      `apply_event` / `commit_pick`. The models stay fixed while the index moves on.
 
+| Style | Lengths | `query` | Role |
+|---|---|---|---|
+| `prefix` | 0, 1, 2, 3 | The first `len` characters of the command text | **Headline**; every verdict reads it (continuity with the first results) |
+| `fragment` | 1, 2, 3, 5 | `fragment_query(text, len, splitmix64(run.id ^ FRAGMENT_SALT))`: the words after the first (split on whitespace), each from its first letter or digit (words without one are dropped); the hash picks one word, the same at every length; its first `len` characters. None (the lookup is skipped at that length) when the text has one word or the chosen word is shorter than `len` | Information: what a user types who remembers a word from the middle of the command. A prefix query flatters any scorer that rewards a match at the start of the text (Skim's, which `fzf_scored` uses) |
+
+A fragment is a substring of the target, so the target always matches it.
+The fragment style was added on 2026-11-17; before it every query was a
+prefix.
+
 ### 5.3 Rankers
 
 | Key | Order | Seeds | Role |
 |---|---|---|---|
 | `recency` | `last_run_at` descending, then `db_id` descending | none | **The baseline of R1-R3** ("fzf: newest first among fuzzy matches") |
-| `fzf_scored` | `fuzzy_score` descending, then `last_run_at` descending, then `db_id` descending | none | Information only: what fzf does when it sorts by match score with recency as tie-break (ADR-17) |
-| `heuristic` | `rank_commands(.., head = usize::MAX, model = None)` | none | R3 |
+| `fzf_scored` | `fuzzy_score` descending, then `last_run_at` descending, then `db_id` descending | none | Information only: the first approximation of fzf, built on Skim's score (ADR-17). Skim gives the first character of the text 16 more than a later word start, which the prefix style always rewards |
+| `fzf` | `fzf_score(FzfQuery::new(query), text)` descending ([02 section 7.1](02-browse.md#71-fzfs-score-srccmdfzfrs)), then as `recency` | none | Information: fzf's own Ctrl-R order (`--scheme=history`), computed in the benchmark from the score alone. Without a model `heuristic` is this order, so the two rows are equal; the row stays so that a later change to the heuristic is measured against it |
+| `heuristic` | `rank_commands(.., head = usize::MAX, model = None)` | none | R3 (the cold start) |
 | `model` | `rank_commands(.., head = usize::MAX, Some(&model_s))` | per seed | R1, R2 |
 
 ### 5.4 Slices
@@ -394,9 +404,22 @@ Per (split, ranker, slice, query length): `n`, `top1`, `top3`, `top10`
 (share of lookups with rank <= 1, 3, 10) and `mrr` (mean of `1 / rank`). For
 `model`: mean, sample standard deviation, min and max over seeds.
 
+Two information rows go with every table:
+
+| Row | Computed as | Why |
+|---|---|---|
+| `stage1_recall` | Share of lookups whose target the heuristic puts within its first `CMD_STAGE2_K` rows (all four metric columns hold it) | The model only re-orders those rows; a target outside them keeps its heuristic rank. B8 measures agreement of top-10s, not this |
+| Bayes ceiling (synthetic corpora only, not in the JSON) | `corpus::ceiling` (an ignored test, run by hand): re-simulate the generator with the corpus's arguments; for each reused run of the last 20% (every `stride`-th, about 2,000) compute the generator's exact probability of every command being next from the state it chose from; rank the chosen command among the commands with the same first `len` characters by that probability (equal probabilities share their places) | The best any ranker could do on the prefix style: it knows the generator. The gap between the model and it is what remains to learn; the gap between it and 1 is irreducible |
+
+A third row, the share of lookups whose target has exactly the features of
+another stage-2 row (a ceiling for any function of the features), was
+measured once on 2026-11-17 and removed: every stage-2 row of every lookup
+had distinct features (`log_seconds_since_last_run` alone separates them),
+so it was 1.000 everywhere and said nothing.
+
 | Verdict | Computed as | Reported |
 |---|---|---|
-| R1 | `model.top1.mean - recency.top1` on (`holdout`, `gt10min`, length 2) | value, PASS/FAIL, and `n` |
+| R1 | `model.top1.mean - recency.top1` on (`holdout`, `gt10min`, prefix length 2) | value, PASS/FAIL, and `n` |
 | R2 | min over the 8 headline cells of `model.top1.mean - recency.top1` | value, the worst cell, PASS/FAIL |
 | R3 | min over (`all`, `gt10min`, `other_dir`) x 4 lengths x 4 metrics of `heuristic - recency` | value, the worst cell, PASS/FAIL |
 
@@ -428,7 +451,8 @@ model (5 seeds)           0.19   0.31      0.36   0.47      0.55   0.64      0.6
   +- sd                   0.011  0.008     0.012  0.009     0.010  0.008     0.009  0.007
 ```
 
-(the numbers above show the format only), then the three verdict lines, then
+(the numbers above show the format only), then the same tables for the `fragment` style for `all`,
+`gt10min` and `other_dir`, then the three verdict lines, then
 with `--folds` a compact per-fold table of `top1` at length 2 for `all` and
 `gt10min`, then the reference line `file search on its own benchmark: top-1
 0.7960, MRR 0.8656 (different task; see 00-blueprint.md section 2)`.
@@ -441,7 +465,7 @@ with `--folds` a compact per-fold table of `top1` at length 2 for `all` and
   "stats": { "commands": 0, "runs": 0, "span_days": 0.0, "...": 0 },
   "unreachable": { "all": 0.0, "hook": 0.0, "import": 0.0 },
   "splits": { "holdout": { "seeds": 5, "cells": [
-      { "ranker": "model", "slice": "gt10min", "len": 2, "n": 1412,
+      { "ranker": "model", "slice": "gt10min", "style": "prefix", "len": 2, "n": 1412,
         "top1": {"mean": 0.0, "sd": 0.0, "min": 0.0, "max": 0.0}, "top3": {}, "top10": {}, "mrr": {} } ] } },
   "verdicts": { "R1": {"value": 0.0, "status": "PASS"}, "R2": {"value": 0.0, "cell": "all/len0", "status": "PASS"},
                 "R3": {"value": 0.0, "cell": "...", "status": "PASS"} } }
@@ -693,11 +717,10 @@ Work top to bottom; within a row try the listed values one at a time.
 
 | # | Candidate | Constant(s) | Values to try | Target |
 |---|---|---|---|---|
-| 1 | Heuristic weights | `CMD_H_W_FUZZY` | 0.3, 0.6, 1.0 | R3 at lengths 1-3 |
-| 1 | | `CMD_H_W_DIR`, `CMD_H_W_REPO` | (0.3, 0.1), (0.5, 0.2), (0.8, 0.3) | R3 on `other_dir`, `all` length 0 |
-| 1 | | `CMD_H_RECENCY_SCALE_SECS` | 900, 3600, 14400 | R3 on `all` length 0 |
+| 1 | Cold start (done 2026-11-17) | The heuristic is fzf's order ([02 section 7](02-browse.md#7-heuristic-ranking)); the weights of this row are gone. A psychic signal (frequency, runs in 30 days, directory share, directory recency, a shorter recency scale) may be added only as a tie-break inside equal fzf scores, and only if it is not below pure fzf on any cell of `all`/`gt10min`/`other_dir` x lengths x 4 metrics, both query styles, on every corpus. Measured: every one was below somewhere (results.md) | - | R3, and pure fzf on every cell |
 | 2 | Stage-2 size | `CMD_STAGE2_K` | 500, 1000, 2000, 4000 | B1, B8, R1 |
-| 3 | Negative sampler mix | `CMD_TRAIN_RECENT_NEGATIVES` / `CMD_TRAIN_RANDOM_NEGATIVES` | 30/0, 20/10, 15/15, 5/25 | R1, R2 |
+| 3 | Negative sampler mix (done 2026-11-17: 0/30) | `CMD_TRAIN_RECENT_NEGATIVES` / `CMD_TRAIN_RANDOM_NEGATIVES` | 15/15, 0/30; also "hard" (8 of the 15 recent by best fzf score), rejected | R1, R2, `all` length 0 top-10 |
+| 4 | Query style mix (done 2026-11-17) | `CMD_TRAIN_FRAGMENT_SHARE` | 0, 25, 50 | Prefix lengths 1-3 against the fragment style |
 | 4 | Synthetic-query mix | `CMD_TRAIN_QLEN_MIX` | [40,20,20,20], [25,25,25,25], [10,30,30,30], [70,10,10,10] | R1 at length 2 against R2 at length 0 |
 | 5 | Group weights and blend | `CMD_IMPORT_WEIGHT` | 0.1, 0.3, 1.0 | model minus recency top-1 on the `import` slice (reported; must stay >= -0.01) |
 | 5 | | `CMD_PICK_WEIGHT` | 1, 4, 10 (only once real picks exist) | R1 |
@@ -748,14 +771,17 @@ Work top to bottom; within a row try the listed values one at a time.
 | TC-N-08 | verdicts | Cells where model - recency is +0.12 on the R1 cell (`n` 300) and -0.02 on `all/len0` | R1 PASS, R2 FAIL naming `all/len0` | R1 cell with `n` 150 -> `INCONCLUSIVE` |
 | TC-N-09 (in `bench.rs`, so `cargo test cmd::bench` runs it) | data-dir guard | `run_bench(default dir, true, ..)`, `run_bench(tmp, false, ..)` | Both `Err` with the guard message | `run_bench(tmp, true, Stats)` on an empty dir succeeds and prints zeros |
 | TC-N-10 | render purity (B5), in `src/cmd/render.rs` | `include_str!("render.rs")` with the `#[cfg(test)]` module cut off | Contains none of `rusqlite`, `std::fs`, `std::env`, `Instant::now`, `Timestamp::now`, `std::process`, `log::` | - |
+| TC-N-16 | fragment queries, verdict scope | `fragment_query("git commit --amend 'fix it'", len, pick)`; a fragment cell far below the baseline | Words `commit`, `amend`, `fix`, `it` (from the first letter or digit); the same word at every length; none past the word's length; `pick` wraps; verdicts unchanged by the fragment cell | One word, or no letter or digit -> none; characters, not bytes |
+| TC-N-17 | `fzf` baseline | `git log` (10), `tig git` (30), `grep -i` (40), `ls` (50); query `gi` | Ranks 2, 1, 3, 4 (equal word-start scores newest first, the scattered match, then the non-match) | Target absent -> `NOT_MATCHED`; empty query -> newest first |
+| TC-N-18 | Bayes ceiling (`src/cmd/corpus/ceiling.rs`) | `zipf_pmf` against 200,000 draws of `zipf_s` for (n, s) in (1, 1), (7, 1), (50, 1.5), (300, 1.8), (20, 0); the generator's distribution over 2,800 reused runs of interactive 500 / 20,000 | Each probability within 0.005 of the observed frequency; every distribution sums to 1; the mean probability of the chosen command equals the mean sum of squared probabilities within 0.01 (both estimate the same quantity only if the distribution is the generator's) | - |
 | TC-N-11 | baselines | 3 candidates with (`last_run_at`, `fuzzy`) = (10, 5), (30, 5), (20, 9) | `recency` order: 2nd, 3rd, 1st; `fzf_scored` order: 3rd, 2nd, 1st | equal `last_run_at` -> higher `db_id` first |
 
 ### 11.2 Integration tests
 
 | ID | Flow | Setup | Verification | Teardown |
 |---|---|---|---|---|
-| IT-N-01 | Relevance end to end | Temp data dir; `generate(300, 6000, seed 3, anchor fixed)`; `relevance --seeds 2 --max-test-runs 200 --json out.json` | Exit 0; JSON parses; has `splits.holdout.cells` for 4 rankers x 4 lengths x slice `all`; for `recency` and `heuristic` `sd == 0`; `unreachable.all` between 0 and 1; `verdicts` has R1, R2, R3; a second run produces a byte-identical JSON apart from `date` | `remove_dir_all` |
-| IT-N-02 | Replay state equals a fresh load | Same data; a `Replayer` with every run applied versus `CommandIndex::load` at `now` = newest run + 1 for one (cwd, repo, session) | `rank_commands(.., usize::MAX, None)` over all commands returns the same order of `db_id`s from both, for queries `""` and `g` | `remove_dir_all` |
+| IT-N-01 | Relevance end to end | Temp data dir; `generate(300, 6000, seed 3, anchor fixed)`; `relevance --seeds 2 --max-test-runs 200 --json out.json` | Exit 0; JSON parses; has `splits.holdout.cells` for 5 rankers x 4 lengths x slice `all`, and fragment and `stage1_recall` cells; for every unseeded ranker `sd == 0`; `unreachable.all` between 0 and 1; `verdicts` has R1, R2, R3; a second run produces a byte-identical JSON apart from `date` | `remove_dir_all` |
+| IT-N-02 | Replay state equals a fresh load | Same data; a `Replayer` with every run applied versus `CommandIndex::load` at `now` = newest run + 1 for one (cwd, repo, session) | `rank_commands(.., usize::MAX, None)` over all commands returns the same order of `db_id`s from both, for queries `""` and `g`; the `CMD_RECENCY_RANK_CAP` newest matching commands are the same from serving's candidates (both fill paths) and from `train::newest_matching`; every feature per command is equal | `remove_dir_all` |
 | IT-N-03 | Agent extraction | Temp projects dir: `p1/s1.jsonl` (the TC-N-05 fixture), `p1/s1/subagents/agent-a9.jsonl` (two uses with `agentId` `a9`, timed between the main file's first two), a non-JSONL file | Runs from both files; `shell_session` values `agent:s1` and `agent:s1:a9`; rows in global time order with `prev_command_id` set inside one session only; `source = 'hook'`; the fixture files' mtimes unchanged | `remove_dir_all` |
 | IT-N-04 | Two-stage check | IT-N-01's data plus `retrain`; `twostage --queries 40` with `CMD_STAGE2_K` larger than the corpus | Overlap 1.0 and top-1 agreement 1.0 (no cut applies); exit 0 | `remove_dir_all` |
 | IT-N-05 | Real data dir is never written | Record size and mtime of every file in `get_default_data_dir()` (skip if it does not exist); run IT-N-01's commands | Unchanged afterwards | none |

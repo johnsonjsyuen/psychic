@@ -178,7 +178,7 @@ fn tc_l_10_a_first_ever_run_makes_no_group() {
 }
 
 #[test]
-fn tc_l_11_negatives_are_recent_then_random_and_rows_are_in_idx_order() {
+fn tc_l_11_negatives_are_random_and_rows_are_in_idx_order() {
     let commands = git_commands(40);
     let mut replayer = Replayer::new(&commands);
     for id in 1..=40 {
@@ -197,13 +197,13 @@ fn tc_l_11_negatives_are_recent_then_random_and_rows_are_in_idx_order() {
     let labels: f32 = group.rows.iter().map(|row| row.label).sum();
     assert_eq!(labels, 1.0);
     assert_eq!(group.rows[0].label, 1.0, "command 1 is idx 0");
-    for recent in 25..=39 {
-        assert!(idxs.contains(&recent), "the 15 most recent: {recent}");
-    }
-    assert_eq!(
-        idxs.iter().filter(|&&idx| (1..25).contains(&idx)).count(),
-        15,
-        "15 random others"
+    // Since 2026-11-17 no fixed recent negatives (CMD_TRAIN_RECENT_NEGATIVES
+    // is 0): 30 distinct random others, not only the newest.
+    assert_eq!(CMD_TRAIN_RECENT_NEGATIVES, 0);
+    assert_eq!(group.rows.len(), 1 + CMD_TRAIN_RANDOM_NEGATIVES);
+    assert!(
+        idxs.iter().filter(|&&idx| (1..25).contains(&idx)).count() > 5,
+        "older commands are drawn too: {idxs:?}"
     );
     assert_eq!(group.weight, CMD_HOOK_WEIGHT);
     assert_eq!(group.timestamp, T0 + 100);
@@ -399,7 +399,8 @@ fn tc_l_16_the_stats_file_round_trips() {
     assert_eq!(stats.trained_at_unix, T0);
     assert_eq!(stats.feature_names, command_feature_names());
     assert_eq!(
-        stats.feature_gain[0].feature, "argument_count",
+        stats.feature_gain[0].feature,
+        *command_feature_names().last().unwrap(),
         "gain descending"
     );
     assert_eq!(stats.feature_gain.len(), COMMAND_FEATURE_REGISTRY.len());
@@ -421,7 +422,10 @@ fn tc_l_18_a_run_right_after_its_pick_in_the_same_shell_is_not_a_group() {
         run(5, a, t + 400),
     ];
     let events = vec![pick(1, t, a, "g", "tui", "s")];
-    let input = input(git_commands(2), runs, events);
+    // The same two words in both texts, so any prefix or fragment query
+    // of one matches the other: every eligible run has a negative.
+    let commands = vec![command(a, "git log"), command(b, "log git")];
+    let input = input(commands, runs, events);
     assert_eq!(eligible_runs(&input, None), 2);
     let built = build_groups(&input, &options(8000));
     let stamps: Vec<i64> = built.groups.iter().map(|g| g.timestamp).collect();
@@ -717,8 +721,16 @@ fn it_l_01_serving_and_replay_compute_the_same_features() {
             } else {
                 matcher.fuzzy_match(&entry.text, query).unwrap_or(0)
             };
-            let a = feature_row(&served, &served_ctx, query, served_idx, score);
-            let b = feature_row(&replayer.index, &replay_ctx, query, replay_idx, score);
+            let newest = newest_matching(&replayer, &matcher, query);
+            let a = feature_row(&served, &served_ctx, query, &newest, served_idx, score);
+            let b = feature_row(
+                &replayer.index,
+                &replay_ctx,
+                query,
+                &newest,
+                replay_idx,
+                score,
+            );
             assert!(same_bits(&a, &b), "{query:?}: {a:?} != {b:?}");
             compared += 1;
         }
@@ -897,6 +909,58 @@ fn the_retrain_is_due_after_the_interval_and_without_a_fresh_lock() {
 }
 
 #[test]
+fn a_model_with_an_older_feature_list_is_refused_and_retrained_at_once() {
+    let dir = TempDir::new("old-features");
+    let now = SystemTime::now();
+    // A model of the release before `fzf_score` and `recency_rank`: the
+    // registry's first 23 names.
+    let mut stats = sample_stats();
+    stats.feature_names.truncate(23);
+    std::fs::write(
+        dir.0.join(STATS_FILE),
+        serde_json::to_string(&stats).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.0.join(MODEL_FILE), "tree\nversion=v4\n").unwrap();
+    assert!(
+        crate::cmd::model::CmdModel::load(&dir.0).is_none(),
+        "refused: the heuristic ranks"
+    );
+    // An attempt an hour's interval would normally block, made before the
+    // model was written: the retrain is due anyway.
+    let attempt = dir.0.join(ATTEMPT_FILE);
+    std::fs::write(&attempt, "1\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&attempt)
+        .unwrap()
+        .set_modified(now - Duration::from_secs(60))
+        .unwrap();
+    assert!(retrain_due(&dir.0, now));
+    // An attempt after it (one that found too little to train) backs off.
+    std::fs::File::options()
+        .write(true)
+        .open(&attempt)
+        .unwrap()
+        .set_modified(now + Duration::from_secs(1))
+        .unwrap();
+    assert!(!retrain_due(&dir.0, now + Duration::from_secs(2)));
+    // A model with the current list waits for the interval as before.
+    std::fs::write(
+        dir.0.join(STATS_FILE),
+        serde_json::to_string(&sample_stats()).unwrap(),
+    )
+    .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&attempt)
+        .unwrap()
+        .set_modified(now - Duration::from_secs(60))
+        .unwrap();
+    assert!(!retrain_due(&dir.0, now));
+}
+
+#[test]
 fn e_l_09_a_failed_spawn_is_logged_and_ignored() {
     let dir = TempDir::new("spawn");
     let now = SystemTime::now();
@@ -965,4 +1029,32 @@ fn e_l_15_a_model_of_deleted_history_is_not_left_behind() {
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(".pending"))
         .collect();
     assert!(leftovers.is_empty(), "no pending file is left");
+}
+
+#[test]
+fn a_quarter_of_non_empty_training_queries_are_fragments() {
+    let text = "git commit --amend";
+    let (mut non_empty, mut fragments) = (0, 0);
+    for run_id in 0..4000 {
+        let query = training_query(42, run_id, text);
+        let length = query_length(42, run_id);
+        assert_eq!(query.chars().count(), length);
+        if length > 0 {
+            non_empty += 1;
+            if !text.starts_with(&query) {
+                fragments += 1;
+                assert!(
+                    ["commit", "amend"].iter().any(|w| w.starts_with(&query)),
+                    "a later word's start: {query}"
+                );
+            }
+        }
+    }
+    let share = f64::from(fragments) / f64::from(non_empty);
+    assert!(
+        (share - f64::from(CMD_TRAIN_FRAGMENT_SHARE) / 100.0).abs() < 0.03,
+        "{share}"
+    );
+    // A one-word text has no fragment: always the prefix.
+    assert!((0..200).all(|id| "make".starts_with(&training_query(42, id, "make"))));
 }

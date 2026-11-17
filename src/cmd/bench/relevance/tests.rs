@@ -9,6 +9,7 @@ use super::super::super::store::test_support::hook_run;
 use super::super::super::store::{CommandRecord, EventRecord, RunRecord};
 use super::super::super::train::test_support::{FIXTURE_ANCHOR, TempDir};
 use super::super::super::train::{build_training_set, replay};
+use super::super::super::tuning::CMD_RECENCY_RANK_CAP;
 use super::super::{BenchCommand, BenchEnv};
 use super::*;
 
@@ -204,6 +205,7 @@ fn cell(ranker: Ranker, slice: Slice, len: usize, n: usize, top1: f64) -> Cell {
     Cell {
         ranker,
         slice,
+        style: QueryStyle::Prefix,
         len,
         n,
         values: [v, v, v, v],
@@ -281,6 +283,82 @@ fn tc_n_08_verdicts() {
     let failed = r3(0.498);
     assert_eq!(failed.status, Status::Fail);
     assert_eq!(failed.cell, "other_dir/len3/top1");
+}
+
+#[test]
+fn verdicts_read_prefix_cells_only() {
+    // A fragment cell far below the baseline does not move R2 or R3.
+    let mut cells = grid(300, &[cell(Ranker::Model, Slice::Gt10min, 2, 300, 0.62)]);
+    for ranker in [Ranker::Model, Ranker::Heuristic] {
+        cells.insert(
+            0,
+            Cell {
+                style: QueryStyle::Fragment,
+                ..cell(ranker, Slice::All, 2, 300, 0.0)
+            },
+        );
+    }
+    let v = verdicts(&cells, 5);
+    assert_eq!(v.r2.status, Status::Pass);
+    assert_eq!(v.r3.status, Status::Pass);
+}
+
+// --- TC-N-16: fragment queries ---------------------------
+
+#[test]
+fn tc_n_16_fragment_queries_start_a_later_word() {
+    let text = "git commit --amend 'fix it'";
+    // Words after the first, from their first letter or digit.
+    let words = ["commit", "amend", "fix", "it"];
+    for pick in 0..4u64 {
+        let word = words[pick as usize];
+        assert_eq!(fragment_query(text, 1, pick).unwrap(), &word[..1]);
+        assert_eq!(fragment_query(text, 2, pick).unwrap(), &word[..2]);
+        // The same word at every length; too short a word gives none.
+        assert_eq!(
+            fragment_query(text, 5, pick),
+            (word.len() >= 5).then(|| word[..5].to_string())
+        );
+    }
+    assert_eq!(fragment_query(text, 2, 4).unwrap(), "co", "pick wraps");
+    assert_eq!(fragment_query("ls", 1, 0), None, "one word");
+    assert_eq!(fragment_query("ls | -", 1, 0), None, "no letter or digit");
+    assert_eq!(
+        fragment_query("echo héllo", 2, 0).unwrap(),
+        "hé",
+        "characters"
+    );
+    assert_eq!(make_query(QueryStyle::Prefix, "ab", 3, 1), None);
+    assert_eq!(make_query(QueryStyle::Prefix, "abc", 0, 1).unwrap(), "");
+}
+
+#[test]
+fn the_fzf_baseline_orders_by_fzf_score_then_newest() {
+    // "gi": word starts in "git log" and "tig git" (equal under the history
+    // scheme), scattered in "grep -i"; "ls" does not match at all.
+    let mut index = CommandIndex::default();
+    let texts = [
+        ("git log", 10),
+        ("tig git", 30),
+        ("grep -i", 40),
+        ("ls", 50),
+    ];
+    let mut candidates = Vec::new();
+    for (i, &(text, last_run_at)) in texts.iter().enumerate() {
+        let idx = index.add_command(i as i64 + 1, text);
+        index.record_run(idx, last_run_at, None, None, Some(0), None);
+        candidates.push(CommandCandidate {
+            idx,
+            fuzzy_score: 0,
+        });
+    }
+    let ranks: Vec<u32> = (0..4)
+        .map(|t| fzf_rank(&index, &candidates, "gi", t))
+        .collect();
+    assert_eq!(ranks, [2, 1, 3, 4]);
+    assert_eq!(fzf_rank(&index, &candidates[..2], "gi", 3), NOT_MATCHED);
+    // No query: newest first.
+    assert_eq!(fzf_rank(&index, &candidates, "", 3), 1);
 }
 
 // --- TC-N-11: baselines -----------------------------------------------------------
@@ -436,17 +514,35 @@ fn it_n_01_and_05_relevance_end_to_end_leaves_the_real_data_dir_alone() {
     assert!(first.contains("## Verdicts"));
     let value: Value = serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
     let cells = value["splits"]["holdout"]["cells"].as_array().unwrap();
-    for ranker in ["recency", "fzf_scored", "heuristic", "model"] {
+    for ranker in ["recency", "fzf_scored", "fzf", "heuristic", "model"] {
         for len in 0..4 {
             let cell = cells
                 .iter()
                 .find(|c| c["ranker"] == ranker && c["slice"] == "all" && c["len"] == len)
                 .unwrap_or_else(|| panic!("{ranker} len {len}"));
             assert!(cell["n"].as_u64().unwrap() > 0);
-            if ranker == "recency" || ranker == "heuristic" {
+            if ranker != "model" {
                 assert_eq!(cell["top1"]["sd"], 0.0);
             }
         }
+    }
+    // The fragment style and the information rows are there too.
+    for (ranker, style, len) in [
+        ("model", "fragment", 5),
+        ("stage1_recall", "prefix", 2),
+        ("fzf", "fragment", 1),
+    ] {
+        let cell = cells
+            .iter()
+            .find(|c| {
+                c["ranker"] == ranker
+                    && c["slice"] == "all"
+                    && c["style"] == style
+                    && c["len"] == len
+            })
+            .unwrap_or_else(|| panic!("{ranker} {style} len {len}"));
+        let top1 = cell["top1"]["mean"].as_f64().unwrap();
+        assert!((0.0..=1.0).contains(&top1), "{ranker}: {top1}");
     }
     let unreachable = value["unreachable"]["all"].as_f64().unwrap();
     assert!((0.0..=1.0).contains(&unreachable));
@@ -544,9 +640,32 @@ fn it_n_02_replay_state_equals_a_fresh_load() {
         assert!(from_replay.len() > 10, "query {query:?} matches");
         assert_eq!(from_replay, order(&loaded, &loaded_ctx), "query {query:?}");
 
+        // The newest matching commands as training finds them (a walk of
+        // the replay's recency order) equal what serving computes from its
+        // candidates.
+        let newest = |index: &CommandIndex, ctx: &RankContext| {
+            let candidates = filter_candidates(index, ctx, &matcher, query, Scope::All, None);
+            crate::cmd::rank::newest_of(
+                candidates.iter().map(|c| {
+                    let e = &index.entries[c.idx as usize];
+                    (e.last_run_at, e.db_id)
+                }),
+                CMD_RECENCY_RANK_CAP,
+            )
+        };
+        let served = newest(&loaded, &loaded_ctx);
+        assert_eq!(served.len(), CMD_RECENCY_RANK_CAP);
+        assert_eq!(newest(&replayer.index, &replay_ctx), served);
+        assert_eq!(
+            crate::cmd::train::newest_matching(&replayer, &matcher, query),
+            served,
+            "query {query:?}"
+        );
+
         // Every feature the model reads, per command, is the same too.
         let features = |index: &CommandIndex, ctx: &RankContext| -> Vec<(i64, Vec<f64>)> {
             let query_lower = query.to_lowercase();
+            let newest = newest(index, ctx);
             let mut rows: Vec<(i64, Vec<f64>)> =
                 filter_candidates(index, ctx, &matcher, query, Scope::All, None)
                     .iter()
@@ -558,6 +677,14 @@ fn it_n_02_replay_state_equals_a_fresh_load() {
                             idx: c.idx,
                             entry,
                             fuzzy_score: c.fuzzy_score,
+                            fzf_score: crate::cmd::rank::fzf_score(
+                                &crate::cmd::fzf::FzfQuery::new(query),
+                                &entry.text,
+                            ),
+                            recency_rank: crate::cmd::rank::recency_rank(
+                                &newest,
+                                (entry.last_run_at, entry.db_id),
+                            ),
                             index,
                             ctx,
                         };

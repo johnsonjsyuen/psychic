@@ -290,10 +290,8 @@ fn draw_debug(f: &mut Frame, area: Rect, app: &CmdApp) {
         let parts = &row.heuristic_parts;
         lines.push(field("score", format!("{:.4}", row.score)));
         lines.push(field("heuristic", format!("{:.4}", row.heuristic)));
+        lines.push(field("  fzf", parts.fzf.to_string()));
         lines.push(field("  recency", format!("{:.4}", parts.recency)));
-        lines.push(field("  dir", format!("{:.4}", parts.dir)));
-        lines.push(field("  repo", format!("{:.4}", parts.repo)));
-        lines.push(field("  fuzzy", format!("{:.4}", parts.fuzzy)));
         lines.push(field("ml_score", optional(row.ml_score, 4)));
         lines.push(field("ml_weight", format!("{:.2}", row.ml_weight)));
         lines.push(field("fuzzy_score", row.fuzzy_score.to_string()));

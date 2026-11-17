@@ -69,9 +69,11 @@ Appended to `src/cmd/tuning.rs`. All are tuning candidates
 | `CMD_TRAIN_MAX_RUN_GROUPS` | `usize` | `8000` | Only the newest this-many eligible runs produce groups |
 | `CMD_TRAIN_MIN_GROUPS` | `usize` | `50` | Below this many groups nothing is trained |
 | `CMD_TRAIN_QLEN_MIX` | `[u32; 4]` | `[40, 20, 20, 20]` | Percent of run groups with synthetic query length 0, 1, 2, 3 |
-| `CMD_TRAIN_RECENT_NEGATIVES` | `usize` | `15` | Negatives taken from the most recently run matching commands |
+| `CMD_TRAIN_FRAGMENT_SHARE` | `u32` | `25` | Percent of run groups with a non-empty query whose query is a fragment of a later word (section 5.2) rather than a prefix |
+| `CMD_TRAIN_RECENT_NEGATIVES` | `usize` | `0` (was 15) | Negatives taken from the most recently run matching commands. 0 since 2026-11-17: fixed newest negatives skew every recency feature (section 5.2) |
 | `CMD_TRAIN_RECENT_SCAN` | `usize` | `500` | Distinct recent commands examined to find them |
-| `CMD_TRAIN_RANDOM_NEGATIVES` | `usize` | `15` | Negatives drawn at random from all matching commands |
+| `CMD_TRAIN_RANDOM_NEGATIVES` | `usize` | `30` (was 15) | Negatives drawn at random from all matching commands |
+| `CMD_RECENCY_RANK_CAP` | `usize` | `15` | Feature 25 counts newer matching commands up to this |
 | `CMD_TRAIN_RANDOM_TRIES` | `usize` | `200` | Draws allowed to find them |
 | `CMD_NEVER_SECS_LOG` | `f64` | `19.57` | "Never" on the `ln(1 + seconds)` axis (`ln(1 + 10 years)`, as [src/feature_defs/implementations.rs:533](../../src/feature_defs/implementations.rs)) |
 | `CMD_FAIL_RECENT_SECS` | `i64` | `120` | Window of `failed_within_2_minutes` |
@@ -108,7 +110,7 @@ pub(super) trait CommandFeature: Send + Sync {
 }
 /// Append-only. The position is the column in the model. A `static` slice, not a
 /// `Lazy`: it is read inside a rayon loop.
-pub(super) static COMMAND_FEATURE_REGISTRY: &[&dyn CommandFeature] = &[ /* the 23 rows below, in this order */ ];
+pub(super) static COMMAND_FEATURE_REGISTRY: &[&dyn CommandFeature] = &[ /* the rows below, in this order */ ];
 pub(super) fn command_feature_names() -> Vec<&'static str>;
 pub(super) fn command_feature_specs() -> Vec<crate::training::FeatureSpec<'static>>;   // name + monotone (1, -1, 0)
 pub(super) fn compute_all(inputs: &CommandFeatureInputs, out: &mut [f64]);             // writes exactly REGISTRY.len() values (asserts out.len())
@@ -143,6 +145,11 @@ Type N = Numeric, B = Binary. Mono: `+` Increasing, `-` Decreasing, blank none.
 | 21 | `last_exit_nonzero` | B | | `1.0` if `e.last_exit_code` is `Some(n)` with `n != 0` | `0.0` |
 | 22 | `command_length` | N | | `e.chars` | - |
 | 23 | `argument_count` | N | | `e.words.saturating_sub(1)` | `0.0` |
+| 24 | `fzf_score` | N | + | `inputs.fzf_score`: fzf's score of the text for the query under `--scheme=history` ([02 section 7.1](02-browse.md#71-fzfs-score-srccmdfzfrs)); serving takes it from the heuristic's parts, training computes it with the same `rank::fzf_score` | `0.0` for the empty query; `-1.0` (`NO_FZF_MATCH`) when fzf does not match |
+| 25 | `recency_rank` | N | | `inputs.recency_rank`: how many commands matching the query (the candidates, for serving; the commands `newest_matching` finds, for training) have a newer `(last_run_at, db_id)`, at most `CMD_RECENCY_RANK_CAP`. Serving takes the `CMD_RECENCY_RANK_CAP` newest candidates in the heuristic's pass (`rank::newest_of`, one pass over the sort keys, no allocation per candidate); training walks the replay's recency order until it has that many matches (`train::newest_matching`); IT-N-02 checks both give the same list | - |
+
+Features 24 on were added on 2026-11-17 (results.md). Feature 24 sits
+beside feature 1 rather than replacing it: measured both ways, see results.md.
 
 Feature 18 is "the share of this command's runs whose immediately preceding
 command had the template of any of the last 3 commands of this shell session".
@@ -205,10 +212,10 @@ For each run, **before** `apply_run`:
 | Eligible | `replayer.knows(run.command_id)` is `Some(pos)`: the command had run before, so it could have been found. A first-ever run produces no group. Also not eligible: a run for which `replayer.follows_pick(run)` holds - the pick group already represents that decision, and the index now contains the pick (features 4, 5, 12), a state serving never sees before the choice. `commit_pick` records the last pick per `(shell_session, command_id)` for this test; the Cap pre-pass applies the same rule in the same timeline order |
 | Cap | Number eligible runs 0.. in timeline order; let `E` be their count among runs with `started_at < until` (all runs when `until` is `None`), found by a first pass over the timeline with a seen-set and the pick rule. Only eligible ordinals `>= E.saturating_sub(CMD_TRAIN_MAX_RUN_GROUPS)` produce groups. Earlier ones only feed the index |
 | Query length | `r = splitmix64(seed ^ (run.id as u64)) % 100`; length 0 if `r < 40`, 1 if `r < 60`, 2 if `r < 80`, else 3 (the cumulative `CMD_TRAIN_QLEN_MIX`) |
-| Query | The first `length` characters (`chars().take(length)`) of the positive's text; the whole text if it is shorter |
+| Query | `training_query`: with `d = splitmix64(seed ^ run.id ^ FRAGMENT_SALT)`, a non-empty length and `d % 100 < CMD_TRAIN_FRAGMENT_SHARE`, the fragment `fragment_query(text, length, d >> 8)` (the definition the relevance benchmark's fragment style uses, [04 section 5.2](04-bench.md#52-protocol), with another salt) when there is one; otherwise the first `length` characters (`chars().take(length)`) of the positive's text, the whole text if it is shorter |
 | Context | `ctx = replayer.context(run.started_at, run.cwd, run.repo_root, Some(&run.shell_session))` |
 | "Matches" | Empty query: every command. Otherwise `matcher.fuzzy_match(&entry.text, query).is_some()` with one `SkimMatcherV2` owned by the builder |
-| Recent negatives | From `recent_distinct()`: skip the positive and deleted entries; examine at most `CMD_TRAIN_RECENT_SCAN` of the rest; keep those that match, up to `CMD_TRAIN_RECENT_NEGATIVES` |
+| Recent negatives | From `recent_distinct()`: skip the positive and deleted entries; examine at most `CMD_TRAIN_RECENT_SCAN` of the rest; keep those that match, up to `CMD_TRAIN_RECENT_NEGATIVES` (0 since 2026-11-17: none; see below) |
 | Random negatives | `state = splitmix64(seed ^ (run.id as u64) ^ 0x9E37_79B9_7F4A_7C15)`; repeat at most `CMD_TRAIN_RANDOM_TRIES` times: `state = splitmix64(state)`, `cand = state % entries.len()`; keep `cand` if it is not the positive, not deleted, not already chosen (recent or random), and matches; stop at `CMD_TRAIN_RANDOM_NEGATIVES` |
 | Skip | No negative found, or the positive does not match its own query (a prefix of its text always matches; the rule only makes the function total): no group |
 | Rows | The positive (label 1) and the negatives (label 0), **ordered by idx ascending**; each row = `compute_all` with that candidate's own fuzzy score for the query (0 for the empty query) |
@@ -223,7 +230,22 @@ fn splitmix64(mut x: u64) -> u64 { x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
 The one definition is `corpus::splitmix64` (Phase D0's generator uses the
 same function); `train.rs` imports it.
 
-At most 31 rows per group (1 + 15 + 15).
+At most 31 rows per group (1 + `CMD_TRAIN_RECENT_NEGATIVES` +
+`CMD_TRAIN_RANDOM_NEGATIVES`).
+
+Why no recent negatives (2026-11-17). A ranker scored row by row learns, in
+effect, how much likelier a command with given features is to be the
+positive than a matching command drawn as a negative. With the 15 newest
+matching commands always among the negatives, the newest commands are
+negatives in every group while serving shows them once each, so the model
+learned that recently run commands are less likely than they are: on the
+interactive 50k corpus its top-10 at length 0 was 0.41 against newest-first
+0.53, and it lost to plain score-sorted fuzzy matching at lengths 1-3.
+Uniform negatives represent the candidates as serving sees them; the same
+corpus went to 0.54 top-10 at length 0 and above every baseline at lengths
+2-3 (results.md). Feature 25 made the effect visible: with a cap of 20 the
+ranks 15-19 were almost never a negative (the 15 newest were, the random
+ones rarely land there), and the model put those commands first.
 
 The table from "Context" down is one function, so tests can fix the query:
 
@@ -473,6 +495,14 @@ applied to scaled weighted group counts (ADR-14).
 | 450 | 45 | 0.881 |
 | 600 | 60 | 0.982 |
 
+The heuristic it blends with is fzf's order expressed as a value in (0, 1]
+([02 section 7.2](02-browse.md#72-types-and-the-value)): the fzf score
+rescaled over the candidates' range, plus a recency term in (0, 1] that only
+breaks ties. With a small `ml_weight` (a new install) the model can reorder
+commands of equal fzf score but rarely overrides a better match; at full
+weight the model decides alone. Stage 1 (step 1 of section 7.2) is therefore
+fzf's order: the model scores fzf's top `CMD_STAGE2_K`.
+
 `blend_examples` examples: 300 hook groups; or 75 pick groups; or 1,000
 imported groups. A fresh install that imported 8,000 or more eligible runs
 reaches full model weight at its first training; the `import` slice
@@ -519,6 +549,15 @@ The new model is used by the **next** picker start. The first picker start on
 an install with imported history therefore ranks by heuristic and starts the
 first training.
 
+A model trained with another feature list (an older release: the registry
+grew) is refused by `CmdModel::load` (section 7.1), so ranking falls back to
+the heuristic. The retrain is then due at once, whatever the interval:
+`retrain_due` also holds when `cmd_model_stats.json` parses and its
+`feature_names` differ from the registry, unless `cmd_train_attempt` is newer
+than that file (an attempt since then found too little to train; it backs
+off by the interval as usual). Test:
+`a_model_with_an_older_feature_list_is_refused_and_retrained_at_once`.
+
 ## 9. Anti-patterns (DO NOT)
 
 | Don't | Do instead | Why |
@@ -553,24 +592,26 @@ Fixture `F1`: built with the `CommandIndex` mutators; `now = 1_000_000`; command
 
 | ID | Component | Input | Expected | Edge cases covered |
 |---|---|---|---|---|
-| TC-L-01 | every feature on `F1`, query `gs`, fuzzy 57 | `compute_all` | `[57, 0, 0, 0, 0, ln(11)=2.3979, 1, 2, 3, 4, ln(5)=1.6094, 0, 0.5, 0, 2.3979, 2, 0.5, 0.5, 0.6667, 0, 0, 10, 1]` (+-1e-4) | `word_starts_with_query` is 0 for `gs`; `last_exit_nonzero` is 0 because the newest run exited 0 |
+| TC-L-01 | every feature on `F1`, query `gs`, fuzzy 57 | `compute_all` | `[57, 0, 0, 0, 0, ln(11)=2.3979, 1, 2, 3, 4, ln(5)=1.6094, 0, 0.5, 0, 2.3979, 2, 0.5, 0.5, 0.6667, 0, 0, 10, 1, 51, 3]` (+-1e-4; `fzf_score` 51 = 16 + 2*8 for `g` at the start, -3-1-1 for the gap, 16 + 8 for `s` at a word start; `recency_rank` 3 as the fixture passes it) | `word_starts_with_query` is 0 for `gs`; `last_exit_nonzero` is 0 because the newest run exited 0 |
 | TC-L-02 | query features | queries `""`, `git`, `st`, `GIT` | features 1-3: `[0,0,0]`, `[f,1,1]`, `[f,0,1]`, `[f,1,1]` (`f` = the fuzzy score passed in) | case-insensitive prefix; empty query |
 | TC-L-03 | unknowns | An entry with `run_count 1`, exit NULL, `ctx.dir = None`, `prev_templates` all `None` | `success_rate` is NaN; features 13-18 are `0, 0, 19.57, 0, 0, 0` | - |
 | TC-L-04 | `failed_within_2_minutes` | `last_fail_at` = `now-119`, `now-120`, `0`, `now+5` | `1, 0, 0, 0` | boundary and clock skew |
 | TC-L-05 | `follows_recent3_share` | `follower_runs` 2 for template X and 1 for Y, `run_count 6`, `prev_templates = [X, Y, X]` | `0.5` | the duplicate X is counted once |
-| TC-L-06 | registry shape | `COMMAND_FEATURE_REGISTRY` | 23 entries; names unique; the names in the order of section 4; `command_feature_specs()` monotone column equals `[1,0,0,1,1,-1,1,1,1,1,1,1,1,1,-1,1,1,1,0,0,0,0,0]` | - |
+| TC-L-06 | registry shape | `COMMAND_FEATURE_REGISTRY` | 25 entries; names unique; the names in the order of section 4; `command_feature_specs()` monotone column equals `[1,0,0,1,1,-1,1,1,1,1,1,1,1,1,-1,1,1,1,0,0,0,0,0,1,0]` | - |
 | TC-L-07 | `splitmix64` | `0`, `1` | `0xE220A8397B1DCDAF`, `0x910A2DEC89025CC1` | published SplitMix64 vectors |
 | TC-L-08 | query-length mix | Run ids `1..=10_000`, seed 42 | Shares of lengths 0/1/2/3 within 40/20/20/20 +-2 percentage points; the same ids and seed give the same lengths twice; seed 43 changes at least one | text shorter than the length -> whole text |
 | TC-L-09 | no leakage | Commands A, B; timeline A, B, A (`build_run_group` for the third run, query `""`) | In that group the positive's `runs_last_hour` counts 1 run (the first A), and `log_seconds_since_last_run` is the gap to the first A, not 0 | - |
 | TC-L-10 | first-ever run | Timeline A, B | No group for either run; `counts.hook == 0` | - |
-| TC-L-11 | negatives (`build_run_group`) | 40 commands run once each, then command 0 again, query `""` | 31 rows: 1 positive, 15 recent (the 15 most recently run other commands), 15 random distinct others; rows in ascending idx; labels sum to 1 | With query `zz` matching nothing else -> no group |
+| TC-L-11 | negatives (`build_run_group`) | 40 commands run once each, then command 0 again, query `""` | 31 rows: 1 positive and 30 random distinct others (no fixed recent ones since 2026-11-17), older commands among them; rows in ascending idx; labels sum to 1 | With query `zz` matching nothing else -> no group |
+| TC-L-19 | `training_query` | 4,000 run ids, text `git commit --amend` | Length as `query_length`; of the non-empty ones `CMD_TRAIN_FRAGMENT_SHARE`% (+-3) are the start of `commit` or `amend`, the rest prefixes | A one-word text: always a prefix |
+| TC-L-20 | old model on disk | Stats whose `feature_names` are the first 23 of the registry | `CmdModel::load` is `None` (heuristic ranking); `retrain_due` holds although the last attempt is a minute old; an attempt newer than the stats backs off; current names wait for the interval | - |
 | TC-L-12 | weights and cap | 5 eligible hook runs, 5 eligible import runs, `max_run_groups = 4` | 4 groups, built from the 4 newest eligible runs; `row_weights` are 1.0 or 0.3 by source | - |
 | TC-L-13 | pick group | Impressions (q `g`: A, B, C), (q `gi`: A, B), pick A | 5 rows, labels `[1,0,0,1,0]`, weight 4.0, every row's timestamp = the pick's; afterwards `picks_in_window(A) == 1` | An episode with no impression of the picked command -> no group; impressions without a pick -> no group |
 | TC-L-14 | `from_parts` asserts | Unsorted `episodes`; a zero weight; `features.len()` mismatch | Each panics with its assert message | - |
 | TC-L-15 | blend table | `blend_examples` 0, 150, 300, 450, 600 | `ml_weight` 0.018, 0.119, 0.500, 0.881, 0.982 (+-1e-3) | - |
 | TC-L-16 | stats file | A `CmdModelStats` value | Serialises and parses back equal; `blend_examples` = `pick*4 + hook*1 + import*0.3` | - |
 | TC-L-17 | two-stage order | 6 candidates, `rank_with` with `head = usize::MAX` and `Stage2 { k: 3, ml_weight: 1.0, predict: <stub returning raw scores that reverse the input order> }` | First 3 rows are the heuristic top 3 in reversed order; last 3 are heuristic ranks 4-6 unchanged with `ml_score = None` | `k >= len` -> all rows model-scored |
-| TC-L-18 | pick then run | Timeline: runs A, B; pick of A in shell session `s` at t; run of A in `s` at t+5; run of A in `s` at t+400; run of A in session `u` at t+6 | The t+5 run is not eligible; the t+400 run and the session-`u` run are | - |
+| TC-L-18 | pick then run | Timeline: runs A (`git log`), B (`log git`: any query of one matches the other); pick of A in shell session `s` at t; run of A in `s` at t+5; run of A in `s` at t+400; run of A in session `u` at t+6 | The t+5 run is not eligible; the t+400 run and the session-`u` run are | - |
 
 ### 10.2 Integration tests
 
@@ -582,7 +623,7 @@ Fixture `F1`: built with the `CommandIndex` mutators; `now = 1_000_000`; command
 | IT-L-04 | Stale or foreign model is refused | Valid model + stats, then edit `feature_names[0]` in the JSON; separately, delete the stats file; separately, truncate `cmd_model.txt` | `CmdModel::load` is `None` in all three; the worker still answers `UpdateQuery` with heuristic rows | `remove_dir_all` |
 | IT-L-05 | Lock | Create a fresh `cmd_train.lock` by hand, call `retrain`; then set its mtime 1,000 s back and call again | First `AlreadyRunning`; second trains (or `NotEnoughData`) and removes the lock | `remove_dir_all` |
 | IT-L-06 | File model untouched | The existing `training` tests plus `fit(set, features)` versus `fit_seeded(set, features, 42)` on the CSV of `test_from_csv_drops_unclicked_episodes_and_sorts_stably` enlarged to 40 episodes | Identical `model` strings | none |
-| IT-L-07 | Model changes the ranking only inside stage 2 | IT-L-02's data and model; worker with and without the model; 20 queries | Same set of matched ids both ways; with the model, rows `0..k` carry `ml_score` and 23 features; no TIMING or log line contains a command text | `remove_dir_all` |
+| IT-L-07 | Model changes the ranking only inside stage 2 | IT-L-02's data and model; worker with and without the model; 20 queries | Same set of matched ids both ways; with the model, rows `0..k` carry `ml_score` and every registry feature; no TIMING or log line contains a command text | `remove_dir_all` |
 
 Where they live: TC-L-01..06, E-L-08 and E-L-13 in `src/cmd/features.rs`;
 TC-L-07..14, 16, 18, IT-L-01..06 and E-L-02, 03, 09, 10, 11, 12, 15 in

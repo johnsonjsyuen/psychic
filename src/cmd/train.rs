@@ -24,13 +24,15 @@ use super::features::{
     COMMAND_FEATURE_REGISTRY, CommandFeatureInputs, command_feature_names, command_feature_specs,
     compute_all,
 };
+use super::fzf::FzfQuery;
 use super::index::{CommandIndex, RankContext};
+use super::rank::{fzf_score, recency_rank};
 use super::store::{CmdStore, CommandRecord, EventRecord, RunRecord, Source};
 use super::tuning::{
-    CMD_HOOK_WEIGHT, CMD_IMPORT_WEIGHT, CMD_PICK_RUN_SECS, CMD_PICK_WEIGHT,
-    CMD_RETRAIN_MIN_INTERVAL_SECS, CMD_TRAIN_LOCK_STALE_SECS, CMD_TRAIN_MAX_RUN_GROUPS,
-    CMD_TRAIN_MIN_GROUPS, CMD_TRAIN_QLEN_MIX, CMD_TRAIN_RANDOM_NEGATIVES, CMD_TRAIN_RANDOM_TRIES,
-    CMD_TRAIN_RECENT_NEGATIVES, CMD_TRAIN_RECENT_SCAN,
+    CMD_HOOK_WEIGHT, CMD_IMPORT_WEIGHT, CMD_PICK_RUN_SECS, CMD_PICK_WEIGHT, CMD_RECENCY_RANK_CAP,
+    CMD_RETRAIN_MIN_INTERVAL_SECS, CMD_TRAIN_FRAGMENT_SHARE, CMD_TRAIN_LOCK_STALE_SECS,
+    CMD_TRAIN_MAX_RUN_GROUPS, CMD_TRAIN_MIN_GROUPS, CMD_TRAIN_QLEN_MIX, CMD_TRAIN_RANDOM_NEGATIVES,
+    CMD_TRAIN_RANDOM_TRIES, CMD_TRAIN_RECENT_NEGATIVES, CMD_TRAIN_RECENT_SCAN,
 };
 use anyhow::{Context, Result};
 use fuzzy_matcher::FuzzyMatcher;
@@ -58,6 +60,8 @@ const NO_RETRAIN_ENV: &str = "PSYCHIC_NO_RETRAIN";
 const NOT_ENOUGH_FOR_A_SPLIT: &str = "every split needs rows";
 /// Mixed into the run id for the random-negative stream.
 const RANDOM_NEGATIVE_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Mixed into a run id to choose whether its query is a fragment, and which.
+const FRAGMENT_SALT: u64 = 0xF4A6_0000_0000_F4A6;
 
 // ---------------------------------------------------------------------------
 // Inputs
@@ -410,21 +414,55 @@ struct Group {
     timestamp: i64,
 }
 
-/// The features of `idx` for `query` in `ctx`.
+/// The `CMD_RECENCY_RANK_CAP` newest commands matching `query` as
+/// `(last_run_at, db_id)`, newest first: what serving's
+/// `CommandRanking::newest` holds for the same state and query.
+pub(super) fn newest_matching(
+    replayer: &Replayer,
+    matcher: &SkimMatcherV2,
+    query: &str,
+) -> Vec<(i64, i64)> {
+    let index = &replayer.index;
+    let mut found: Vec<(i64, i64)> = Vec::new();
+    for idx in replayer.recent_distinct() {
+        let entry = &index.entries[idx as usize];
+        // Runs replay in time order, so this walks last runs newest first;
+        // past the cap only an equal last run can still belong.
+        if found.len() >= CMD_RECENCY_RANK_CAP
+            && found.last().is_some_and(|&(at, _)| entry.last_run_at < at)
+        {
+            break;
+        }
+        if !entry.deleted && (query.is_empty() || matcher.fuzzy_match(&entry.text, query).is_some())
+        {
+            found.push((entry.last_run_at, entry.db_id));
+        }
+    }
+    found.sort_unstable_by(|a, b| b.cmp(a));
+    found.truncate(CMD_RECENCY_RANK_CAP);
+    found
+}
+
+/// The features of `idx` for `query` in `ctx`; `newest` is
+/// [`newest_matching`] for `query`.
 fn feature_row(
     index: &CommandIndex,
     ctx: &RankContext,
     query: &str,
+    newest: &[(i64, i64)],
     idx: u32,
     fuzzy_score: i64,
 ) -> Vec<f64> {
     let query_lower = query.to_lowercase();
+    let entry = &index.entries[idx as usize];
     let inputs = CommandFeatureInputs {
         query,
         query_lower: &query_lower,
         idx,
-        entry: &index.entries[idx as usize],
+        entry,
         fuzzy_score,
+        fzf_score: fzf_score(&FzfQuery::new(query), &entry.text),
+        recency_rank: recency_rank(newest, (entry.last_run_at, entry.db_id)),
         index,
         ctx,
     };
@@ -450,6 +488,41 @@ fn query_length(seed: u64, run_id: i64) -> usize {
 /// The first `length` characters of `text`, or all of it if shorter.
 fn synthetic_query(text: &str, length: usize) -> String {
     text.chars().take(length).collect()
+}
+
+/// A fragment query (section 5.2; the relevance benchmark's second style,
+/// 04 section 5.2): the first `len` characters of one word after the first,
+/// counted from the word's first letter or digit. `pick` chooses the word,
+/// the same one at every length. `None` when the text has no such word or
+/// the chosen one is shorter than `len`.
+pub(super) fn fragment_query(text: &str, len: usize, pick: u64) -> Option<String> {
+    let words: Vec<&str> = text
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|word| {
+            word.find(|c: char| c.is_alphanumeric())
+                .map(|at| &word[at..])
+        })
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    let word = words[(pick % words.len() as u64) as usize];
+    (word.chars().count() >= len).then(|| word.chars().take(len).collect())
+}
+
+/// The synthetic query of a run's group (section 5.2): its length by
+/// [`query_length`]; then, for a non-empty one, a fragment of a later word
+/// for `CMD_TRAIN_FRAGMENT_SHARE` percent of runs (by a seeded hash of the
+/// run id) when the text has one long enough, else a prefix.
+fn training_query(seed: u64, run_id: i64, text: &str) -> String {
+    let length = query_length(seed, run_id);
+    let draw = splitmix64(seed ^ run_id as u64 ^ FRAGMENT_SALT);
+    let fragment = length > 0 && ((draw % 100) as u32) < CMD_TRAIN_FRAGMENT_SHARE;
+    fragment
+        .then(|| fragment_query(text, length, draw >> 8))
+        .flatten()
+        .unwrap_or_else(|| synthetic_query(text, length))
 }
 
 fn source_weight(source: Source) -> f64 {
@@ -527,6 +600,7 @@ fn build_run_group(
 
     let mut members = negatives;
     members.push((positive, positive_score));
+    let newest = newest_matching(replayer, matcher, query);
     // Not the positive first: tied scores would resolve in its favour.
     members.sort_unstable_by_key(|&(idx, _)| idx);
     let rows = members
@@ -534,7 +608,7 @@ fn build_run_group(
         .map(|(idx, score)| GroupRow {
             idx,
             label: if idx == positive { 1.0 } else { 0.0 },
-            features: feature_row(index, &ctx, query, idx, score),
+            features: feature_row(index, &ctx, query, &newest, idx, score),
         })
         .collect();
     Some(Group {
@@ -581,7 +655,14 @@ fn build_pick_group(
                 } else {
                     0.0
                 },
-                features: feature_row(index, &ctx, query, idx, score),
+                features: feature_row(
+                    index,
+                    &ctx,
+                    query,
+                    &newest_matching(replayer, matcher, query),
+                    idx,
+                    score,
+                ),
             })
         })
         .collect();
@@ -760,9 +841,8 @@ fn build_groups(input: &ReplayInput, options: &BuildOptions) -> Groups {
                     && !replayer.follows_pick(run)
                 {
                     if ordinal >= first_grouped {
-                        let length = query_length(options.seed, run.id);
-                        let query =
-                            synthetic_query(&replayer.index.entries[idx as usize].text, length);
+                        let text = &replayer.index.entries[idx as usize].text;
+                        let query = training_query(options.seed, run.id, text);
                         let group = build_run_group(&replayer, &matcher, run, &query, options.seed);
                         if let Some(group) = group {
                             match run.source {
@@ -1228,7 +1308,26 @@ fn retrain_due(data_dir: &Path, now: SystemTime) -> bool {
         .is_none_or(|age| age >= Duration::from_secs(CMD_RETRAIN_MIN_INTERVAL_SECS));
     let lock = data_dir.join(LOCK_FILE);
     let unlocked = !lock.exists() || is_stale_lock(&lock, now);
-    attempted_long_ago && unlocked
+    (attempted_long_ago || model_needs_new_features(data_dir)) && unlocked
+}
+
+/// The model on disk was trained with another feature list (an older
+/// release), so `CmdModel::load` refuses it and ranking is the heuristic's
+/// until a retrain: due at once rather than after the interval, unless an
+/// attempt was made since that model was written (one that found too little
+/// to train, which would otherwise repeat at every picker start).
+fn model_needs_new_features(data_dir: &Path) -> bool {
+    let stats = data_dir.join(STATS_FILE);
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let attempted_since = match (modified(&data_dir.join(ATTEMPT_FILE)), modified(&stats)) {
+        (Some(attempt), Some(model)) => attempt > model,
+        _ => false,
+    };
+    !attempted_since
+        && std::fs::read_to_string(&stats)
+            .ok()
+            .and_then(|text| serde_json::from_str::<CmdModelStats>(&text).ok())
+            .is_some_and(|stats| stats.feature_names != command_feature_names())
 }
 
 /// Start `exe --data-dir <data_dir> history --retrain --quiet` detached: its

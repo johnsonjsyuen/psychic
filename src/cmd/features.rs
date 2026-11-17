@@ -1,4 +1,4 @@
-//! The 23 command features (`docs/ctrl-r/03-learn.md` section 4).
+//! The command features (`docs/ctrl-r/03-learn.md` section 4).
 //!
 //! One feature path, two fill paths (ADR-12): serving computes features over
 //! the [`CommandIndex`] loaded from SQL, training over the one a replay
@@ -24,6 +24,12 @@ pub(super) struct CommandFeatureInputs<'a> {
     pub entry: &'a CommandEntry,
     /// The candidate's fuzzy score for `query`; 0 for the empty query.
     pub fuzzy_score: i64,
+    /// fzf's score for `query` (02 section 7): 0 for the empty query,
+    /// `rank::NO_FZF_MATCH` when fzf does not match.
+    pub fzf_score: i32,
+    /// How many commands matching `query` ran more recently than this one,
+    /// at most `CMD_RECENCY_RANK_CAP` (03 section 4).
+    pub recency_rank: u32,
     pub index: &'a CommandIndex,
     pub ctx: &'a RankContext,
 }
@@ -298,6 +304,16 @@ command_feature!(ArgumentCount, "argument_count", Numeric, NONE, |i| {
     f64::from(i.entry.words.saturating_sub(1))
 });
 
+// --- Added after the first release (append-only) --------------------------------
+
+command_feature!(FzfScore, "fzf_score", Numeric, INCREASING, |i| {
+    f64::from(i.fzf_score)
+});
+
+command_feature!(RecencyRank, "recency_rank", Numeric, NONE, |i| {
+    f64::from(i.recency_rank)
+});
+
 /// Append-only. The position is the column in the model. A `static` slice,
 /// not a `Lazy`: it is read inside a rayon loop.
 pub(super) static COMMAND_FEATURE_REGISTRY: &[&dyn CommandFeature] = &[
@@ -324,6 +340,8 @@ pub(super) static COMMAND_FEATURE_REGISTRY: &[&dyn CommandFeature] = &[
     &LastExitNonzero,
     &CommandLength,
     &ArgumentCount,
+    &FzfScore,
+    &RecencyRank,
 ];
 
 /// The one feature allowed to be NaN (missing).
@@ -390,12 +408,18 @@ mod tests {
         fuzzy_score: i64,
     ) -> Vec<f64> {
         let query_lower = query.to_lowercase();
+        let entry = &index.entries[idx as usize];
         let inputs = CommandFeatureInputs {
             query,
             query_lower: &query_lower,
             idx,
-            entry: &index.entries[idx as usize],
+            entry,
             fuzzy_score,
+            fzf_score: crate::cmd::rank::fzf_score(
+                &crate::cmd::fzf::FzfQuery::new(query),
+                &entry.text,
+            ),
+            recency_rank: 3,
             index,
             ctx,
         };
@@ -437,6 +461,10 @@ mod tests {
         let expected = [
             57.0, 0.0, 0.0, 0.0, 0.0, 2.3979, 1.0, 2.0, 3.0, 4.0, 1.6094, 0.0, 0.5, 0.0, 2.3979,
             2.0, 0.5, 0.5, 0.6667, 0.0, 0.0, 10.0, 1.0,
+            // fzf_score: "g" at the start (16 + 2 * 8), a 3-character gap
+            // (-3 - 1 - 1), "s" at a word start (16 + 8).
+            51.0, // recency_rank, as the fixture passes it.
+            3.0,
         ];
         assert_close(&features(&index, &ctx, 0, "gs", 57), &expected);
     }
@@ -516,17 +544,19 @@ mod tests {
                 "last_exit_nonzero",
                 "command_length",
                 "argument_count",
+                "fzf_score",
+                "recency_rank",
             ]
         );
         let mut unique = names.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), 23, "names are unique");
+        assert_eq!(unique.len(), names.len(), "names are unique");
         let monotone: Vec<i8> = command_feature_specs().iter().map(|f| f.monotone).collect();
         assert_eq!(
             monotone,
             [
-                1, 0, 0, 1, 1, -1, 1, 1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 1, 0, 0, 0, 0, 0
+                1, 0, 0, 1, 1, -1, 1, 1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0
             ]
         );
         let binary: Vec<&str> = COMMAND_FEATURE_REGISTRY

@@ -12,8 +12,8 @@ set of results is in [results.md](results.md).
 |---|---|---|---|
 | [00-blueprint.md](00-blueprint.md) | Strategic | - | Problem, targets R1-R3 and B1-B9, module map, complete list of upstream edits, MVP scope, non-goals, ADR-1..ADR-21 |
 | [01-record.md](01-record.md) | Implementation | A | Schema, every SQL statement and `CmdStore` method, `track-command`, CLI flags of both subcommands, recording hooks, privacy, backfill |
-| [02-browse.md](02-browse.md) | Implementation | B | Picker invocation, `CommandIndex`, worker protocol and filter, heuristic ranking, UI, keys, event logging, Ctrl-R widgets |
-| [03-learn.md](03-learn.md) | Implementation | C | 23 features, training-set replay, `src/training` refactor, model files, two-stage rank and blend, retrain trigger |
+| [02-browse.md](02-browse.md) | Implementation | B | Picker invocation, `CommandIndex`, worker protocol and filter, heuristic ranking (fzf's Ctrl-R order, `src/cmd/fzf.rs`), UI, keys, event logging, Ctrl-R widgets |
+| [03-learn.md](03-learn.md) | Implementation | C | 25 features, training-set replay, `src/training` refactor, model files, two-stage rank and blend, retrain trigger |
 | [04-bench.md](04-bench.md) | Implementation | D0, D | Corpora, relevance protocol, performance benchmarks, iteration loop, results-log format, tuning candidates |
 | `results.md` | Reference | D | Benchmark results log; created by the Phase D commit in the format of [04 section 8](04-bench.md#8-results-log-format) |
 

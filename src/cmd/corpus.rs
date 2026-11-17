@@ -431,6 +431,19 @@ fn avoiding(
 
 /// Section 4.3, "For each run": the whole simulation, without any IO.
 fn simulate(commands: usize, runs: usize, seed: u64, shape: &Shape) -> Vec<SynthRun> {
+    simulate_observed(commands, runs, seed, shape, |_, _, _, _| {})
+}
+
+/// [`simulate`], calling `observe(n, world, state, chosen)` for every run `n`
+/// that reuses a command, with the state the choice was made from: what the
+/// Bayes ceiling of the relevance report reads (04 section 5.5).
+fn simulate_observed(
+    commands: usize,
+    runs: usize,
+    seed: u64,
+    shape: &Shape,
+    mut observe: impl FnMut(usize, &World, &Seen, usize),
+) -> Vec<SynthRun> {
     assert!(
         1 <= commands && commands <= runs,
         "need 1 <= commands <= runs"
@@ -498,7 +511,9 @@ fn simulate(commands: usize, runs: usize, seed: u64, shape: &Shape) -> Vec<Synth
                 in_dir: &homed[dir],
                 reusable: &reusable,
             };
-            choose_seen(&world, &mut rng, shape, &state)
+            let chosen = choose_seen(&world, &mut rng, shape, &state);
+            observe(n, &world, &state, chosen);
+            chosen
         };
 
         // Outcome.
@@ -916,6 +931,9 @@ pub(super) fn extract_agent(
     })?;
     Ok(report)
 }
+
+#[cfg(test)]
+mod ceiling;
 
 #[cfg(test)]
 mod tests {

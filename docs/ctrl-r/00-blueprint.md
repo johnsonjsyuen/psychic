@@ -122,7 +122,7 @@ selection --> println!(command) on stdout, exit 0 --> widget replaces the prompt
 | `keys.rs` | `CmdAction`, `CMD_KEYMAP` | B | [02 section 9](02-browse.md#9-keys) |
 | `app.rs` | UI state, event loop, input handling | B | [02 section 8](02-browse.md#8-ui-thread) |
 | `render.rs` | List, preview, debug pane, help overlay | B | [02 section 8.3](02-browse.md#83-layout-and-rows) |
-| `features.rs` | `CommandFeature`, `COMMAND_FEATURE_REGISTRY`, 23 features | C | [03 section 4](03-learn.md#4-features) |
+| `features.rs` | `CommandFeature`, `COMMAND_FEATURE_REGISTRY`, 25 features (23 at first) | C | [03 section 4](03-learn.md#4-features) |
 | `model.rs` | `CmdModel`: load checks, blend weight, prediction by walking the trees of `cmd_model.txt` in Rust | C | [03 section 7.1](03-learn.md#71-loading-the-model) |
 | `train.rs` | Replay, group building, fit, model files, lock, detached retrain | C | [03 section 5](03-learn.md#5-training-set-replay), [03 section 6](03-learn.md#6-fit-and-model-files) |
 | `corpus.rs` | Agent-transcript extractor, synthetic generator | D0 (parallel with B) | [04 section 4](04-bench.md#4-corpora) |
@@ -176,7 +176,7 @@ Not edited: `src/keymap.rs`, `src/help.rs`, `src/render.rs`, `src/app.rs`,
 | 1 | Record every command (opt-in) with cwd, repo root, exit code, duration, shell session; import existing history | A |
 | 2 | `psychic history` picker with heuristic ranking, scope filter, preview, delete | B |
 | 3 | Ctrl-R widgets for zsh, bash, fish | B |
-| 4 | Learned ranker: 23 features, replay-built training set, second model, blend | C |
+| 4 | Learned ranker: 25 features (23 at first), replay-built training set, second model, blend | C |
 | 5 | Relevance and performance benchmarks with pass bars, three corpora, results log | D |
 
 Build order: A -> D0 -> B -> C -> D. Commit D0 ([04 section 2](04-bench.md#2-files-touched-and-the-two-commits):
