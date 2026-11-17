@@ -159,6 +159,57 @@ fn it_b_05_enter_prints_the_pick_and_escape_prints_nothing() {
 }
 
 #[test]
+fn it_b_12_enter_prints_the_pick_at_once_while_another_process_holds_the_write_lock() {
+    let scratch = Scratch::empty("picker", "write-locked");
+    seed(&scratch, "echo locked-one", 100, "/w");
+    // An import or a purge's VACUUM in another process, holding the lock
+    // for longer than the picker's whole run.
+    let other = rusqlite::Connection::open(scratch.db()).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let out = scratch.path("out");
+    let mut command = Command::new(BINARY);
+    command
+        .env_clear()
+        .env("HOME", scratch.path("home"))
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("TERM", "xterm-256color")
+        .env("PSYCHIC_NO_RETRAIN", "1")
+        .arg("--data-dir")
+        .arg(scratch.path("data"))
+        .args(["history", "--cwd", "/tmp"]);
+    let file = std::fs::File::create(&out).unwrap();
+    let mut pty = Pty::spawn_with_stdout(command, 30, 100, Some(file)).expect("the picker starts");
+    settle(&pty, "the picker");
+    let pressed = std::time::Instant::now();
+    pty.write(ENTER).unwrap();
+    let status = pty
+        .wait(Duration::from_secs(15))
+        .unwrap_or_else(|| panic!("the picker did not exit:\n{}", pty.output()));
+    let took = pressed.elapsed();
+
+    assert!(status.success(), "{}", pty.output());
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "echo locked-one\n");
+    // The pick waits at most CMD_EVENT_WAIT_MS (100 ms) on the lock; the
+    // rest is the exit. Before, it waited busy_timeout (5 s) twice.
+    assert!(took < Duration::from_secs(1), "Enter to exit took {took:?}");
+    other.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        query(
+            &scratch.db(),
+            "SELECT COUNT(*) FROM command_events WHERE action = 'pick'"
+        ),
+        ["0"],
+        "the pick was not logged"
+    );
+    let log = std::fs::read_to_string(scratch.path("data/app.log")).unwrap();
+    assert!(
+        log.contains("command event logging failed: starting a transaction failed: database busy"),
+        "{log}"
+    );
+}
+
+#[test]
 fn it_b_07_the_query_never_reaches_app_log() {
     let scratch = Scratch::empty("picker", "no-query-in-log");
     seed(&scratch, "echo one", 100, "/w");

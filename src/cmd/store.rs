@@ -857,41 +857,61 @@ impl CmdStore {
 
     // --- Events, delete, purge ---------------------------------------------
 
-    /// Write `events`, all stamped `now`, in one transaction.
+    /// Write `events`, all stamped `now`, in one transaction (E1).
     pub(super) fn log_events(&self, now: i64, events: &[NewEvent]) -> Result<()> {
-        const OP: &str = "logging command events";
+        self.transaction(|tx| Self::insert_events(tx, now, events))
+    }
+
+    /// A pick: `events` (the impressions due and the pick itself) and the
+    /// pick count of `picked_id`, in one transaction (E1, E2), so Enter waits
+    /// for the write lock at most once.
+    pub(super) fn log_pick_events(
+        &self,
+        now: i64,
+        events: &[NewEvent],
+        picked_id: i64,
+    ) -> Result<()> {
         self.transaction(|tx| {
-            let mut statement = tx.prepare_cached(E1).op(OP)?;
-            for event in events {
-                let episode = event
-                    .episode_queries
-                    .map(|queries| serde_json::to_string(queries).expect("strings serialize"));
-                statement
-                    .execute(params![
-                        now,
-                        event.action.as_sql(),
-                        event.command_id,
-                        event.query,
-                        event.rank,
-                        event.session_id,
-                        event.subsession_id as i64,
-                        episode,
-                        event.cwd,
-                        event.repo_root,
-                        event.shell_session,
-                    ])
-                    .op(OP)?;
-            }
+            Self::insert_events(tx, now, events)?;
+            tx.prepare_cached(E2)
+                .and_then(|mut s| s.execute(params![picked_id]))
+                .op("counting a pick")?;
             Ok(())
         })
     }
 
-    pub(super) fn count_pick(&self, command_id: i64) -> Result<()> {
-        self.conn()
-            .prepare_cached(E2)
-            .and_then(|mut s| s.execute(params![command_id]))
-            .op("counting a pick")?;
+    fn insert_events(tx: &Transaction, now: i64, events: &[NewEvent]) -> Result<()> {
+        const OP: &str = "logging command events";
+        let mut statement = tx.prepare_cached(E1).op(OP)?;
+        for event in events {
+            let episode = event
+                .episode_queries
+                .map(|queries| serde_json::to_string(queries).expect("strings serialize"));
+            statement
+                .execute(params![
+                    now,
+                    event.action.as_sql(),
+                    event.command_id,
+                    event.query,
+                    event.rank,
+                    event.session_id,
+                    event.subsession_id as i64,
+                    episode,
+                    event.cwd,
+                    event.repo_root,
+                    event.shell_session,
+                ])
+                .op(OP)?;
+        }
         Ok(())
+    }
+
+    /// How long this connection waits for another's write lock before a
+    /// statement fails with "database busy" (`busy_timeout`).
+    pub(super) fn set_busy_timeout(&self, wait: Duration) -> Result<()> {
+        self.conn()
+            .busy_timeout(wait)
+            .op("configuring the connection")
     }
 
     /// Forget one command: a tombstone of its text's hash (so an import does
@@ -1811,7 +1831,7 @@ mod tests {
         let make = command_id(&store, "make").unwrap();
         let episode = vec!["m".to_string(), "ma".to_string()];
         store
-            .log_events(
+            .log_pick_events(
                 200,
                 &[NewEvent {
                     action: EventAction::Pick,
@@ -1825,9 +1845,9 @@ mod tests {
                     repo_root: None,
                     shell_session: Some("s"),
                 }],
+                make,
             )
             .unwrap();
-        store.count_pick(make).unwrap();
 
         let picks: Vec<(i64, String, i64, Vec<String>)> = store
             .picks_since(150)

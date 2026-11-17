@@ -397,7 +397,7 @@ fixes the join order (SQLite never reorders a `CROSS JOIN`).
 | ID | Statement | Used by |
 |---|---|---|
 | E1 | `INSERT INTO command_events (timestamp, action, command_id, query, rank, session_id, subsession_id, episode_queries, cwd, repo_root, shell_session) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)` | [02 section 10](02-browse.md#10-event-logging) |
-| E2 | `UPDATE commands SET pick_count = pick_count + 1 WHERE id = ?1` | pick |
+| E2 | `UPDATE commands SET pick_count = pick_count + 1 WHERE id = ?1` | pick, in the same transaction as the pick's E1 rows |
 | D0 | `PRAGMA secure_delete = ON`, on every connection `CmdStore` opens (`open`, `open_file`, `in_memory`), before any other statement | every connection to the command tables (section 10.5) |
 | D1 | `INSERT OR REPLACE INTO deleted_commands (text_hash, deleted_at) VALUES (?1, ?2)` | delete one |
 | D2 | `DELETE FROM command_events WHERE command_id = ?1` (plan: `idx_command_events_command`) | delete one |
@@ -442,7 +442,8 @@ Row structs are plain `pub(super)` structs in `store.rs` with the listed fields.
 | `command_dirs(command_id: i64)` | R9 | `Vec<DirUse { dir: String, runs: u32, last_run_at: i64 }>` |
 | `command_predecessors(command_id: i64)` | R10 | `Vec<PrecededBy { template: String, runs: u32 }>` |
 | `log_events(now: i64, events: &[NewEvent])` (one transaction) | E1 | `()`; `NewEvent` has one field per E1 parameter except `timestamp`, which the method takes as `now: i64`; `action` is `enum EventAction { Impression, Pick }`, `episode_queries` is `Option<&[String]>` and is written as a JSON array |
-| `count_pick(command_id: i64)` | E2 | `()` |
+| `log_pick_events(now: i64, events: &[NewEvent], picked_id: i64)` (one transaction) | E1, E2 | `()`: the events, then E2 for `picked_id`, so a pick takes the write lock once |
+| `set_busy_timeout(wait: Duration)` | - | `()`: this connection's `busy_timeout` (the picker's UI thread sets `CMD_EVENT_WAIT_MS`, [02 section 10](02-browse.md#10-event-logging)) |
 | `delete_command(command_id: i64, text: &str, now: i64)` | D1-D6 | `LogBound`: `Truncated`, or `Busy` when D6 found another connection in the way or failed (the rows are deleted either way; `Err` only when D1-D5 failed) |
 | `truncate_log_now()` | W1/D6 | `LogBound` (`Truncated` or `Busy`); the connection's `busy_timeout` is restored |
 | `open_for_recording(data_dir)`, `close_recording(self, limit: u64)` | W1 | `Self`; `LogBound` (section 6), through `truncate_log_now` once the log is over `limit`. The log's length is one `fs::metadata` of `events.db-wal` (missing = 0) |
@@ -581,6 +582,13 @@ It does not check the opt-in marker: being called is the hook's decision
 propagate through `main` as `Err`; no error message contains the command text
 (section 10.6). `log::` macros reached inside `Database::new` are no-ops because
 no logger is installed (section 2, M1).
+
+When another process holds the write lock (an `--import` mid-file, a purge's
+`VACUUM`, another `track-command` truncating the log), step 7 waits on
+`busy_timeout`, 5 s, and then fails (E-R-03, E-R-19). That wait is kept on
+purpose: the hook runs `track-command` in the background and never waits for
+it (section 11), so waiting costs the user nothing, while giving up sooner
+would lose the run. B4 is the uncontended time.
 
 Budget: B4. Cost model: process start + clap parse, one `Database::new`
 (first-open schema work is about 0.7 ms, [src/db.rs:151-153](../../src/db.rs)),
@@ -1390,14 +1398,20 @@ and `previous = replace(&mut cwd, target)`; `Lost` sets `previous = cwd.take()`;
    imported once only).
 5. Otherwise `record_run_in` with `source = Import`, `exit_code = None`,
    `duration_ms = None`, `started_at = at[i]`, `cwd = cwds[i]`,
-   `repo_root = cwd.and_then(|c| find_repo_root(c, Some(home)))`, `shell_session =
+   `repo_root = cwd.and_then(|c| find_repo_root(c, Some(home)))` (looked up once per distinct `cwd`, before the transaction starts: step 5 then does no file system work while it holds the write lock), `shell_session =
    "import:<kind>:<h>"` for real timestamps and `"import-synth:<kind>:<h>"` for
    synthetic ones, where `<h>` is `format!("{:016x}", fnv1a64(path) as u64)[..8]`.
    A `RunOutcome::Duplicate` counts as skipped.
 6. After the file: I2-insert `(source_key, now, inserted)`.
 
 All entries of one file go in one `CmdStore::transaction`, in ascending
-`(at, file index)` order, so S3 finds each entry's predecessor.
+`(at, file index)` order, so S3 finds each entry's predecessor. That
+transaction holds the database's write lock until it commits: a
+`track-command` meanwhile waits on `busy_timeout` (E-R-19) and the picker's
+event writes give up after `CMD_EVENT_WAIT_MS` (02 E-B-06). Only database work
+happens inside it; parsing, the `cd` replay and the repository walks happen
+before. A source is not split into several transactions: E-R-14's rollback of
+a whole file (and its retry, synthetic entries included) depends on it.
 
 ### 12.4 Atuin
 
@@ -1626,7 +1640,7 @@ same module. It is not shared with `src/`.
 | E-R-16 | zsh without `zsh/datetime` | `EPOCHREALTIME` empty | Hook omits `--started-at` and `--duration-ms` | `track.rs` uses `now`; duration NULL | None |
 | E-R-17 | bash older than 4.2 | `printf '%(%s)T'` fails | Hook omits `--duration-ms` | duration NULL | None |
 | E-R-18 | bash history disabled or command suppressed by `HISTCONTROL`/`HISTIGNORE` | `$HISTCMD` where the sync left it, newest entry stamped before the sync | Not recorded | By design | None |
-| E-R-19 | Two `track-command` processes at once | SQLite write lock | Second waits on `busy_timeout` | - | None |
+| E-R-19 | Two `track-command` processes at once, or one during an import's per-file transaction or a purge | SQLite write lock | Waits on `busy_timeout` (5 s) in the background; the prompt does not wait (section 9) | Past 5 s: E-R-03 | None |
 | E-R-24 | `track-command` finds the log over `CMD_WAL_TRUNCATE_BYTES` while another connection writes, checkpoints or reads | W1 returns busy = 1 (`busy_timeout` 0) | `LogBound::Busy`, `Ok(())`, exit 0: the run is recorded | The log stays over the bound until a later run (or the last connection closing) truncates it | None |
 | E-R-25 | D6 after a delete finds another connection reading, writing or checkpointing (or the checkpoint fails) | `wal_checkpoint(TRUNCATE)` busy = 1 with `busy_timeout` 0, or an `Err` from it | `LogBound::Busy`; the delete stands (rows and tombstone), the list updates, no wait | The text can stay in `events.db-wal` and unrewritten pages of `events.db` until the picker's exit (D6 again), the next delete, the last connection closing, W1, or `--purge` (section 10.5) | `log::warn!` at picker exit if still busy (no text); a failed checkpoint's error (operation and code) |
 | E-R-20 | Clock goes backwards between runs | `started_at` smaller than the session's last | S3 (`started_at <= ?2`) finds an older predecessor or none; S5 keeps `last_run_at` as the max | - | None |

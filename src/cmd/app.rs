@@ -7,7 +7,7 @@
 //! refresh (ADR-11). The pick is printed to stdout after the terminal is
 //! restored; stdout is the shell widget's pipe.
 
-use super::events::{CmdEvents, PickPlace, Shown};
+use super::events::{CMD_EVENT_WAIT_MS, CmdEvents, PickPlace, Shown};
 use super::index::LoadParams;
 use super::keys::{self, CmdAction};
 use super::render;
@@ -436,13 +436,13 @@ impl CmdApp {
             rank: self.selected + 1,
         };
         let text = Arc::clone(&row.text);
-        if self.visible_rows > 0 && self.events.wants_impressions(true) {
-            let shown = self.shown();
-            if let Err(error) = self.events.log_impressions(&shown) {
-                log::error!("command event logging failed: {}", error);
-            }
-        }
-        if let Err(error) = self.events.log_pick(picked) {
+        let shown = if self.visible_rows > 0 && self.events.wants_impressions(true) {
+            self.shown()
+        } else {
+            Vec::new()
+        };
+        // One transaction, waiting at most CMD_EVENT_WAIT_MS for the lock.
+        if let Err(error) = self.events.log_accept(&shown, picked) {
             log::error!("command event logging failed: {}", error);
         }
         Flow::Exit(Some(text))
@@ -587,7 +587,10 @@ pub(super) fn run(data_dir: &Path, args: &cli::HistoryArgs) -> Result<()> {
     };
 
     // 6. The UI thread's own connection, for event logging, and the tick.
-    let store = match CmdStore::open(data_dir) {
+    let store = match CmdStore::open(data_dir).and_then(|store| {
+        store.set_busy_timeout(Duration::from_millis(CMD_EVENT_WAIT_MS))?;
+        Ok(store)
+    }) {
         Ok(store) => Some(store),
         Err(error) => {
             log::error!("command events will not be logged: {}", error);

@@ -11,6 +11,7 @@ use super::{privacy, repo, template, track};
 use crate::import::shell_history::{self, HistoryCommand};
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags};
+use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 
 /// Where history comes from.
@@ -192,6 +193,11 @@ struct Candidate {
 
 /// Filter `candidates` (already in import order) and record the rest in one
 /// transaction that also marks `key` imported. Returns how many were inserted.
+///
+/// The repository of every directory is looked up before the transaction
+/// starts: that is file system work (a walk up to `.git` per directory), and
+/// inside the transaction it would hold the write lock that `track-command`
+/// and the picker wait on.
 fn record_candidates(
     store: &CmdStore,
     key: &str,
@@ -199,6 +205,7 @@ fn record_candidates(
     context: &ImportContext,
 ) -> Result<u64> {
     let already = store.import_done(key)?;
+    let repo_roots = repo_roots(candidates, context.home);
     store.transaction(|tx| {
         let mut inserted = 0;
         for candidate in candidates {
@@ -206,9 +213,7 @@ fn record_candidates(
                 continue;
             }
             let cwd = candidate.cwd.as_deref();
-            let repo_root =
-                cwd.and_then(|cwd| repo::find_repo_root(Path::new(cwd), Some(context.home)));
-            let repo_root = repo_root.as_deref().map(Path::to_string_lossy);
+            let repo_root = cwd.and_then(|cwd| repo_roots.get(cwd)?.as_deref());
             let template = template::templatize(&candidate.text);
             let outcome = CmdStore::record_run_in(
                 tx,
@@ -217,7 +222,7 @@ fn record_candidates(
                     template: &template,
                     started_at: candidate.started_at,
                     cwd,
-                    repo_root: repo_root.as_deref(),
+                    repo_root,
                     exit_code: candidate.exit_code,
                     duration_ms: candidate.duration_ms,
                     shell_session: &candidate.shell_session,
@@ -231,6 +236,19 @@ fn record_candidates(
         store.mark_import(key, context.now, inserted)?;
         Ok(inserted)
     })
+}
+
+/// The repository root (as stored: `to_string_lossy`) of each distinct
+/// `cwd` among `candidates`, `None` outside a repository.
+fn repo_roots<'a>(candidates: &'a [Candidate], home: &Path) -> FxHashMap<&'a str, Option<String>> {
+    let mut roots = FxHashMap::default();
+    for cwd in candidates.iter().filter_map(|c| c.cwd.as_deref()) {
+        roots.entry(cwd).or_insert_with(|| {
+            repo::find_repo_root(Path::new(cwd), Some(home))
+                .map(|root| root.to_string_lossy().into_owned())
+        });
+    }
+    roots
 }
 
 /// Section 12.3 step 4.
