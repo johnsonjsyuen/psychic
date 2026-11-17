@@ -515,7 +515,7 @@ fn import_atuin(store: &CmdStore, path: &Path, context: &ImportContext) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::store::test_support::{command_id, hook_run, query_strings};
+    use crate::cmd::store::test_support::{command_id, hook_run, query_strings, table_rows};
 
     #[test]
     fn assign_times_fills_gaps_backwards_from_the_ceiling() {
@@ -777,6 +777,44 @@ mod tests {
 
         assert_eq!(command_id(&scratch.store, "rm -rf build"), None);
         assert!(command_id(&scratch.store, "ls").is_some());
+    }
+
+    #[test]
+    fn a_deleted_command_stays_deleted_through_a_purge_and_a_new_import() {
+        let scratch = Scratch::new("backfill-tomb-purge");
+        std::fs::write(
+            scratch.home.join(".zsh_history"),
+            ": 1700000000:0;echo synthetic-secret-zsh\n: 1700000001:0;echo kept-zsh\n",
+        )
+        .unwrap();
+        // Untimestamped: imported again only because purge forgets the import.
+        std::fs::write(
+            scratch.home.join(".bash_history"),
+            "echo synthetic-secret-bash\necho kept-bash\n",
+        )
+        .unwrap();
+        scratch.import(NOW);
+        for text in ["echo synthetic-secret-zsh", "echo synthetic-secret-bash"] {
+            let id = command_id(&scratch.store, text).unwrap();
+            scratch.store.delete_command(id, text, NOW).unwrap();
+        }
+
+        scratch.store.purge().unwrap();
+        assert_eq!(table_rows(&scratch.store, "commands"), 0);
+        assert_eq!(table_rows(&scratch.store, "command_imports"), 0);
+        assert_eq!(table_rows(&scratch.store, "deleted_commands"), 2);
+        scratch.import(NOW + 10);
+
+        assert_eq!(
+            command_id(&scratch.store, "echo synthetic-secret-zsh"),
+            None
+        );
+        assert_eq!(
+            command_id(&scratch.store, "echo synthetic-secret-bash"),
+            None
+        );
+        assert!(command_id(&scratch.store, "echo kept-zsh").is_some());
+        assert!(command_id(&scratch.store, "echo kept-bash").is_some());
     }
 
     #[test]

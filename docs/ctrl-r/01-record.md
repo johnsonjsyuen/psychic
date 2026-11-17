@@ -403,7 +403,7 @@ fixes the join order (SQLite never reorders a `CROSS JOIN`).
 | D3 | `DELETE FROM command_runs WHERE command_id = ?1` (plan: `idx_command_runs_command`) | delete one |
 | D4 | `UPDATE command_runs SET prev_command_id = NULL WHERE prev_command_id = ?1` (plan: `idx_command_runs_prev`) | delete one |
 | D5 | `DELETE FROM commands WHERE id = ?1` | delete one |
-| P1 | `PRAGMA secure_delete = ON`; then in one transaction `DELETE FROM command_events; DELETE FROM command_runs; DELETE FROM commands; DELETE FROM command_imports; DELETE FROM deleted_commands;`; then `VACUUM`; then `PRAGMA wal_checkpoint(TRUNCATE)`, whose first column (busy) must be 0 (section 10.5) | purge |
+| P1 | `PRAGMA secure_delete = ON`; then in one transaction `DELETE FROM command_events; DELETE FROM command_runs; DELETE FROM commands; DELETE FROM command_imports;` (`deleted_commands` is kept, section 10.5); then `VACUUM`; then `PRAGMA wal_checkpoint(TRUNCATE)`, whose first column (busy) must be 0 (section 10.5) | purge |
 | W1 | `PRAGMA busy_timeout` set to 0 on this connection; then `PRAGMA wal_checkpoint(TRUNCATE)`; busy (first column) 1 is not an error (section 9.1) | `track-command`, once `events.db-wal` is over `CMD_WAL_TRUNCATE_BYTES` |
 | I1 | `SELECT MIN(started_at) FROM command_runs WHERE source = 'hook'` (plan: `idx_command_runs_hook`) | backfill |
 | I2 | `SELECT 1 FROM command_imports WHERE source_key = ?1` / `INSERT OR REPLACE INTO command_imports (source_key, imported_at, runs) VALUES (?1, ?2, ?3)` | backfill |
@@ -723,11 +723,23 @@ today's modes.
 | Operation | Trigger | Effect |
 |---|---|---|
 | Delete one command | Picker key ([02 section 9](02-browse.md#9-keys)) | `CmdStore::delete_command`: D1-D5 in one transaction. The tombstone `fnv1a64(text)` stops a later import restoring it. Running the command again records it again |
-| Purge | `psychic history --purge` | Without `--yes`: print `Delete all recorded commands (N commands, M runs)? [y/N] ` and read one line from stdin; anything but `y`/`Y` prints `Nothing deleted.` and returns. Then P1, remove `cmd_model.txt` and `cmd_model_stats.json` if present, print `Deleted N commands and M runs. Recording is still on|off.` If P1's checkpoint reported busy, then fail with E-R-23. The marker file is not touched |
+| Purge | `psychic history --purge` | Without `--yes`: print `Delete all recorded commands (N commands, M runs)? [y/N] ` and read one line from stdin; anything but `y`/`Y` prints `Nothing deleted.` and returns. Then P1, remove `cmd_model.txt` and `cmd_model_stats.json` if present, print `Deleted N commands and M runs. Recording is still on|off.` If P1's checkpoint reported busy, then fail with E-R-23. The marker file is not touched. The tombstones in `deleted_commands` are kept; `command_imports` is emptied, so the next import (`--import`, or the first `--enable` after it) reads every source again, minus the tombstoned texts |
 
 ```rust
 pub(super) fn fnv1a64(text: &str) -> i64  // offset 0xcbf29ce484222325, prime 0x100000001b3, over UTF-8 bytes, `as i64`
 ```
+
+A tombstone is that hash and the second of the delete; it holds no text. It
+outlives a purge: purge empties everything else, and a tombstone is the only
+thing that stops the shell's own history file (which psychic does not edit)
+from bringing a deleted command back on the next import, including the one a
+`--disable`, `--purge`, `--enable` sequence runs. `command_imports` is emptied
+by purge, because a source marked as imported would skip its untimestamped
+entries on the next import (section 12.3 step 4). The hash is unsalted FNV-1a
+of the raw text and not a cryptographic hash: someone holding `events.db` can
+confirm a guess (hash a candidate command and look it up), so a short or
+guessable secret is not hidden from a dictionary or brute-force search; a
+long random one is. What a tombstone does not reveal is any text nobody guessed.
 
 Purge leaves no command text in the database's files. `DELETE` alone leaves the freed pages'
 bytes in `events.db`, and in WAL mode the old pages also sit in
@@ -1504,7 +1516,8 @@ within one test: `Database`'s schema registry is keyed by path
 | IT-R-03 | Import stops at the first hook run | As IT-R-02 plus one `Source::Hook` run at t=1,700,000,050 before importing a zsh file with entries at ...000 and ...100 | Only the ...000 entry is imported | `remove_dir_all` |
 | IT-R-04 | Atuin import | Build a temp `history.db` with the A1-A4 schema and 4 rows with nanosecond timestamps: (exit 0, cwd `/x`), (exit 1, cwd `unknown`), (exit -1, cwd `/y`), and a fourth with `deleted_at` set | 3 rows imported; `started_at` in seconds; `exit_code` 0, 1, NULL; `cwd` `/x`, NULL, `/y`; `duration_ms` NULL where Atuin's is -1; the Atuin file's mtime and size are unchanged | `remove_dir_all` |
 | IT-R-05 | Tombstone blocks re-import | Import, `delete_command` one, import again | The deleted text is absent after the second import | `remove_dir_all` |
-| IT-R-06 | Enable, disable, purge | Temp data dir; `--enable --no-import`, record 2 runs, `--status`, `--purge --yes`, `--disable` | Marker exists then not; modes 700/600; status lines as section 13.3; after purge all five tables are empty and the marker is still present | `remove_dir_all` |
+| IT-R-08 | Tombstones outlive purge | `.zsh_history` (timestamped) and `.bash_history` (untimestamped), each with a synthetic secret and a kept command; import, `delete_command` both secrets, `purge`, import again | After purge: `commands` and `command_imports` empty, `deleted_commands` 2 rows; after the second import both kept commands are back (the bash one only because `command_imports` was emptied) and neither secret is. Purge's unit test checks a tombstone survives it | `remove_dir_all` |
+| IT-R-06 | Enable, disable, purge | Temp data dir; `--enable --no-import`, record 2 runs, `--status`, `--purge --yes`, `--disable` | Marker exists then not; modes 700/600; status lines as section 13.3; after purge all five tables are empty (nothing was tombstoned) and the marker is still present | `remove_dir_all` |
 | IT-R-07 | No command text leaks (`tests/no_text_leaks.rs`, the built binary, so its real logger writes the real `app.log`) | Temp `HOME` (cleared environment) with `.bash_history`, `.zsh_history` and a non-database Atuin `history.db`, all holding `SENTINEL_c0ffee`; `--data-dir` in the temp dir. Run `history --enable` (imports), `track-command` with the sentinel (succeeding, and failing on a data dir that is a file), `history --import`, `--status`, `--purge --yes` | No invocation's stdout or stderr contains the sentinel; it is in `events.db*` before the purge (so it went through every path); `app.log` exists and holds `atuin skipped (unreadable)` (so a leak would show); no file in the data dir other than `events.db*`, recursively, contains the bytes; nothing was written to `HOME/.local/share/psychic`. Checked to fail when a `log::debug!` of the text is added to the importer | `remove_dir_all` |
 | IT-S-zsh, IT-S-bash, IT-S-fish | Real shell, real hook (`tests/shell_hooks.rs`) | Section 15.3 | Section 15.3 | `remove_dir_all` |
 

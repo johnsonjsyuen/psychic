@@ -147,7 +147,10 @@ const D3: &str = "DELETE FROM command_runs WHERE command_id = ?1";
 const D4: &str = "UPDATE command_runs SET prev_command_id = NULL WHERE prev_command_id = ?1";
 const D5: &str = "DELETE FROM commands WHERE id = ?1";
 
-const P1: &str = "DELETE FROM command_events; DELETE FROM command_runs; DELETE FROM commands; DELETE FROM command_imports; DELETE FROM deleted_commands;";
+/// Everything but `deleted_commands`: the tombstones hold no text (section
+/// 10.5), and without them a later import would bring the deleted commands
+/// back from the shell's history file.
+const P1: &str = "DELETE FROM command_events; DELETE FROM command_runs; DELETE FROM commands; DELETE FROM command_imports;";
 /// Before P1: the pages the deletes free are overwritten with zeros.
 const P1_SECURE: &str = "PRAGMA secure_delete = ON";
 /// After P1 and `VACUUM`: copy the log into the database and cut it to zero
@@ -891,8 +894,8 @@ impl CmdStore {
         })
     }
 
-    /// Delete everything in the command tables (P1), then `VACUUM` so the
-    /// text is gone from the file too. Returns what there was.
+    /// Delete everything in the command tables but the tombstones (P1), then
+    /// `VACUUM` so the text is gone from the file too. Returns what there was.
     pub(super) fn purge(&self) -> Result<PurgeCounts> {
         let before = self.counts()?;
         self.conn()
@@ -1347,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_empties_every_command_table_and_reports_what_there_was() {
+    fn purge_empties_every_command_table_but_the_tombstones_and_reports_what_there_was() {
         let store = CmdStore::in_memory();
         record(&store, &hook_run("A", "s", 100, Some(0)));
         record(&store, &hook_run("A", "s", 101, Some(0)));
@@ -1365,10 +1368,12 @@ mod tests {
             "command_runs",
             "command_events",
             "command_imports",
-            "deleted_commands",
         ] {
             assert_eq!(table_rows(&store, table), 0, "{table} is empty");
         }
+        // The tombstone stays, so an import cannot bring B back.
+        assert!(store.is_tombstoned(privacy::fnv1a64("B")).unwrap());
+        assert_eq!(table_rows(&store, "deleted_commands"), 1);
     }
 
     const SENTINEL: &[u8] = b"SENTINEL_purge_5ca1ab1e";

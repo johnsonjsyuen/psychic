@@ -2877,7 +2877,9 @@ of log (+0.4-0.6 ms `db_open`). Details and the rejected options:
 its `-wal`/`-shm`, the marker and the command model files `0600` (only when
 they differ; file-only users who never enable history keep their modes).
 Errors from the command code name the operation and SQLite error code, never
-a bound value. `--purge` turns on `secure_delete`, empties the five tables,
+a bound value. `--purge` turns on `secure_delete`, empties the command tables
+except the tombstones (hashes, no text, so a deleted command stays deleted
+through a purge and a re-import),
 `VACUUM`s, and truncates the write-ahead log with a `TRUNCATE` checkpoint, so
 no deleted text stays in the database's files even while another psychic
 process has the database open; if one is in the middle of a read, the checkpoint cannot
