@@ -3017,16 +3017,26 @@ subcommand refuses to run without an explicit `--data-dir`, or with the real
 one, and `generate`/`extract-agent` refuse a data dir that already holds
 commands. Both builders write through `CmdStore::record_run_in`, so a corpus
 is ordinary recorded history. `generate --commands N --runs M --seed S
-[--anchor T]` simulates a user over 40 directories in 8 repositories: one
-splitmix64 stream, Zipf popularity, per-directory favourites, edit-build-test
+[--anchor T] [--profile interactive|repetitive|agent]` simulates a user over
+40 directories in 8 repositories: one splitmix64 stream, Zipf popularity,
+per-directory favourites, a working set of recent commands, edit-build-test
 chains, session repeats and retry-after-failure, about 300 s between runs;
-the same arguments give a byte-identical history. 50,000 commands / 500,000
-runs take 7.6 s and 111 MB after `VACUUM`. `extract-agent [--projects-dir D]`
+the same arguments give a byte-identical history. The default,
+`interactive`, is calibrated on `stats` of a real bash history (immediate
+repeats about 0.06, top-10 share about 0.4, most commands run once: half of
+the commands are one-offs the generator never picks again, so a heavy head
+carries the 10 runs per command); `repetitive` is the original D0 shape (half
+of all runs repeat the previous one) and `agent` a flat, low-repeat one; the
+targets and which of them are assumptions are in 04 section 4.3. 50,000
+commands / 500,000 runs take about 9 s and 120 MB as written. `extract-agent [--projects-dir D]`
 reads `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR`'s) read-only
 and records each Bash tool call with its cwd, time, exit status (`is_error`
 -> 1) and duration, in session `agent:<sessionId>[:<agentId>]`. `stats`
 prints aggregates only: counts, span, shares with cwd and exit code,
-sessions, immediate-repeat and first-ever shares, pick episodes.
+sessions, immediate-repeat and first-ever shares, pick episodes, then top-10
+and top-100 shares, commands run once, the recurrence gap in runs and
+seconds, same-directory and same-session shares of recurring runs, and
+command length percentiles.
 
 ## Page-Based Caching
 

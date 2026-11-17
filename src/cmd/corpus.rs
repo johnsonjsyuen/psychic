@@ -66,6 +66,137 @@ fn zipf(u: f64, n: usize) -> usize {
 // Synthetic generator (section 4.3)
 // ---------------------------------------------------------------------------
 
+/// The shape of a synthetic history (`generate --profile`, section 4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Profile {
+    /// Calibrated on a real interactive shell history: few immediate
+    /// repeats, a heavy head of short commands, most commands run once.
+    Interactive,
+    /// The D0 generator, unchanged: about half of all runs repeat the
+    /// previous command. A stress case.
+    Repetitive,
+    /// Like a coding agent: almost no repeats, a flat popularity and long
+    /// commands. A stress case.
+    Agent,
+}
+
+/// How a profile spells command `i`.
+#[derive(Clone, Copy)]
+enum TextStyle {
+    /// `tool sub arg`, every command three words (the D0 texts).
+    ThreeWords,
+    /// The most popular commands are one or two words; some of the tail
+    /// grows a pipe or extra flags.
+    Interactive,
+    /// A `cd` into the repository, the command, a message of a heavy-tailed
+    /// number of words, and output trimming.
+    Agent,
+}
+
+/// The parameters of a profile: section 4.3, table "Profiles".
+struct Shape {
+    /// Per run: chance of moving to another directory.
+    p_move: f64,
+    /// Per run: chance the run fails.
+    p_fail: f64,
+    /// After a failure: chance the next reused run retries it.
+    p_retry: f64,
+    /// Upper ends of the reuse branches over one draw `c`, in this order:
+    /// repeat, chain, directory, recent; global above the last.
+    repeat_below: f64,
+    chain_below: f64,
+    dir_below: f64,
+    recent_below: f64,
+    /// Repeat branch: weights of the session's last three, newest first.
+    repeat_weights: [f64; RecentCommands::LEN],
+    /// Exponent of the global popularity Zipf (1.0 is the D0 formula).
+    zipf_s: f64,
+    /// Exponent of the recent branch's Zipf over the working set.
+    recent_s: f64,
+    /// A chain, directory, recent or global pick that equals the previous
+    /// command takes its list's next entry instead, so immediate repeats come
+    /// only from the repeat and retry branches.
+    avoid_repeat: bool,
+    /// Share of commands (after the first [`ALWAYS_REUSABLE`]) that are
+    /// one-offs: run when new, and again only by the repeat or retry branch.
+    one_off: f64,
+    /// A homed command's home is the directory it first ran in, rather than
+    /// a hashed one.
+    home_where_first_run: bool,
+    text: TextStyle,
+}
+
+impl Profile {
+    fn shape(self) -> Shape {
+        match self {
+            Profile::Interactive => Shape {
+                p_move: 0.02,
+                p_fail: 0.08,
+                p_retry: 0.25,
+                repeat_below: 0.045,
+                chain_below: 0.10,
+                dir_below: 0.30,
+                recent_below: 0.65,
+                repeat_weights: [1.0, 0.0, 0.0],
+                zipf_s: 1.5,
+                recent_s: 1.8,
+                avoid_repeat: true,
+                one_off: 0.5,
+                home_where_first_run: true,
+                text: TextStyle::Interactive,
+            },
+            Profile::Repetitive => Shape {
+                p_move: 0.08,
+                p_fail: 0.10,
+                p_retry: 0.5,
+                repeat_below: 0.55,
+                chain_below: 0.68,
+                dir_below: 0.87,
+                recent_below: 0.87,
+                repeat_weights: [0.80, 0.12, 0.08],
+                zipf_s: 1.0,
+                recent_s: 1.0,
+                avoid_repeat: false,
+                one_off: 0.0,
+                home_where_first_run: false,
+                text: TextStyle::ThreeWords,
+            },
+            Profile::Agent => Shape {
+                p_move: 0.005,
+                p_fail: 0.10,
+                p_retry: 0.0,
+                repeat_below: 0.0,
+                chain_below: 0.05,
+                dir_below: 0.60,
+                recent_below: 0.85,
+                repeat_weights: [1.0, 0.0, 0.0],
+                zipf_s: 0.0,
+                recent_s: 1.0,
+                avoid_repeat: true,
+                one_off: 0.0,
+                home_where_first_run: true,
+                text: TextStyle::Agent,
+            },
+        }
+    }
+}
+
+/// A Zipf position of exponent `s` in a list of length `n`, from a uniform
+/// `u`: the inverse CDF of the density `(x + 1)^-s` on `[0, n)`, floored.
+/// `s = 1` is [`zipf`] exactly; `s = 0` is uniform; a larger `s` has a
+/// heavier head.
+fn zipf_s(u: f64, n: usize, s: f64) -> usize {
+    if s == 1.0 {
+        return zipf(u, n);
+    }
+    assert!(n > 0, "a Zipf pick needs a non-empty list");
+    assert!((0.0..1.0).contains(&u), "u is in [0, 1)");
+    let a = 1.0 - s;
+    let top = ((n + 1) as f64).powf(a);
+    let x = (1.0 + u * (top - 1.0)).powf(1.0 / a);
+    (x as usize).saturating_sub(1).min(n - 1)
+}
+
 const TOOLS: [&str; 40] = [
     "git",
     "cargo",
@@ -120,11 +251,16 @@ const DIRS_PER_REPO: usize = 5;
 const DIRS: usize = REPOS * DIRS_PER_REPO;
 /// Runs written per transaction.
 const GENERATE_BATCH: usize = 10_000;
+/// Distinct commands the recent branch chooses among: the most recently run.
+const WORKING_SET: usize = 256;
+/// The most popular commands are never one-offs, so the reusable list is
+/// never empty once something has run.
+const ALWAYS_REUSABLE: usize = 10;
 
 /// The fixed part of the synthetic world: what command `i` is, where it lives
 /// and what tends to follow it. Pure functions of the seed and `i`.
 struct World {
-    salts: [u64; 5],
+    salts: [u64; 7],
 }
 
 impl World {
@@ -139,6 +275,7 @@ impl World {
         splitmix64(self.salts[salt] ^ i as u64)
     }
 
+    /// The D0 text: `tool sub arg`, unique because `arg` holds `i`.
     fn text(i: usize) -> String {
         let tool = TOOLS[i % TOOLS.len()];
         let sub = SUBS[(i / TOOLS.len()) % SUBS.len()];
@@ -149,9 +286,49 @@ impl World {
         }
     }
 
+    /// Command `i` in `style`. Unique for every `i` in every style.
+    fn styled_text(&self, style: TextStyle, i: usize) -> String {
+        // Commands spelled as one word: the head of the popularity.
+        const SINGLE_WORD: usize = 8;
+        const PAIRS: usize = TOOLS.len() * SUBS.len();
+        match style {
+            TextStyle::ThreeWords => Self::text(i),
+            TextStyle::Interactive if i < SINGLE_WORD => TOOLS[i].to_string(),
+            TextStyle::Interactive => match self.h(5, i) % 10 {
+                // Two words while `i` still names a distinct pair.
+                0..=3 if i < PAIRS => {
+                    format!("{} {}", TOOLS[i % TOOLS.len()], SUBS[i / TOOLS.len()])
+                }
+                0..=7 => Self::text(i),
+                _ => format!("{} 2>&1 | grep -v pattern{}", Self::text(i), i % 97),
+            },
+            TextStyle::Agent => {
+                // Words in the message: 5 to 205, most short, a few very long.
+                let u = (self.h(5, i) >> 11) as f64 / (1u64 << 53) as f64;
+                let words = 5 + (200.0 * u * u * u) as usize;
+                let message: Vec<&str> =
+                    (0..words).map(|k| SUBS[(i + 7 * k) % SUBS.len()]).collect();
+                format!(
+                    "cd /synth/repo{} && {} --message \"{}\" 2>&1 | tail -n {}",
+                    i % REPOS,
+                    Self::text(i),
+                    message.join(" "),
+                    20 + i % 80
+                )
+            }
+        }
+    }
+
     /// The directory command `i` is mostly run in; `None` for a global command.
     fn home(&self, i: usize) -> Option<usize> {
         (self.h(2, i) % 10 < 7).then(|| (self.h(1, i) % DIRS as u64) as usize)
+    }
+
+    /// Whether command `i` may be chosen again by the chain, directory,
+    /// recent and global branches: all but a `one_off` share of the commands
+    /// after the first [`ALWAYS_REUSABLE`].
+    fn reusable(&self, i: usize, one_off: f64) -> bool {
+        i < ALWAYS_REUSABLE || ((self.h(6, i) >> 11) as f64 / (1u64 << 53) as f64) >= one_off
     }
 
     /// The command that tends to follow `i` (never a later one).
@@ -192,7 +369,6 @@ struct RecentCommands {
 
 impl RecentCommands {
     const LEN: usize = 3;
-    const WEIGHTS: [f64; Self::LEN] = [0.80, 0.12, 0.08];
 
     fn push(&mut self, command: usize) {
         self.newest_first.insert(0, command);
@@ -203,10 +379,10 @@ impl RecentCommands {
         self.newest_first.first().copied()
     }
 
-    /// One of the last three, weighted 0.80 / 0.12 / 0.08 (renormalised over
+    /// One of the last three by `weights` (newest first, renormalised over
     /// those that exist), from a uniform `u`.
-    fn weighted(&self, u: f64) -> Option<usize> {
-        let weights = &Self::WEIGHTS[..self.newest_first.len()];
+    fn weighted(&self, u: f64, weights: &[f64; Self::LEN]) -> Option<usize> {
+        let weights = &weights[..self.newest_first.len()];
         let total: f64 = weights.iter().sum();
         let mut target = u * total;
         for (command, weight) in self.newest_first.iter().zip(weights) {
@@ -219,8 +395,42 @@ impl RecentCommands {
     }
 }
 
+/// The last [`WORKING_SET`] distinct commands run, most recent first, across
+/// sessions: what a user is "working on" lately.
+#[derive(Default)]
+struct WorkingSet {
+    newest_first: Vec<usize>,
+}
+
+impl WorkingSet {
+    fn touch(&mut self, command: usize) {
+        if let Some(at) = self.newest_first.iter().position(|&c| c == command) {
+            self.newest_first.remove(at);
+        }
+        self.newest_first.insert(0, command);
+        self.newest_first.truncate(WORKING_SET);
+    }
+}
+
+/// When `avoid` is set and `list[pos]` is `previous`, the next entry
+/// (wrapping); otherwise `list[pos]`. A one-entry list keeps its entry.
+fn avoiding(
+    avoid: bool,
+    previous: Option<usize>,
+    pos: usize,
+    len: usize,
+    at: impl Fn(usize) -> usize,
+) -> usize {
+    let pick = at(pos);
+    if avoid && Some(pick) == previous && len > 1 {
+        at((pos + 1) % len)
+    } else {
+        pick
+    }
+}
+
 /// Section 4.3, "For each run": the whole simulation, without any IO.
-fn simulate(commands: usize, runs: usize, seed: u64) -> Vec<SynthRun> {
+fn simulate(commands: usize, runs: usize, seed: u64, shape: &Shape) -> Vec<SynthRun> {
     assert!(
         1 <= commands && commands <= runs,
         "need 1 <= commands <= runs"
@@ -229,10 +439,14 @@ fn simulate(commands: usize, runs: usize, seed: u64) -> Vec<SynthRun> {
     let mut rng = Stream { state: seed };
 
     let mut seen = 0usize;
+    // Commands the chain, directory, recent and global branches may choose,
+    // in first-run order (lower = more popular).
+    let mut reusable: Vec<usize> = Vec::new();
     let mut homed: Vec<Vec<usize>> = vec![Vec::new(); DIRS];
     let mut dir = rng.below(DIRS as u64) as usize;
     let mut session = 0u64;
     let mut recent = RecentCommands::default();
+    let mut working = WorkingSet::default();
     let mut t = 0i64;
     let mut retry: Option<usize> = None;
     let mut out = Vec::with_capacity(runs);
@@ -252,7 +466,7 @@ fn simulate(commands: usize, runs: usize, seed: u64) -> Vec<SynthRun> {
         }
 
         // Move.
-        if rng.u() < 0.08 {
+        if rng.u() < shape.p_move {
             dir = rng.below(DIRS as u64) as usize;
         }
 
@@ -262,16 +476,33 @@ fn simulate(commands: usize, runs: usize, seed: u64) -> Vec<SynthRun> {
         let command = if seen == 0 || x < p_new {
             let new = seen;
             seen += 1;
-            if let Some(home) = world.home(new) {
-                homed[home].push(new);
+            if world.reusable(new, shape.one_off) {
+                reusable.push(new);
+                let home = world.home(new).map(|home| {
+                    if shape.home_where_first_run {
+                        dir
+                    } else {
+                        home
+                    }
+                });
+                if let Some(home) = home {
+                    homed[home].push(new);
+                }
             }
             new
         } else {
-            choose_seen(&world, &mut rng, retry, &recent, &homed[dir], seen)
+            let state = Seen {
+                retry,
+                recent: &recent,
+                working: &working,
+                in_dir: &homed[dir],
+                reusable: &reusable,
+            };
+            choose_seen(&world, &mut rng, shape, &state)
         };
 
         // Outcome.
-        let exit_code = if rng.u() < 0.10 { 1 } else { 0 };
+        let exit_code = if rng.u() < shape.p_fail { 1 } else { 0 };
         retry = (exit_code != 0).then_some(command);
         let duration_ms = 10 + rng.below(5000) as i64;
 
@@ -284,47 +515,73 @@ fn simulate(commands: usize, runs: usize, seed: u64) -> Vec<SynthRun> {
             duration_ms,
         });
         recent.push(command);
+        if world.reusable(command, shape.one_off) {
+            working.touch(command);
+        }
     }
     assert_eq!(seen, commands, "p_new reaches 1 when it must");
     out
 }
 
-/// "Else choose" of section 4.3: retry, repeat, chain, directory or global.
-fn choose_seen(
-    world: &World,
-    rng: &mut Stream,
+/// What "Else choose" looks at.
+struct Seen<'a> {
     retry: Option<usize>,
-    recent: &RecentCommands,
-    in_dir: &[usize],
-    seen: usize,
-) -> usize {
-    assert!(seen > 0, "something has run before");
-    if let Some(failed) = retry
-        && rng.u() < 0.5
+    recent: &'a RecentCommands,
+    working: &'a WorkingSet,
+    in_dir: &'a [usize],
+    reusable: &'a [usize],
+}
+
+/// "Else choose" of section 4.3: retry, repeat, chain, directory, recent or
+/// global.
+fn choose_seen(world: &World, rng: &mut Stream, shape: &Shape, state: &Seen) -> usize {
+    assert!(!state.reusable.is_empty(), "the first command is reusable");
+    if let Some(failed) = state.retry
+        && rng.u() < shape.p_retry
     {
         return failed;
     }
+    let previous = state.recent.newest();
+    let avoid = shape.avoid_repeat;
     let c = rng.u();
-    let branch = if c < 0.55 {
-        // Repeat. The weighted pick draws only when there is something to pick.
-        if recent.newest().is_some() {
-            recent.weighted(rng.u())
+    let branch = if c < shape.repeat_below {
+        // The weighted pick draws only when there is something to pick.
+        if previous.is_some() {
+            state.recent.weighted(rng.u(), &shape.repeat_weights)
         } else {
             None
         }
-    } else if c < 0.68 {
-        recent.newest().and_then(|last| world.successor(last))
-    } else if c < 0.87 {
-        (!in_dir.is_empty()).then(|| in_dir[zipf(rng.u(), in_dir.len())])
+    } else if c < shape.chain_below {
+        previous
+            .and_then(|last| world.successor(last))
+            .filter(|&next| world.reusable(next, shape.one_off))
+            .filter(|&next| !(avoid && Some(next) == previous))
+    } else if c < shape.dir_below {
+        let in_dir = state.in_dir;
+        (!in_dir.is_empty()).then(|| {
+            let pos = zipf(rng.u(), in_dir.len());
+            avoiding(avoid, previous, pos, in_dir.len(), |k| in_dir[k])
+        })
+    } else if c < shape.recent_below {
+        // The working set without its newest entry: the previous command
+        // when that is reusable (a one-off is never in the working set).
+        let older = state.working.newest_first.get(1..).unwrap_or_default();
+        (!older.is_empty()).then(|| older[zipf_s(rng.u(), older.len(), shape.recent_s)])
     } else {
         None
     };
-    branch.unwrap_or_else(|| zipf(rng.u(), seen))
+    branch.unwrap_or_else(|| {
+        let reusable = state.reusable;
+        let pos = zipf_s(rng.u(), reusable.len(), shape.zipf_s);
+        avoiding(avoid, previous, pos, reusable.len(), |k| reusable[k])
+    })
 }
 
-/// Write a seeded synthetic history of `commands` distinct commands and `runs`
-/// runs into `store`, the newest run at `anchor - 60`. Deterministic for a
-/// given `(commands, runs, seed, anchor)`.
+/// [`generate_profile`] with the default profile, [`Profile::Interactive`].
+#[allow(
+    dead_code,
+    reason = "the default shape, for tests and the training fixture (Phase C)"
+)]
 pub(super) fn generate(
     store: &CmdStore,
     commands: usize,
@@ -332,15 +589,33 @@ pub(super) fn generate(
     seed: u64,
     anchor: i64,
 ) -> Result<()> {
+    generate_profile(store, commands, runs, seed, anchor, Profile::Interactive)
+}
+
+/// Write a seeded synthetic history of `commands` distinct commands and `runs`
+/// runs, shaped by `profile`, into `store`, the newest run at `anchor - 60`.
+/// Deterministic for a given `(commands, runs, seed, anchor, profile)`.
+pub(super) fn generate_profile(
+    store: &CmdStore,
+    commands: usize,
+    runs: usize,
+    seed: u64,
+    anchor: i64,
+    profile: Profile,
+) -> Result<()> {
     assert!(
         1 <= commands && commands <= runs,
         "need 1 <= commands <= runs"
     );
-    let simulated = simulate(commands, runs, seed);
+    let shape = profile.shape();
+    let simulated = simulate(commands, runs, seed, &shape);
     let t_last = simulated.last().expect("runs >= 1").t;
     let shift = anchor - 60 - t_last;
 
-    let texts: Vec<String> = (0..commands).map(World::text).collect();
+    let world = World::new(seed);
+    let texts: Vec<String> = (0..commands)
+        .map(|i| world.styled_text(shape.text, i))
+        .collect();
     let templates: Vec<String> = texts
         .iter()
         .map(|text| template::templatize(text))
@@ -691,13 +966,17 @@ mod tests {
 
     #[test]
     fn recent_commands_weights_renormalise() {
+        let weights = Profile::Repetitive.shape().repeat_weights;
         let mut recent = RecentCommands::default();
-        assert_eq!(recent.weighted(0.5), None);
+        assert_eq!(recent.weighted(0.5, &weights), None);
         recent.push(7);
-        assert_eq!(recent.weighted(0.99), Some(7));
+        assert_eq!(recent.weighted(0.99, &weights), Some(7));
         recent.push(8); // newest first: 8, 7; weights 0.80, 0.12 of 0.92
-        assert_eq!(recent.weighted(0.86), Some(8));
-        assert_eq!(recent.weighted(0.88), Some(7));
+        assert_eq!(recent.weighted(0.86, &weights), Some(8));
+        assert_eq!(recent.weighted(0.88, &weights), Some(7));
+        // Interactive repeats only the newest.
+        let newest = Profile::Interactive.shape().repeat_weights;
+        assert_eq!(recent.weighted(0.999, &newest), Some(8));
         recent.push(9);
         recent.push(10);
         assert_eq!(recent.newest_first, vec![10, 9, 8]);
@@ -715,12 +994,14 @@ mod tests {
 
     #[test]
     fn simulation_has_every_command_once_new() {
-        let runs = simulate(5, 5, 3);
-        assert_eq!(
-            runs.iter().map(|run| run.command).collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4],
-            "commands == runs: every run is a new command"
-        );
+        for profile in [Profile::Interactive, Profile::Repetitive, Profile::Agent] {
+            let runs = simulate(5, 5, 3, &profile.shape());
+            assert_eq!(
+                runs.iter().map(|run| run.command).collect::<Vec<_>>(),
+                vec![0, 1, 2, 3, 4],
+                "commands == runs: every run is a new command"
+            );
+        }
     }
 
     // TC-N-03
@@ -728,7 +1009,7 @@ mod tests {
     fn generator_structure() {
         let store = CmdStore::in_memory();
         let anchor = 1_800_000_000;
-        generate(&store, 500, 20_000, 7, anchor).unwrap();
+        generate_profile(&store, 500, 20_000, 7, anchor, Profile::Repetitive).unwrap();
 
         let counts = store.counts().unwrap();
         assert_eq!(
@@ -758,7 +1039,7 @@ mod tests {
         assert_eq!(outside, vec!["0"], "every repo_root is a prefix of its cwd");
 
         // The simulation agrees with what was stored.
-        let simulated = simulate(500, 20_000, 7);
+        let simulated = simulate(500, 20_000, 7, &Profile::Repetitive.shape());
         assert_eq!(
             immediate_repeat_share(&simulated),
             stats.immediate_repeat_share
@@ -771,6 +1052,159 @@ mod tests {
         generate(&store, 50, 50, 2, 1_000_000).unwrap();
         let counts = store.counts().unwrap();
         assert_eq!((counts.commands, counts.hook_runs), (50, 50));
+    }
+
+    #[test]
+    fn zipf_s_generalises_zipf() {
+        for u in [0.0, 0.3, 0.5, 0.77, 0.999_999] {
+            assert_eq!(zipf_s(u, 1000, 1.0), zipf(u, 1000));
+        }
+        // s = 0 is uniform: 1 + 0.5 * 10 = 6 -> 5.
+        assert_eq!(zipf_s(0.5, 10, 0.0), 5);
+        assert_eq!(zipf_s(0.999_999, 10, 0.0), 9);
+        // s = 2: (1 + 0.5 * (1/1001 - 1))^-1 = 1.998 -> 0.
+        assert_eq!(zipf_s(0.5, 1000, 2.0), 0);
+        assert!(zipf_s(0.999_999, 1000, 2.0) >= 990, "the tail is reachable");
+        assert_eq!(zipf_s(0.5, 1, 1.6), 0);
+    }
+
+    #[test]
+    fn every_style_spells_each_command_once() {
+        let world = World::new(1);
+        for style in [
+            TextStyle::ThreeWords,
+            TextStyle::Interactive,
+            TextStyle::Agent,
+        ] {
+            let texts: rustc_hash::FxHashSet<String> =
+                (0..3000).map(|i| world.styled_text(style, i)).collect();
+            assert_eq!(texts.len(), 3000);
+            assert!(
+                texts.iter().all(|text| !template::is_own_command(text)),
+                "none is psychic's own"
+            );
+        }
+        assert_eq!(world.styled_text(TextStyle::Interactive, 6), "ls");
+        assert_eq!(world.styled_text(TextStyle::Interactive, 7), "cat");
+        for i in 8..3000 {
+            let text = world.styled_text(TextStyle::Interactive, i);
+            let pair = format!("{} {}", TOOLS[i % 40], SUBS[(i / 40) % 25]);
+            assert!(
+                (i < 1000 && text == pair) || text.starts_with(&World::text(i)),
+                "{i}: {text}"
+            );
+        }
+        assert!(
+            world
+                .styled_text(TextStyle::Agent, 5)
+                .starts_with("cd /synth/repo5 && make status arg5 --message \"")
+        );
+    }
+
+    #[test]
+    fn working_set_moves_to_front_and_is_bounded() {
+        let mut working = WorkingSet::default();
+        for command in [1, 2, 3, 2] {
+            working.touch(command);
+        }
+        assert_eq!(working.newest_first, vec![2, 3, 1]);
+        for command in 0..1000 {
+            working.touch(command);
+        }
+        assert_eq!(working.newest_first.len(), WORKING_SET);
+        assert_eq!(working.newest_first[0], 999);
+    }
+
+    /// FNV-1a over every simulated run, as text.
+    fn digest(runs: &[SynthRun]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for run in runs {
+            let line = format!(
+                "{},{},{},{},{},{};",
+                run.command, run.t, run.dir, run.session, run.exit_code, run.duration_ms
+            );
+            for byte in line.bytes() {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    #[test]
+    fn the_repetitive_profile_is_the_d0_generator() {
+        // The digest of `simulate(500, 20_000, 7)` before profiles existed
+        // (commit d65f6aa); its texts are `World::text`, checked above.
+        let runs = simulate(500, 20_000, 7, &Profile::Repetitive.shape());
+        assert_eq!(digest(&runs), 0xd62d_4f1c_e841_ad5f);
+    }
+
+    /// `stats` of a profile's history, both blocks.
+    fn profile_stats(
+        profile: Profile,
+        commands: usize,
+        runs: usize,
+    ) -> (
+        super::super::bench::CorpusStats,
+        super::super::bench::ShapeStats,
+    ) {
+        let store = CmdStore::in_memory();
+        generate_profile(&store, commands, runs, 7, 1_800_000_000, profile).unwrap();
+        let all_runs = store.all_runs().unwrap();
+        (
+            super::super::bench::CorpusStats::compute(
+                &store.counts().unwrap(),
+                &all_runs,
+                &store.all_events().unwrap(),
+            ),
+            super::super::bench::ShapeStats::compute(&all_runs, &store.all_commands().unwrap()),
+        )
+    }
+
+    // TC-N-12
+    #[test]
+    fn the_interactive_profile_is_near_the_real_history() {
+        let (stats, shape) = profile_stats(Profile::Interactive, 2000, 20_000);
+        assert_eq!((stats.commands, stats.runs), (2000, 20_000));
+        let checks = [
+            (
+                "immediate repeat share",
+                stats.immediate_repeat_share,
+                0.04,
+                0.10,
+            ),
+            ("top-10 share", shape.top10_share, 0.30, 0.50),
+            ("commands run once", shape.once_only_commands, 0.40, 0.80),
+            ("same directory", shape.same_dir_share, 0.60, 0.90),
+        ];
+        for (name, value, low, high) in checks {
+            assert!((low..=high).contains(&value), "{name} {value}");
+        }
+        let [_, p50, _, p90] = shape.gap_runs;
+        assert!((3..=20).contains(&p50), "gap p50 {p50}");
+        assert!(p90 >= 30, "gap p90 {p90}");
+        let [_, l50, _] = shape.length_chars;
+        assert!((4..=20).contains(&l50), "length p50 {l50}");
+    }
+
+    // TC-N-13
+    #[test]
+    fn the_agent_profile_hardly_repeats() {
+        let (stats, shape) = profile_stats(Profile::Agent, 1900, 2000);
+        assert!(
+            stats.immediate_repeat_share < 0.01,
+            "{}",
+            stats.immediate_repeat_share
+        );
+        assert!(shape.top10_share < 0.03, "{}", shape.top10_share);
+        assert!(shape.length_chars[1] >= 100, "{:?}", shape.length_chars);
+        // At ten runs per command it is still flat: no heavy head.
+        let (stats, shape) = profile_stats(Profile::Agent, 2000, 20_000);
+        assert!(
+            stats.immediate_repeat_share < 0.01,
+            "{}",
+            stats.immediate_repeat_share
+        );
+        assert!(shape.top10_share < 0.10, "{}", shape.top10_share);
     }
 
     fn dump(store: &CmdStore) -> Vec<String> {

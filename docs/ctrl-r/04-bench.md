@@ -65,7 +65,8 @@ first three variants; D adds the other three.
 pub enum BenchCommand {
     /// Write a seeded synthetic history into --data-dir
     Generate { #[arg(long)] commands: usize, #[arg(long)] runs: usize, #[arg(long, default_value_t = 1)] seed: u64,
-               #[arg(long)] anchor: Option<i64> },
+               #[arg(long)] anchor: Option<i64>,
+               #[arg(long, value_enum, default_value_t = Profile::Interactive)] profile: Profile },   // corpus::Profile
     /// Import Bash tool calls from Claude Code transcripts into --data-dir
     ExtractAgent { #[arg(long)] projects_dir: Option<PathBuf> },
     /// Describe the history in --data-dir
@@ -161,9 +162,18 @@ decide R1 on that machine either; see [README](README.md) residual item 10.
 
 ### 4.3 Corpus 3: synthetic generator
 
-`pub(super) fn generate(store: &CmdStore, commands: usize, runs: usize, seed: u64, anchor: i64) -> anyhow::Result<()>`
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Profile { Interactive, Repetitive, Agent }   // --profile interactive|repetitive|agent
+pub(super) fn generate_profile(store: &CmdStore, commands: usize, runs: usize, seed: u64, anchor: i64, profile: Profile) -> anyhow::Result<()>;
+pub(super) fn generate(store: &CmdStore, commands: usize, runs: usize, seed: u64, anchor: i64) -> anyhow::Result<()>; // Profile::Interactive
+```
+
 (`anchor` = `--anchor`, else the current time). Asserts `1 <= commands <= runs`.
-Deterministic for a given `(commands, runs, seed, anchor)`. One random stream:
+Deterministic for a given `(commands, runs, seed, anchor, profile)`. The
+profiles share one algorithm and differ only in the parameters of the table
+"Profiles" below; `repetitive` is the D0 generator, run for run (TC-N-15).
+One random stream:
 `next() = { state = splitmix64(state); state }` starting from `state = seed`
 (`splitmix64` as [03 section 5.2](03-learn.md#52-groups-from-executed-commands));
 `u()` = `(next() >> 11) as f64 / 2^53` (in `[0, 1)`, never 1.0, so `p_new = 1` always takes the new branch); `below(n)` = `next() % n`.
@@ -174,13 +184,17 @@ World:
 |---|---|
 | Directories | 40: `dirs[k * 5 + j] = /synth/repo<k>/dir<j>`, `k` in 0..8, `j` in 0..5; `repo_root` = `/synth/repo<k>` |
 | Hash `h(salt, i)` | `splitmix64(splitmix64(seed.wrapping_add(salt)) ^ i)` |
-| Command `i` (0-based; lower `i` = more popular) | Text `"{TOOLS[i % 40]} {SUBS[(i / 40) % 25]} {arg}"` where `arg` = `src/file{i}.rs` when `i % 3 == 0` else `arg{i}`. `TOOLS` = `["git","cargo","npm","docker","kubectl","make","ls","cat","grep","rg","ssh","curl","python","pytest","just","go","terraform","aws","vim","tar","rsync","scp","find","sed","awk","jq","node","yarn","pnpm","pip","uv","brew","systemctl","journalctl","psql","sqlite3","gh","helm","ansible","tmux"]`; `SUBS` = `["status","build","test","run","push","pull","log","diff","add","commit","checkout","fetch","install","update","list","show","apply","plan","deploy","exec","logs","start","stop","clean","check"]`. Every text is unique because `arg` contains `i`. `template = templatize(text)` |
-| Home directory of `i` | `dirs[h(1, i) % 40]` when `h(2, i) % 10 < 7`; otherwise none (a "global" command) |
+| Command `i` (0-based; lower `i` = more popular) | Spelled by the profile's text style. `three-words` (the D0 text, `World::text(i)`): `"{TOOLS[i % 40]} {SUBS[(i / 40) % 25]} {arg}"` where `arg` = `src/file{i}.rs` when `i % 3 == 0` else `arg{i}`. `TOOLS` = `["git","cargo","npm","docker","kubectl","make","ls","cat","grep","rg","ssh","curl","python","pytest","just","go","terraform","aws","vim","tar","rsync","scp","find","sed","awk","jq","node","yarn","pnpm","pip","uv","brew","systemctl","journalctl","psql","sqlite3","gh","helm","ansible","tmux"]`; `SUBS` = `["status","build","test","run","push","pull","log","diff","add","commit","checkout","fetch","install","update","list","show","apply","plan","deploy","exec","logs","start","stop","clean","check"]`. Every text is unique because `arg` contains `i`. `interactive`: `TOOLS[i]` for `i < 8`; else by `h(5, i) % 10`: 0-3 and `i < 1000` -> `"{TOOLS[i % 40]} {SUBS[i / 40]}"`; 0-7 -> the D0 text; 8-9 -> the D0 text + `" 2>&1 \| grep -v pattern{i % 97}"`. `agent`: `"cd /synth/repo{i % 8} && {D0 text} --message \"{w words}\" 2>&1 \| tail -n {20 + i % 80}"` with `w = 5 + floor(200 u^3)`, `u` = `h(5, i)` as a uniform, word `k` = `SUBS[(i + 7k) % 25]`. Unique in every style (TC-N-14). `template = templatize(text)` |
+| Home directory of `i` | When `h(2, i) % 10 < 7`: `dirs[h(1, i) % 40]`, or, when the profile's `home where first run` is set, the directory `i` first runs in; otherwise none (a "global" command) |
+| Reusable | `i < 10`, or `h(6, i)` as a uniform `>= one_off`. Only reusable commands enter the directory lists, the working set and the global list, and only they are chain successors; a one-off runs again only through retry or repeat |
 | Chain successor of `i` | `h(4, i) % (i + 1)` when `h(3, i) % 4 == 0`; otherwise none. (edit -> build -> test style chains: a successor's own successor continues the chain) |
 | Zipf pick from a list of length `n` | `pos = ((((n + 1) as f64).powf(u())) as usize).saturating_sub(1).min(n - 1)` - an exponent-1 Zipf: `P(pos = k) = ln((k + 2) / (k + 1)) / ln(n + 1)`, so the first element is the most likely and every element is possible |
+| Zipf pick of exponent `s` (`zipf_s`) | `s == 1`: the formula above. Otherwise, with `a = 1 - s`: `pos = floor((1 + u() * ((n + 1)^a - 1))^(1 / a)) - 1`, clamped to `0..n` (the inverse CDF of `(x + 1)^-s`; `s = 0` is uniform) |
 
-State: `seen` (commands `0..seen` have run), per-directory list of seen commands
-homed there (in first-run order), current `dir` (initially `dirs[below(40)]`, drawn once before the loop),
+State: `seen` (commands `0..seen` have run), `reusable` (the reusable ones among
+them, in first-run order), per-directory list of reusable commands
+homed there (in first-run order), the working set (the last 256 distinct
+reusable commands run, most recent first, across sessions), current `dir` (initially `dirs[below(40)]`, drawn once before the loop),
 current `session` (initially 0), the session's last 3 commands (the last 3
 runs, newest first; duplicates allowed), `t` (seconds,
 starts at 0), `retry: Option<i>` (initially `None`). Draws happen in the order
@@ -189,7 +203,8 @@ move `u()`, `x`, `c` (when choosing), the outcome `u()` and `below(5000)`; the
 retry `u()` is drawn only when `retry` is `Some`; the repeat branch draws one
 `u()` for its weighted pick only when the last-3 is non-empty; the chain
 branch draws nothing; the directory branch draws one `u()` for its Zipf pick
-only when the list is non-empty; the global pick (directly or as a
+only when the list is non-empty; the recent branch draws one `u()` only when
+the working set has at least two entries; the global pick (directly or as a
 fall-through) draws one `u()`.
 
 For each run `n` in `0..runs`:
@@ -197,27 +212,76 @@ For each run `n` in `0..runs`:
 | Step | Rule |
 |---|---|
 | Gap | `g = u()`. `g < 0.005`: new session (`session += 1`, `dir = dirs[below(40)]`, last-3 cleared), `t += 3600 + below(39_600)`. `g < 0.155`: `t += 300 + below(1500)`. Otherwise: `t += 5 + below(55)` |
-| Move | `u() < 0.08`: `dir = dirs[below(40)]` |
-| New? | `p_new = (commands - seen) / (runs - n)`; `x = u()` (always drawn). If `seen == 0` or `x < p_new`: command = `seen`; `seen += 1`; register it in its home directory's list. This makes exactly `commands` distinct commands by the end |
-| Else choose | If `retry` is `Some(i)` and `u() < 0.5`: `i`. Otherwise `c = u()`: `c < 0.55` -> repeat: one of the session's last 3 with weights 0.80 / 0.12 / 0.08 (newest first; renormalised over those that exist). `c < 0.68` -> chain: the successor of the session's last command. `c < 0.87` -> directory: Zipf pick from the current directory's list. Else -> global: Zipf pick from `0..seen`. A branch that has nothing to offer falls through to global |
-| Outcome | `exit_code = 1` when `u() < 0.10`, else 0; `retry = Some(command)` after a failure, else `None`. `duration_ms = 10 + below(5000)` |
-| Record | Remember `(command, t, dir, session, exit_code, duration_ms)`; push the command on the session's last-3 |
+| Move | `u() < p_move`: `dir = dirs[below(40)]` |
+| New? | `p_new = (commands - seen) / (runs - n)`; `x = u()` (always drawn). If `seen == 0` or `x < p_new`: command = `seen`; `seen += 1`; if reusable, push it on `reusable` and on its home directory's list. This makes exactly `commands` distinct commands by the end |
+| Else choose | If `retry` is `Some(i)` and `u() < p_retry`: `i`. Otherwise `c = u()`: `c < repeat` -> repeat: one of the session's last 3 by `repeat weights` (newest first; renormalised over those that exist). `c < chain` -> chain: the successor of the session's last command, if reusable. `c < directory` -> directory: Zipf pick from the current directory's list. `c < recent` -> recent: `zipf_s(recent_s)` pick from the working set without its newest entry. Else -> global: `zipf_s(zipf_s)` pick from `reusable`. A branch that has nothing to offer falls through to global. With `avoid repeat` set, a chain pick equal to the session's last command falls through, and a directory or global pick equal to it takes the next entry of its list (wrapping; a one-entry list keeps it), so immediate repeats come only from retry and repeat |
+| Outcome | `exit_code = 1` when `u() < p_fail`, else 0; `retry = Some(command)` after a failure, else `None`. `duration_ms = 10 + below(5000)` |
+| Record | Remember `(command, t, dir, session, exit_code, duration_ms)`; push the command on the session's last-3; if reusable, move it to the front of the working set |
 
 Afterwards shift every `t` by `anchor - 60 - t_last` and write all runs in
 order with `record_run_in` (`source = Hook`, `shell_session = "synth:<session>"`,
 `cwd = dir`, `repo_root` of that dir), one `CmdStore::transaction` per 10,000 runs.
 
-Resulting structure (asserted by TC-N-03 within tolerance): about half of all
-runs are an immediate repeat of the session's previous command; mean gap about 300 s
-(500,000 runs span about 4.8 years, so the 30-day window holds about 8,600
-runs); `commands / runs` of the runs are a never-before-seen command. The
-generator writes no `command_events` (section 12, E-N-10).
+Profiles (`src/cmd/corpus.rs`, `Profile::shape`):
 
-Measured at D0 (release build, `--seed 1 --anchor 1794873600`): 2,000 / 20,000
-in 0.2 s, 4.3 MB after `VACUUM`, immediate-repeat share 0.471, span 68.2 days;
-50,000 / 500,000 in 7.6 s, 120.7 MB as written and 111.4 MB after `VACUUM`
-(B7 budget 300 MB; `command_runs` 33 MB plus seven run indexes 67 MB),
-immediate-repeat share 0.459, span 1,758.8 days, 8,725 runs in the last 30 days.
+| Parameter | `interactive` (default) | `repetitive` (D0) | `agent` |
+|---|---|---|---|
+| `p_move` | 0.02 | 0.08 | 0.005 |
+| `p_fail` / `p_retry` | 0.08 / 0.25 | 0.10 / 0.5 | 0.10 / 0 |
+| `c` bounds: repeat, chain, directory, recent | 0.045, 0.10, 0.30, 0.65 | 0.55, 0.68, 0.87, 0.87 | 0, 0.05, 0.60, 0.85 |
+| `repeat weights` | 1, 0, 0 | 0.80, 0.12, 0.08 | 1, 0, 0 |
+| `zipf_s` (global) / `recent_s` | 1.5 / 1.8 | 1 / - | 0 (uniform) / 1.0 |
+| `avoid repeat` | yes | no | yes |
+| `one_off` | 0.5 | 0 | 0 |
+| `home where first run` | yes | no | yes |
+| Text style | `interactive` | `three-words` | `agent` |
+
+The gap and session rules are the same in all three: mean gap about 300 s,
+a new session about every 200 runs, so 500,000 runs span about 4.8 years and
+the 30-day window holds about 8,600 runs; `commands / runs` of the runs are
+a never-before-seen command. The generator writes no `command_events`
+(section 12, E-N-10).
+
+**Calibration of `interactive`.** The targets come from `stats` of corpus 1
+(203 commands, 500 runs of one person's bash history). What is data and what
+is assumed:
+
+| Statistic | Real (corpus 1) | Source of the target | `interactive` at 203 / 500 | at 2,000 / 20,000 | at 50,000 / 500,000 |
+|---|---|---|---|---|---|
+| immediate repeat share | 0.064 | data; held constant across sizes is an assumption | 0.072 | 0.062 | 0.058 |
+| top-10 share | 0.412 | data at 500 runs; that the head keeps about 0.4 at 500,000 runs is an assumption | 0.352 | 0.413 | 0.380 |
+| top-100 share | 0.794 | data, but at 203 commands it is half the vocabulary; it falls with size | 0.794 | 0.694 | 0.558 |
+| commands run once | 0.680 | data at 500 runs; a long tail at every size is an assumption | 0.650 | 0.579 | 0.628 |
+| recurrence gap in runs p25 / p50 / p75 / p90 | 2 / 7 / 27 / 69 | data, truncated by the 500-run window; longer tails at size follow from the head and tail above | 2 / 6 / 24 / 72 | 3 / 9 / 51 / 652 | 3 / 13 / 254 / 9,387 |
+| same directory as last run | 0.600 | weak data: only 10.8% of corpus 1 has a cwd (replayed from `cd`); corpus 2, with true cwds, has 0.882. 0.6-0.8 is assumed | 0.761 | 0.696 | 0.675 |
+| same session as last run | 1.000 (one session) | no data: corpus 1 is one file. The session model is D0's (assumption) | 0.872 | 0.786 | 0.687 |
+| length in chars p10 / p50 / p90 | 3 / 10 / 42 | data | 3 / 13 / 44 | 3 / 10 / 43 | 3 / 16 / 44 |
+| timestamps, gaps in seconds, exit codes, durations | none (synthetic 1 s timestamps, no exit codes) | assumption: D0's rules unchanged | | | |
+
+How a long tail fits 10 runs per command on average: a `one_off` half of
+the commands is never chosen again by the chain, directory, recent or global
+branches, and the global pick has a heavy head (`zipf_s` 1.5), so the mean
+is carried by a few hundred popular commands while the median command runs
+once. At 50,000 / 500,000: top-10 0.380, 62.8% of commands run once, every
+run is one of 50,000 distinct texts.
+
+The stress profiles: `repetitive` is D0's shape (immediate repeats 0.459-0.471,
+gap p50 1 run). `agent` matches corpus 2 only when run at its ratio
+(`--commands 5690 --runs 5724`: immediate repeats 0.000, top-10 0.003,
+commands run once 0.994, length p50 237 against corpus 2's 0.001 / 0.005 /
+0.995 / 237); at 10 runs per command it stays flat (top-10 0.019-0.063) with
+almost no immediate repeats. Relevance is reported per profile; none is used
+alone to claim relevance (section 4, row 3).
+
+Measured (release build, `--seed 1 --anchor 1794873600`): `interactive`
+2,000 / 20,000 in 0.2 s, 4.6 MB as written, span 69.5 days
+(`cmd-synth2-small`); 50,000 / 500,000 in 8.6-9.4 s, 120.0 MB as written,
+span 1,767.4 days, 8,623 runs in the last 30 days (`cmd-synth2-50k`). D0
+(now `--profile repetitive`): 2,000 / 20,000 in 0.2 s, 4.3 MB after
+`VACUUM`, immediate-repeat share 0.471, span 68.2 days; 50,000 / 500,000 in
+7.6 s, 120.7 MB as written and 111.4 MB after `VACUUM` (B7 budget 300 MB;
+`command_runs` 33 MB plus seven run indexes 67 MB), immediate-repeat share
+0.459, span 1,758.8 days, 8,725 runs in the last 30 days.
 
 ### 4.4 `stats`
 
@@ -231,6 +295,20 @@ session), `first-ever share` (runs that are their command's first),
 `pick episodes` (`pick` rows in `command_events`). Shares are of all runs, three
 decimals, `0.000` on an empty history; counts are plain integers. No command text. Computed in memory from
 `counts`, `all_runs`, `all_events` ([01 section 6.5](01-record.md#65-cmdstore-methods-and-row-types)); `bench.rs` and `corpus.rs` contain no SQL.
+
+Then a second block, `ShapeStats::compute(&all_runs, &all_commands)`: how
+repetitive the history is. In T3 order; a run *recurs* when its command ran
+before (anywhere); percentiles as section 6, `0` when empty.
+
+| Line | Value |
+|---|---|
+| `top-10 share`, `top-100 share` | Runs of the 10 (100) most-run commands / runs |
+| `commands run once` | Commands with exactly one run / commands with a run |
+| `recurrence gap in runs p25/p50/p75/p90: a / b / c / d` | Per recurring run: its position minus the position of the command's previous run (1 = the run just before, in any session) |
+| `recurrence gap in seconds p50/p90: a / b` | The same in `started_at` seconds |
+| `same directory as last run` | Of recurring runs where both it and the previous run have a cwd: same cwd |
+| `same session as last run` | Of recurring runs: same `shell_session` |
+| `length in chars p10/p50/p90: a / b / c` | `text.chars().count()` of each run's command, over runs |
 
 ## 5. Relevance benchmark
 
@@ -577,7 +655,11 @@ Work top to bottom; within a row try the listed values one at a time.
 |---|---|---|---|---|
 | TC-N-01 | metrics | ranks `[1, 2, 4, 11]` | `top1 0.25, top3 0.5, top10 0.75, mrr (1 + 0.5 + 0.25 + 1/11)/4 = 0.4602` | empty rank list -> `n = 0`, metrics `NaN` printed as `-` |
 | TC-N-02 | seed aggregation | per-seed top1 `[0.50, 0.52, 0.54]` | `mean 0.52, sd 0.02, min 0.50, max 0.54` | one seed -> `sd 0` |
-| TC-N-03 | generator structure | `generate(commands 500, runs 20_000, seed 7, anchor 1_800_000_000)` | Exactly 500 commands and 20,000 runs; newest `started_at == anchor - 60`; immediate-repeat share (as `stats` defines it) between 0.40 and 0.60; mean gap between 200 and 400 s; 40 or fewer distinct cwds; every `repo_root` is a prefix of its `cwd` | `commands == runs` -> every run is a new command |
+| TC-N-03 | generator structure | `generate_profile(commands 500, runs 20_000, seed 7, anchor 1_800_000_000, Repetitive)` | Exactly 500 commands and 20,000 runs; newest `started_at == anchor - 60`; immediate-repeat share (as `stats` defines it) between 0.40 and 0.60; mean gap between 200 and 400 s; 40 or fewer distinct cwds; every `repo_root` is a prefix of its `cwd` | `commands == runs` -> every run is a new command |
+| TC-N-12 | `interactive` calibration | `generate_profile(2000, 20_000, seed 7, Interactive)` | immediate repeat 0.04-0.10; top-10 0.30-0.50; commands run once 0.40-0.80; same directory 0.60-0.90; gap p50 3-20 runs, p90 at least 30; length p50 4-20 chars | - |
+| TC-N-13 | `agent` stays flat | `Agent` at 1,900 / 2,000 and at 2,000 / 20,000 | immediate repeat below 0.01 both; top-10 below 0.03 and below 0.10; length p50 at least 100 | - |
+| TC-N-14 | texts, `zipf_s`, working set, `ShapeStats` | 3,000 texts per style; `zipf_s` at `s` 1, 0, 2; touches 1, 2, 3, 2 then 0..1000; the six-run history of `shape_stats_of_a_small_history` | all distinct, none psychic's own; `zipf_s(u, n, 1) == zipf(u, n)`, `zipf_s(0.5, 10, 0) = 5`, `zipf_s(0.5, 1000, 2) = 0`; working set `[2, 3, 1]`, then 256 long with 999 first; the eight lines of that test | - |
+| TC-N-15 | `repetitive` is D0 | `simulate(500, 20_000, 7, Repetitive)` | FNV-1a of `"{command},{t},{dir},{session},{exit_code},{duration_ms};"` per run is `0xd62d4f1ce841ad5f`, the value of commit `d65f6aa` | - |
 | TC-N-04 | generator determinism | The same arguments twice into two stores; then seed 8 | The first two have identical `(text, started_at, cwd, exit_code)` sequences; seed 8 differs | - |
 | TC-N-05 | transcript parsing | A fixture of 10 JSONL lines (8 assistant lines and the 2 result lines): Bash use with result (`is_error` false), use with error result, background use, use without timestamp, use on a line without `cwd` after a line with one, a non-Bash tool use, a malformed line, a use with no result | 4 kept: exit 0 with duration, exit 1, cwd carried forward, exit NULL; report counts `tool_uses 6`, `skipped_background 1`, `skipped_no_timestamp 1`, `with_result 2` | `input.command` not a string -> `skipped_malformed`; own or empty text -> `skipped_filtered`; two uses on one line keep their order; `agentId` -> session `<sessionId>:<agentId>` |
 | TC-N-06 | systematic sample | 10 reachable runs, `max_test_runs` 3 | stride 3 -> ordinals 0, 3, 6, 9 | `max_test_runs >= reachable` -> all |

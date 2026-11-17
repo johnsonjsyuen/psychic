@@ -7,8 +7,8 @@
 //! Every output here is an aggregate: no command text (01 section 10.6).
 //! There is no SQL in this file; everything goes through `CmdStore`.
 
-use super::corpus;
-use super::store::{CmdStore, EventRecord, RunRecord, StoreCounts};
+use super::corpus::{self, Profile};
+use super::store::{CmdStore, CommandRecord, EventRecord, RunRecord, StoreCounts};
 use super::tuning::CMD_EVENT_WINDOW_SECS;
 use anyhow::{Result, bail};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -36,6 +36,9 @@ pub enum BenchCommand {
         /// Unix second the history ends at (the newest run is 60 s before); default now
         #[arg(long, allow_negative_numbers = true)]
         anchor: Option<i64>,
+        /// Shape of the history: like a person at a shell, the D0 generator, or a coding agent
+        #[arg(long, value_enum, default_value_t = Profile::Interactive)]
+        profile: Profile,
     },
     /// Import Bash tool calls from Claude Code transcripts into --data-dir
     ExtractAgent {
@@ -82,12 +85,14 @@ pub(super) fn run(
             runs,
             seed,
             anchor,
+            profile,
         } => {
             if commands == 0 || commands > runs {
                 bail!("--commands must be between 1 and --runs");
             }
             let store = empty_store(data_dir)?;
-            corpus::generate(&store, commands, runs, seed, anchor.unwrap_or(env.now))?;
+            let anchor = anchor.unwrap_or(env.now);
+            corpus::generate_profile(&store, commands, runs, seed, anchor, profile)?;
             writeln!(out, "generated {} commands, {} runs", commands, runs)?;
         }
         BenchCommand::ExtractAgent { projects_dir: dir } => {
@@ -107,9 +112,10 @@ pub(super) fn run(
         }
         BenchCommand::Stats => {
             let store = CmdStore::open(data_dir)?;
-            let stats =
-                CorpusStats::compute(&store.counts()?, &store.all_runs()?, &store.all_events()?);
-            for line in stats.lines() {
+            let runs = store.all_runs()?;
+            let stats = CorpusStats::compute(&store.counts()?, &runs, &store.all_events()?);
+            let shape = ShapeStats::compute(&runs, &store.all_commands()?);
+            for line in stats.lines().into_iter().chain(shape.lines()) {
                 writeln!(out, "{line}")?;
             }
         }
@@ -239,8 +245,118 @@ impl CorpusStats {
     }
 }
 
+/// How repetitive a history is, and so how hard "which command comes next"
+/// is on it: the second block of `stats` (section 4.4). No command text, only
+/// its length.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ShapeStats {
+    /// Share of runs taken by the 10 (100) most-run commands.
+    pub top10_share: f64,
+    pub top100_share: f64,
+    /// Share of the commands that ran exactly once.
+    pub once_only_commands: f64,
+    /// For each run of a command that ran before: how many runs since its
+    /// previous run (1 = the run just before), at p25, p50, p75, p90.
+    pub gap_runs: [u64; 4],
+    /// The same gap in seconds, at p50 and p90.
+    pub gap_secs: [i64; 2],
+    /// Of those runs with a cwd on both: same cwd as the previous run.
+    pub same_dir_share: f64,
+    /// Of those runs: same shell session as the previous run.
+    pub same_session_share: f64,
+    /// Length of the command text in characters, over runs, at p10, p50, p90.
+    pub length_chars: [u64; 3],
+}
+
+/// `sorted[min(len - 1, ceil(q * len) - 1)]` (section 6), 0 when empty.
+fn percentile<T: Copy + Ord + Default>(sorted: &[T], q: f64) -> T {
+    if sorted.is_empty() {
+        return T::default();
+    }
+    let rank = (q * sorted.len() as f64).ceil() as usize;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+impl ShapeStats {
+    /// `runs` in T3 order (`started_at, id`); `commands` as T2.
+    pub(super) fn compute(runs: &[RunRecord], commands: &[CommandRecord]) -> Self {
+        let length: FxHashMap<i64, u64> = commands
+            .iter()
+            .map(|command| (command.id, command.text.chars().count() as u64))
+            .collect();
+        let mut runs_of: FxHashMap<i64, u64> = FxHashMap::default();
+        // Per command: (position, started_at, cwd, session) of its last run.
+        let mut last: FxHashMap<i64, (usize, i64, Option<&str>, &str)> = FxHashMap::default();
+        let mut gap_runs = Vec::new();
+        let mut gap_secs = Vec::new();
+        let (mut with_dirs, mut same_dir, mut same_session) = (0usize, 0usize, 0usize);
+        let mut lengths = Vec::with_capacity(runs.len());
+        for (position, run) in runs.iter().enumerate() {
+            *runs_of.entry(run.command_id).or_default() += 1;
+            lengths.push(length.get(&run.command_id).copied().unwrap_or_default());
+            let this = (
+                position,
+                run.started_at,
+                run.cwd.as_deref(),
+                run.shell_session.as_str(),
+            );
+            if let Some((at, started_at, cwd, session)) = last.insert(run.command_id, this) {
+                gap_runs.push((position - at) as u64);
+                gap_secs.push(run.started_at - started_at);
+                if let (Some(before), Some(now)) = (cwd, this.2) {
+                    with_dirs += 1;
+                    same_dir += usize::from(before == now);
+                }
+                same_session += usize::from(session == this.3);
+            }
+        }
+        gap_runs.sort_unstable();
+        gap_secs.sort_unstable();
+        lengths.sort_unstable();
+        let mut counts: Vec<u64> = runs_of.values().copied().collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let ratio = |part: usize, whole: usize| {
+            if whole == 0 {
+                0.0
+            } else {
+                part as f64 / whole as f64
+            }
+        };
+        let top = |k: usize| ratio(counts.iter().take(k).sum::<u64>() as usize, runs.len());
+
+        ShapeStats {
+            top10_share: top(10),
+            top100_share: top(100),
+            once_only_commands: ratio(counts.iter().filter(|&&n| n == 1).count(), counts.len()),
+            gap_runs: [0.25, 0.5, 0.75, 0.9].map(|q| percentile(&gap_runs, q)),
+            gap_secs: [0.5, 0.9].map(|q| percentile(&gap_secs, q)),
+            same_dir_share: ratio(same_dir, with_dirs),
+            same_session_share: ratio(same_session, gap_runs.len()),
+            length_chars: [0.1, 0.5, 0.9].map(|q| percentile(&lengths, q)),
+        }
+    }
+
+    /// One `key: value` line each, in the order of section 4.4.
+    pub(super) fn lines(&self) -> Vec<String> {
+        let [p25, p50, p75, p90] = self.gap_runs;
+        let [s50, s90] = self.gap_secs;
+        let [l10, l50, l90] = self.length_chars;
+        vec![
+            format!("top-10 share: {:.3}", self.top10_share),
+            format!("top-100 share: {:.3}", self.top100_share),
+            format!("commands run once: {:.3}", self.once_only_commands),
+            format!("recurrence gap in runs p25/p50/p75/p90: {p25} / {p50} / {p75} / {p90}"),
+            format!("recurrence gap in seconds p50/p90: {s50} / {s90}"),
+            format!("same directory as last run: {:.3}", self.same_dir_share),
+            format!("same session as last run: {:.3}", self.same_session_share),
+            format!("length in chars p10/p50/p90: {l10} / {l50} / {l90}"),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::store::NewRun;
     use super::super::store::test_support::hook_run;
     use super::*;
 
@@ -318,6 +434,14 @@ sessions: 0
 immediate repeat share: 0.000
 first-ever share: 0.000
 pick episodes: 0
+top-10 share: 0.000
+top-100 share: 0.000
+commands run once: 0.000
+recurrence gap in runs p25/p50/p75/p90: 0 / 0 / 0 / 0
+recurrence gap in seconds p50/p90: 0 / 0
+same directory as last run: 0.000
+same session as last run: 0.000
+length in chars p10/p50/p90: 0 / 0 / 0
 "
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -363,6 +487,39 @@ pick episodes: 0
     }
 
     #[test]
+    fn shape_stats_of_a_small_history() {
+        let store = CmdStore::in_memory();
+        let run = |text, session, at, cwd| NewRun {
+            cwd,
+            ..hook_run(text, session, at, Some(0))
+        };
+        for run in [
+            run("ls", "s1", 0, Some("/w")),
+            run("make", "s1", 10, Some("/w")),
+            run("ls", "s1", 20, Some("/w")), // 2 runs, 20 s; same dir and session
+            run("ls", "s2", 50, Some("/x")), // 1 run, 30 s; neither
+            run("git status", "s2", 60, None),
+            run("git status", "s2", 70, Some("/x")), // 1 run, 10 s; no dir before
+        ] {
+            store.record_run(&run).unwrap();
+        }
+        let shape = ShapeStats::compute(&store.all_runs().unwrap(), &store.all_commands().unwrap());
+        assert_eq!(
+            shape.lines(),
+            vec![
+                "top-10 share: 1.000",
+                "top-100 share: 1.000",
+                "commands run once: 0.333",
+                "recurrence gap in runs p25/p50/p75/p90: 1 / 1 / 2 / 2",
+                "recurrence gap in seconds p50/p90: 20 / 30",
+                "same directory as last run: 0.500",
+                "same session as last run: 0.667",
+                "length in chars p10/p50/p90: 2 / 2 / 10",
+            ]
+        );
+    }
+
+    #[test]
     fn generate_and_extract_need_an_empty_history() {
         let dir = scratch("bench-nonempty");
         let generate = || BenchCommand::Generate {
@@ -370,6 +527,7 @@ pick episodes: 0
             runs: 100,
             seed: 1,
             anchor: Some(1_000_000),
+            profile: Profile::Interactive,
         };
         assert_eq!(
             output(&dir, generate()).unwrap(),
@@ -399,6 +557,7 @@ pick episodes: 0
                     runs,
                     seed: 1,
                     anchor: None,
+                    profile: Profile::Interactive,
                 },
             )
             .unwrap_err();
@@ -507,7 +666,36 @@ pick episodes: 0
                 commands: 5,
                 runs: 9,
                 seed: 1,
-                anchor: None
+                anchor: None,
+                profile: Profile::Interactive,
+            }
+        ));
+        let cli = crate::cli::Cli::try_parse_from([
+            "psychic",
+            "--data-dir",
+            "/tmp/x",
+            "internal",
+            "bench-history",
+            "generate",
+            "--commands",
+            "5",
+            "--runs",
+            "9",
+            "--profile",
+            "agent",
+        ])
+        .unwrap();
+        let Some(crate::cli::Commands::Internal {
+            command: crate::cli::InternalCommands::BenchHistory(args),
+        }) = cli.command
+        else {
+            panic!("parsed as something else");
+        };
+        assert!(matches!(
+            args.command,
+            BenchCommand::Generate {
+                profile: Profile::Agent,
+                ..
             }
         ));
     }
