@@ -686,13 +686,25 @@ impl CmdStore {
             params![range.first, range.last],
             "loading commands",
             |row| {
-                let text = row.get_ref(1)?.as_str().map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?;
+                let text = match row.get_ref(1)? {
+                    rusqlite::types::ValueRef::Text(bytes) => {
+                        std::str::from_utf8(bytes).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?
+                    }
+                    // As `row.get::<String>` reports it.
+                    other => {
+                        return Err(rusqlite::Error::InvalidColumnType(
+                            1,
+                            "text".to_string(),
+                            other.data_type(),
+                        ));
+                    }
+                };
                 Ok(build(CommandRow {
                     id: row.get(0)?,
                     text,

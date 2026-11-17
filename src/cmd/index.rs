@@ -500,6 +500,11 @@ impl CommandIndex {
     /// Per idx: the byte classes of the text, with `fuzzy::LIVE` unless
     /// deleted.
     pub(super) fn filter_classes(&self) -> &[u64] {
+        debug_assert_eq!(
+            self.filter_classes.len(),
+            self.entries.len(),
+            "entries are added only by push_entry"
+        );
         &self.filter_classes
     }
 

@@ -180,7 +180,7 @@ pub(super) struct RankContext {
 
 | Method | Effect |
 |---|---|
-| `add_command(db_id, text) -> u32` | Push an entry with zero counts; fill `text_lower`, `chars`, `words`; register in `by_db_id`. Asserts `db_id` is new |
+| `add_command(db_id, text) -> u32` | Push an entry with zero counts; fill `text_lower`, `chars`, `words`, `classes`; push `classes | LIVE` to `filter_classes`; register in `by_db_id`. Asserts `db_id` is new |
 | `record_run(idx, at, dir: Option<u32>, repo: Option<u32>, exit: Option<i32>, prev_template: Option<u32>)` | `run_count += 1`; `success_count`/`fail_count` by `exit`; if `at >= last_run_at` then `last_exit_code = exit`; `last_run_at = max`; non-zero `exit` -> `last_fail_at = max(last_fail_at, at)`; insert `at` into `run_times` at `partition_point(\|&t\| t <= at)`; for a `Some` dir: `dir_stats[(idx, dir)].runs += 1` and its `last_run_at = max(last_run_at, at)`; for a `Some` repo: `repo_runs += 1`; for a `Some` prev_template: `followers += 1` |
 | `record_pick(idx, at, query: &str, episode_queries: &[String])` | Push `at` to `picks[idx]`, to `picks_by_query[query][idx]`, and to `episode_picks_by_query[q][idx]` for each distinct `q` in `episode_queries` |
 | `remove(idx)` | `entries[idx].deleted = true`; clear `fuzzy::LIVE` in `filter_classes[idx]` |
@@ -335,7 +335,16 @@ and `GetRows` refer to):
 | Base set | Otherwise the last entry's idx list (`narrowed = true`), or every idx `0..entries.len()` when the trail is empty. (A text that matches a longer query matches its prefix, so narrowing loses nothing) |
 | Per idx | Skip when `filter_classes[idx]` lacks `LIVE` (deleted). Skip when out of scope (below). Empty query: keep with `fuzzy_score = 0`. Otherwise the prefilter, then the scorer (`src/cmd/fuzzy.rs`, below): rejected or `None` drops the row, `Some(s)` keeps it with `fuzzy_score = s` |
 | Parallelism | When the query is non-empty and the base set has at least `CMD_PAR_FILTER_MIN` entries, the base set is cut into chunks of `FILTER_CHUNK` (1,024, `worker.rs`), one rayon task each with its own output vector, joined in order; a plain loop otherwise (with no query there is nothing to match, and a pass over 50,000 entries costs less than waking the pool). Output order is ascending idx in both cases |
-| Seeds | While no request waits, the worker computes, one per loop turn, the matches in scope `All` of each single character of `SEED_CHARS` (`a`-`z`; an upper-case letter is a case-sensitive query of its own, and a digit or punctuation rarely starts a search; at 50,000 commands the 26 seeds hold about 530,000 candidates, 8.5 MB). When the trail is empty and the scope is `All`, a query starting with a seeded character starts the trail from that seed: typing the first letter is a reuse and the second narrows from it. `Delete` clears the seeds (they are computed again). One slice is one filter pass over every command, so a request that arrives meanwhile waits at most that |
+| Seeds | While no request waits, the worker computes, one per loop turn, the matches in scope `All` of each single character of `SEED_CHARS` (`a`-`z`; an upper-case letter is a case-sensitive query of its own, and a digit or punctuation rarely starts a search; at 50,000 commands the 26 seeds hold about 530,000 candidates, 8.5 MB), in the order of how many commands start with each letter. When the trail is empty and the scope is `All`, a query starting with a seeded character starts the trail from that seed: typing the first letter is a reuse and the second narrows from it. `Delete` clears the seeds (they are computed again). One slice is one filter pass over every command, so a request that arrives meanwhile waits at most that |
+| Afterwards | A non-empty query that was not reused is pushed onto the trail with its result (a seed that starts the trail is pushed even when it is the answer, see Seeds). `Delete` clears the trail (not `current_query`/`current_scope`) |
+| Empty-query cache | The worker keeps the `CommandRanking` of the empty query per scope (`empty_rankings`, shared `Arc`s): asking for it again skips filter and ranking (`reused = true`, stage times 0). `Delete` clears it. When a page needs the rest sorted, the cache's handle is taken out first so `sort_rest` runs in place, and the sorted ranking is cached |
+
+| Scope | Row is in scope when |
+|---|---|
+| `All` | always |
+| `Directory` | `index.dir_stat(idx, ctx.dir).is_some()` |
+| `Repo` | `index.runs_in_repo(idx, ctx.repo) > 0` |
+| `Session` | `index.session_commands.contains(&idx)` |
 
 The per-command test (`src/cmd/fuzzy.rs`, `Pattern`): a text can match only
 if it holds every byte of the query in order (ASCII case folded unless the
@@ -349,16 +358,8 @@ that pairs each query character with an equal text character in order, so
 the prefilter only ever rejects what the scorer would; the candidates and
 scores are exactly those of matching every command (test
 `the_filter_returns_exactly_what_matching_every_command_does`, and digests
-of the 50,000-command key cycle, 04 section 6.6 `--dump`).
-| Afterwards | A non-empty query that was not reused is pushed onto the trail with its result. `Delete` clears the trail (not `current_query`/`current_scope`) |
-| Empty-query cache | The worker keeps the `CommandRanking` of the empty query per scope (`empty_rankings`, shared `Arc`s): asking for it again skips filter and ranking (`reused = true`, stage times 0). `Delete` clears it. When a page needs the rest sorted, the cache's handle is taken out first so `sort_rest` runs in place, and the sorted ranking is cached |
-
-| Scope | Row is in scope when |
-|---|---|
-| `All` | always |
-| `Directory` | `index.dir_stat(idx, ctx.dir).is_some()` |
-| `Repo` | `index.runs_in_repo(idx, ctx.repo) > 0` |
-| `Session` | `index.session_commands.contains(&idx)` |
+of the 50,000-command key cycle through the worker's own filter, seeds included,
+04 section 6.6 `--dump`).
 
 The closure captures `&CommandIndex`, `&RankContext`, `&SkimMatcherV2` and the
 prepared query: nothing lazily initialised, no lock, no allocation other than the output

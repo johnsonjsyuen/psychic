@@ -13,7 +13,7 @@ use super::super::repo;
 use super::super::store::CmdStore;
 use super::super::train::{ReplayInput, replay};
 use super::super::tuning::{CMD_PAGE_ROWS, CMD_STAGE2_K};
-use super::super::worker::{Scope, filter_candidates, narrowing_applies};
+use super::super::worker::{Scope, filter_candidates, narrowing_applies, replay_filter};
 use anyhow::{Context, Result, bail};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use serde::Deserialize;
@@ -251,9 +251,10 @@ pub(super) struct LatencyOptions {
     pub keystrokes: usize,
     /// Slept before each recorded key, as a typist pauses.
     pub pause: Duration,
-    /// Where to write one line per recorded key with digests of its
-    /// candidates and ranking (ids and scores, never text), to compare two
-    /// builds; `None` = no dump.
+    /// Where to write one line per key (warm-up cycle included) with
+    /// digests of what the worker's filter answers and its ranking (ids and
+    /// scores, never text), to compare two builds made with the same Rust
+    /// toolchain (the digest is std's `DefaultHasher`); `None` = no dump.
     pub dump: Option<PathBuf>,
 }
 
@@ -298,13 +299,6 @@ pub(super) fn latency(
     out: &mut dyn Write,
 ) -> Result<()> {
     let (keystrokes, pause) = (options.keystrokes, options.pause);
-    let mut dump = match &options.dump {
-        Some(path) => Some(std::io::BufWriter::new(
-            std::fs::File::create(path)
-                .with_context(|| format!("could not create {}", path.display()))?,
-        )),
-        None => None,
-    };
     let context_path = data_dir.join("bench-context.json");
     let Ok(context) = std::fs::read_to_string(&context_path) else {
         bail!("run ./bench/history.py setup first");
@@ -358,10 +352,6 @@ pub(super) fn latency(
         );
         let total = started.elapsed().as_secs_f64() * 1000.0;
         let t = ranking.timings;
-        if let Some(dump) = dump.as_mut() {
-            let line = dump_line(i, query.chars().count(), &candidates, &ranking);
-            writeln!(dump, "{line}")?;
-        }
         if i >= KEY_CYCLE.len() {
             times.push(KeyTimes {
                 filter,
@@ -448,7 +438,32 @@ pub(super) fn latency(
             of[0].stage2
         )?;
     }
-    if let Some(mut dump) = dump {
+    if let Some(path) = &options.dump {
+        // The same keys again, through the worker's own filter (seeds,
+        // trail, reuse), each answer ranked as the worker ranks it.
+        let mut dump = std::io::BufWriter::new(
+            std::fs::File::create(path)
+                .with_context(|| format!("could not create {}", path.display()))?,
+        );
+        let mut query = String::new();
+        let queries: Vec<String> = (0..KEY_CYCLE.len() + keystrokes)
+            .map(|i| {
+                apply_key(&mut query, KEY_CYCLE[i % KEY_CYCLE.len()]);
+                query.clone()
+            })
+            .collect();
+        let mut key = 0;
+        let mut failed = Ok(());
+        replay_filter(index, ctx, queries, |index, ctx, query, candidates| {
+            let ranking =
+                rank_commands(query, candidates, index, ctx, CMD_PAGE_ROWS, model.as_ref());
+            let line = dump_line(key, query.chars().count(), candidates, &ranking);
+            if failed.is_ok() {
+                failed = writeln!(dump, "{line}");
+            }
+            key += 1;
+        });
+        failed?;
         dump.flush()?;
     }
     Ok(())

@@ -602,10 +602,13 @@ and blend stages), and per query length (total and filter). Not a pass bar: B1 i
 6.3. `--pause-ms` sleeps that long before each recorded key, as a typist
 pauses: the cores clock down and the caches go cold, as in the picker (every
 stage takes about twice as long after 170 ms, on one thread as on the pool).
-`--now` ranks as of a fixed second; `--dump` writes, per recorded key, the
-query length, the match count, a digest of the candidates (idx, fuzzy score)
-in order, the sorted-row count and a digest of every score in ranking order
-(ids and numbers only): two builds rank identically when their dumps are
+`--now` ranks as of a fixed second; `--dump` replays the same keys (warm-up
+cycle included) through the worker's own filter (all seeds computed first,
+then its trail, reuse and narrowing) and the worker's ranking, and writes per
+key the query length, the match count, a digest of the candidates (idx, fuzzy
+score) in order, the sorted-row count and a digest of every score in ranking
+order (ids and numbers only; std's `DefaultHasher`, so compare builds of one
+Rust toolchain): two builds rank identically when their dumps are
 byte-equal. `history.py latency [N] [--pause S]` runs it on the perf DB with
 the pinned model. `PSYCHIC_BENCH_BINARY=<path>` makes `history.py` measure
 another build (a saved copy of an earlier commit) on the same perf DB, to

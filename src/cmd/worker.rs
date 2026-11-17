@@ -199,8 +199,23 @@ pub(super) fn narrowing_applies(
 /// a search starts with. An upper-case letter is a case-sensitive query of
 /// its own, and digits and punctuation rarely start one; they are not
 /// seeded. (At 50,000 commands the seeds hold about 530,000 candidates,
-/// 8.5 MB.)
+/// 8.5 MB.) They are computed in the order of how many commands start with
+/// each ([`seed_order`]), so the likeliest first letter is ready first.
 const SEED_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+
+/// [`SEED_CHARS`] by how many live commands start with each (ASCII case
+/// folded), most first; ties keep alphabetical order.
+fn seed_order(index: &CommandIndex) -> Vec<u8> {
+    let mut starts = [0usize; 256];
+    for entry in index.entries.iter().filter(|entry| !entry.deleted) {
+        if let Some(&first) = entry.text.as_bytes().first() {
+            starts[first.to_ascii_lowercase() as usize] += 1;
+        }
+    }
+    let mut order = SEED_CHARS.to_vec();
+    order.sort_by_key(|&c| std::cmp::Reverse(starts[c as usize]));
+    order
+}
 
 /// A parallel filter pass hands the pool its base set in chunks of this
 /// many: each chunk is one task with one output vector, and the chunks'
@@ -265,6 +280,26 @@ pub(super) fn filter_candidates(
         .map(|chunk| pass(chunk * FILTER_CHUNK, ((chunk + 1) * FILTER_CHUNK).min(size)))
         .collect();
     parts.concat()
+}
+
+/// The worker's own filter (trail, reuse, narrowing and seeds, all seeds
+/// computed first as after start-up) answering `queries` in turn, in scope
+/// `All`; `each` sees every answer. For the benchmark's `--dump`
+/// (04 section 6.6), so the path the picker takes is the one compared.
+pub(in crate::cmd) fn replay_filter(
+    index: CommandIndex,
+    ctx: RankContext,
+    queries: impl IntoIterator<Item = String>,
+    mut each: impl FnMut(&CommandIndex, &RankContext, &str, &[CommandCandidate]),
+) {
+    let mut worker = Worker::new(index, ctx, None, SkimMatcherV2::default(), None);
+    while worker.has_idle_work() {
+        worker.idle_step();
+    }
+    for query in queries {
+        let candidates = worker.filter(&query, Scope::All).candidates;
+        each(&worker.index, &worker.ctx, &query, &candidates);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +399,8 @@ struct Worker {
     /// worker is idle ([`Worker::idle_step`]): typing one starts the trail
     /// from them, so the first letter of a search costs no filter pass.
     seeds: Vec<Matches>,
+    /// The order the seeds are computed in; empty until the first idle step.
+    seed_order: Vec<u8>,
     // What `GetRows` and `Delete` refer to.
     current_query: String,
     current_scope: Scope,
@@ -408,6 +445,7 @@ impl Worker {
             live,
             trail: Vec::new(),
             seeds: Vec::new(),
+            seed_order: Vec::new(),
             current_query: String::new(),
             current_scope: Scope::All,
             current_query_id: 0,
@@ -513,11 +551,15 @@ impl Worker {
     }
 
     /// One slice of the work done while no request waits: the matches of
-    /// the next character of [`SEED_CHARS`] not yet seeded. One slice is
-    /// one filter pass over every command (well under a millisecond with
-    /// the pool warm), so a request arriving meanwhile waits at most that.
+    /// the next character of [`seed_order`] not yet seeded. One slice is one
+    /// filter pass over every command, so a request arriving meanwhile
+    /// waits at most that (04 section 6.6 reports its time as the length-1
+    /// filter).
     fn idle_step(&mut self) {
-        let Some(&next) = SEED_CHARS.get(self.seeds.len()) else {
+        if self.seed_order.is_empty() {
+            self.seed_order = seed_order(&self.index);
+        }
+        let Some(&next) = self.seed_order.get(self.seeds.len()) else {
             return;
         };
         let query = char::from(next).to_string();
@@ -1796,12 +1838,12 @@ mod tests {
         use rand::{Rng, SeedableRng};
         const PIECES: &[&str] = &[
             "git", "Git", "st", "a", "b", "-", " ", "/", "\\", "é", "É", "☃", "_", "1", "ls", "^",
-            ";", "K",
+            ";", "K", "\u{0}",
         ];
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let texts: Vec<String> = (0..commands)
             .map(|_| {
-                (0..rng.gen_range(1..8))
+                (0..rng.gen_range(0..8)) // some texts empty
                     .map(|_| PIECES[rng.gen_range(0..PIECES.len())])
                     .collect()
             })
@@ -1848,6 +1890,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn seeds_are_computed_most_common_first_letter_first() {
+        let mut index = index_of(&["git a", "go", "Grep", "cargo", "ls", "zz", "zap"]);
+        index.remove(0); // not counted: 2 g, 2 z, 1 c, 1 l
+        let order = seed_order(&index);
+        assert_eq!(&order[..4], b"gzcl");
+        assert_eq!(order.len(), SEED_CHARS.len());
+        assert_eq!(order[4], b'a'); // the rest alphabetical
     }
 
     #[test]
