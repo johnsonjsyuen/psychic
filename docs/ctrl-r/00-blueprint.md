@@ -42,6 +42,7 @@ Scale for every B metric: a database with **50,000 distinct commands and
 | R1 | Blended model top-1 minus recency-baseline top-1, query length 2, slice "target last run more than 10 minutes ago", holdout split, mean of 5 seeds | >= +0.10 |
 | R2 | Blended model top-1 minus recency-baseline top-1 on every headline cell (slices `all` and `gt10min` x query lengths 0,1,2,3), mean of 5 seeds | >= -0.01 on every cell |
 | R3 | Heuristic-only minus recency-baseline, every slice in {`all`, `gt10min`, `other_dir`} x query length x {top-1, top-3, top-10, MRR} | >= -0.001 on every cell |
+| R4 | Blended model top-1 minus the cold start's (fzf's order) top-1 on every cell of slices `all` and `gt10min` x the `fragment` and `infix` query styles x their lengths, mean of 5 seeds: no query style is made worse by loading a model (adopted 2026-11-18 at the task giver's request) | >= -0.01 on every cell |
 | B1 | Per-keystroke worker time (filter + heuristic + features + predict + blend), p95 | <= 8 ms |
 | B2 | Keystroke to first byte of redraw, p95 | <= 16 ms |
 | B3 | Process start to first results on screen, p95 | <= 50 ms |
@@ -72,7 +73,7 @@ file numbers and are never compared with them as a pass/fail test.
 
 **Implementation Implication:** Phase D is not optional polish. No phase is
 "done" for the owner until [results.md](04-bench.md#8-results-log-format) holds
-a row that passes R1-R3 and B1-B10; the file candidates sit at a few hundred
+a row that passes R1-R4 and B1-B10; the file candidates sit at a few hundred
 rows, so B1-B3 force a design (bulk load, parallel filter, two-stage rank) that
 file mode never needed.
 

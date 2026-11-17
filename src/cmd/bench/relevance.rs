@@ -20,13 +20,13 @@ use super::super::corpus::splitmix64;
 use super::super::fuzzy;
 use super::super::index::{CommandIndex, RankContext};
 use super::super::model::CmdModel;
-use super::super::rank::{CommandCandidate, rank_commands};
+use super::super::rank::{CommandCandidate, rank_commands, stage2_rows};
 use super::super::store::{CmdStore, RunRecord, Source};
 use super::super::train::{
     BuildOptions, CmdModelStats, ReplayInput, Replayer, Step, Timeline, build_training_set,
     fit_command_model, fragment_query,
 };
-use super::super::tuning::{CMD_STAGE2_K, CMD_TRAIN_MAX_RUN_GROUPS, CMD_TRAIN_MIN_GROUPS};
+use super::super::tuning::{CMD_TRAIN_MAX_RUN_GROUPS, CMD_TRAIN_MIN_GROUPS};
 use super::super::worker::{Scope, filter_candidates};
 use super::CorpusStats;
 use anyhow::{Context, Result};
@@ -49,6 +49,9 @@ const R2_MIN: f64 = -0.01;
 /// R3: heuristic minus recency on every cell of {all, gt10min, other_dir} x
 /// 4 lengths x 4 metrics.
 const R3_MIN: f64 = -0.001;
+/// R4: model minus fzf's order (the cold start) on every (all, gt10min) x
+/// fragment and infix length cell, top-1.
+const R4_MIN: f64 = -0.01;
 /// A cell with fewer lookups is printed but marked `low n` (E-N-06).
 const LOW_N: usize = 200;
 /// Fewer seeds that trained than this makes R1 and R2 inconclusive (E-N-12).
@@ -61,6 +64,10 @@ const LENGTHS: [usize; 4] = [0, 1, 2, 3];
 const FRAGMENT_LENGTHS: [usize; 4] = [1, 2, 3, 5];
 /// Mixed into a run id to choose the word of its fragment queries.
 const FRAGMENT_SALT: u64 = 0x5EED_F4A6_0000_0001;
+/// Infix query lengths measured, in characters (section 5.2).
+const INFIX_LENGTHS: [usize; 4] = [2, 3, 4, 5];
+/// Mixed into a run id to choose where its infix queries start.
+const INFIX_SALT: u64 = 0x1F1C_5EED_0000_0002;
 /// The reference line of section 5.6.
 const FILE_REFERENCE: &str = "file search on its own benchmark: top-1 0.7960, MRR 0.8656 \
                               (different task; see 00-blueprint.md section 2)";
@@ -81,8 +88,9 @@ pub(super) enum Ranker {
     Fzf,
     Heuristic,
     Model,
-    /// Information: the share of lookups whose target the heuristic puts in
-    /// the first `CMD_STAGE2_K` rows, the only rows the model scores.
+    /// Information: the share of lookups whose target is among the rows the
+    /// model scores (`rank::stage2_rows`: fzf's top `CMD_STAGE2_K` and the
+    /// directory's most-run matches).
     Stage1Recall,
 }
 
@@ -117,6 +125,9 @@ pub(super) enum QueryStyle {
     Prefix,
     /// The first characters of a word inside the text.
     Fragment,
+    /// Characters from inside a word after the first, not at its start: a
+    /// rule training never uses (section 5.2).
+    Infix,
 }
 
 impl QueryStyle {
@@ -124,6 +135,7 @@ impl QueryStyle {
         match self {
             QueryStyle::Prefix => "prefix",
             QueryStyle::Fragment => "fragment",
+            QueryStyle::Infix => "infix",
         }
     }
 
@@ -131,12 +143,13 @@ impl QueryStyle {
         match self {
             QueryStyle::Prefix => LENGTHS,
             QueryStyle::Fragment => FRAGMENT_LENGTHS,
+            QueryStyle::Infix => INFIX_LENGTHS,
         }
     }
 }
 
 /// Every (style, length) measured, in output order.
-const QUERIES: [(QueryStyle, usize); 8] = [
+const QUERIES: [(QueryStyle, usize); 12] = [
     (QueryStyle::Prefix, 0),
     (QueryStyle::Prefix, 1),
     (QueryStyle::Prefix, 2),
@@ -145,6 +158,10 @@ const QUERIES: [(QueryStyle, usize); 8] = [
     (QueryStyle::Fragment, 2),
     (QueryStyle::Fragment, 3),
     (QueryStyle::Fragment, 5),
+    (QueryStyle::Infix, 2),
+    (QueryStyle::Infix, 3),
+    (QueryStyle::Infix, 4),
+    (QueryStyle::Infix, 5),
 ];
 
 /// The query of `style` and `len` for a target, or `None` when the text
@@ -157,7 +174,34 @@ fn make_query(style: QueryStyle, text: &str, len: usize, run_id: i64) -> Option<
         QueryStyle::Fragment => {
             fragment_query(text, len, splitmix64(run_id as u64 ^ FRAGMENT_SALT))
         }
+        QueryStyle::Infix => infix_query(text, len, splitmix64(run_id as u64 ^ INFIX_SALT)),
     }
+}
+
+/// An infix query (section 5.2): `len` characters of a word after the first,
+/// starting at a letter or digit that is not the word's first letter or
+/// digit (inside the word, or after a `/`, `.`, `-` in it). `pick` chooses
+/// among every such start in the text; `None` when there is none. Training's
+/// queries never start there ([`fragment_query`] is the word's start), so
+/// this measures a query rule the model was not trained on.
+pub(super) fn infix_query(text: &str, len: usize, pick: u64) -> Option<String> {
+    let mut starts: Vec<&str> = Vec::new();
+    for word in text.split_whitespace().skip(1) {
+        let Some(first) = word.find(|c: char| c.is_alphanumeric()) else {
+            continue;
+        };
+        let word = &word[first..];
+        for (at, c) in word.char_indices().skip(1) {
+            if c.is_alphanumeric() && word[at..].chars().count() >= len {
+                starts.push(&word[at..]);
+            }
+        }
+    }
+    if starts.is_empty() {
+        return None;
+    }
+    let start = starts[(pick % starts.len() as u64) as usize];
+    Some(start.chars().take(len).collect())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -530,11 +574,12 @@ pub(super) struct Verdicts {
     pub r1: Verdict,
     pub r2: Verdict,
     pub r3: Verdict,
+    pub r4: Verdict,
 }
 
 impl Verdicts {
     pub(super) fn all_pass(&self) -> bool {
-        [&self.r1, &self.r2, &self.r3]
+        [&self.r1, &self.r2, &self.r3, &self.r4]
             .iter()
             .all(|v| v.status == Status::Pass)
     }
@@ -579,7 +624,31 @@ pub(super) fn verdicts(cells: &[Cell], seeds: usize) -> Verdicts {
     }
     // The heuristic has no seeds.
     let r3 = worst_verdict(&r3_cells, R3_MIN, true);
-    Verdicts { r1, r2, r3 }
+
+    // R4: no query style is worse with the model than without it.
+    let other_styles: Vec<(String, usize, f64)> = cells
+        .iter()
+        .filter(|c| {
+            c.ranker == Ranker::Model
+                && c.style != QueryStyle::Prefix
+                && matches!(c.slice, Slice::All | Slice::Gt10min)
+        })
+        .map(|model| {
+            let fzf = cells.iter().find(|c| {
+                c.ranker == Ranker::Fzf
+                    && c.slice == model.slice
+                    && c.style == model.style
+                    && c.len == model.len
+            });
+            let d = fzf.map_or(f64::NAN, |fzf| {
+                model.mean(Metric::Top1) - fzf.mean(Metric::Top1)
+            });
+            let name = format!("{}/{}{}", model.slice.key(), model.style.key(), model.len);
+            (name, model.n, d)
+        })
+        .collect();
+    let r4 = worst_verdict(&other_styles, R4_MIN, enough_seeds);
+    Verdicts { r1, r2, r3, r4 }
 }
 
 // ---------------------------------------------------------------------------
@@ -836,6 +905,7 @@ struct Ranks {
 
 struct Lookup {
     slices: u8,
+    in_stage2: bool,
     recency: u32,
     fzf_scored: u32,
     fzf: u32,
@@ -845,6 +915,8 @@ struct Lookup {
 
 /// What `rank_lookup` measured.
 struct LookupRanks {
+    /// The target is among the rows the model scores.
+    in_stage2: bool,
     recency: u32,
     fzf_scored: u32,
     fzf: u32,
@@ -893,7 +965,11 @@ fn rank_lookup(
             )
         })
         .collect();
+    let in_stage2 = stage2_rows(&candidates, index, ctx)
+        .iter()
+        .any(|c| c.idx == target);
     LookupRanks {
+        in_stage2,
         recency,
         fzf_scored,
         fzf,
@@ -967,6 +1043,7 @@ fn replay_window(
                     }
                     ranks.lookups[at].push(Lookup {
                         slices,
+                        in_stage2: measured.in_stage2,
                         recency: measured.recency,
                         fzf_scored: measured.fzf_scored,
                         fzf: measured.fzf,
@@ -1021,13 +1098,7 @@ fn cells_of(ranks: &Ranks, seeds: usize) -> Vec<Cell> {
             });
             push(Ranker::Model, values);
             // In stage 2 counts as rank 1: all four metrics are the recall.
-            let in_stage2 = |l: &&Lookup| {
-                if (l.heuristic as usize) <= CMD_STAGE2_K {
-                    1
-                } else {
-                    NOT_MATCHED
-                }
-            };
+            let in_stage2 = |l: &&Lookup| if l.in_stage2 { 1 } else { NOT_MATCHED };
             push(
                 Ranker::Stage1Recall,
                 spread(Metrics::of(
@@ -1307,11 +1378,20 @@ fn markdown(
         for slice in [Slice::All, Slice::Gt10min, Slice::OtherDir] {
             write_slice_table(&mut md, label, result, slice, QueryStyle::Fragment);
         }
+        let _ = writeln!(
+            md,
+            "\nInfix queries: characters from inside a word after the first, not at \
+             its start (section 5.2); training never makes such a query."
+        );
+        for slice in [Slice::All, Slice::Gt10min, Slice::OtherDir] {
+            write_slice_table(&mut md, label, result, slice, QueryStyle::Infix);
+        }
     }
     let _ = writeln!(md, "\n## Verdicts ({label}, holdout)\n");
     let _ = writeln!(md, "- {}", verdict_line("R1", &verdicts.r1));
     let _ = writeln!(md, "- {}", verdict_line("R2", &verdicts.r2));
     let _ = writeln!(md, "- {}", verdict_line("R3", &verdicts.r3));
+    let _ = writeln!(md, "- {}", verdict_line("R4", &verdicts.r4));
     if results.len() > 1 {
         write_fold_table(&mut md, label, results);
     }
@@ -1481,7 +1561,7 @@ fn to_json(
         "unreachable": { "all": round6(all), "hook": round6(hook), "import": round6(import) },
         "splits": splits,
         "verdicts": { "R1": verdict_json(&verdicts.r1), "R2": verdict_json(&verdicts.r2),
-                      "R3": verdict_json(&verdicts.r3) },
+                      "R3": verdict_json(&verdicts.r3), "R4": verdict_json(&verdicts.r4) },
     })
 }
 

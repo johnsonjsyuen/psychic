@@ -333,6 +333,82 @@ fn tc_n_16_fragment_queries_start_a_later_word() {
 }
 
 #[test]
+fn tc_n_19_infix_queries_start_inside_a_later_word() {
+    let text = "git commit src/a.rs";
+    // Starts after each word's first letter or digit: "ommit".."t", then
+    // "rc/a.rs".."s" without the separators.
+    let all: Vec<String> = (0..20u64)
+        .filter_map(|pick| infix_query(text, 2, pick))
+        .collect();
+    assert_eq!(&all[..6], ["om", "mm", "mi", "it", "rc", "c/"]);
+    assert!(all.iter().all(|q| !q.starts_with(['/', '.'])));
+    assert!(!all.contains(&"co".to_string()), "never a word's start");
+    assert!(!all.contains(&"gi".to_string()), "never the first word");
+    assert_eq!(infix_query(text, 9, 0), None, "no word that long");
+    assert_eq!(infix_query("ls", 2, 0), None, "one word");
+    assert_eq!(
+        infix_query("ls -a", 2, 0),
+        None,
+        "nothing after a first letter"
+    );
+    // A target always matches its infix query: it is a substring.
+    assert!(text.contains(&infix_query(text, 4, 7).unwrap()));
+    assert_eq!(
+        make_query(QueryStyle::Infix, text, 3, 1),
+        infix_query(text, 3, splitmix64(1 ^ INFIX_SALT))
+    );
+}
+
+#[test]
+fn tc_n_20_r4_compares_the_model_with_fzf_on_fragment_and_infix_cells() {
+    let other = |ranker, style, slice, len, top1| Cell {
+        style,
+        ..cell(ranker, slice, len, 300, top1)
+    };
+    let mut cells = grid(300, &[cell(Ranker::Model, Slice::Gt10min, 2, 300, 0.62)]);
+    for style in [QueryStyle::Fragment, QueryStyle::Infix] {
+        for slice in [Slice::All, Slice::Gt10min] {
+            cells.push(other(Ranker::Fzf, style, slice, 2, 0.40));
+            cells.push(other(Ranker::Model, style, slice, 2, 0.395));
+        }
+    }
+    let v = verdicts(&cells, 5);
+    assert_eq!(v.r4.status, Status::Pass, "0.005 below is within the bar");
+    assert!(v.all_pass());
+    cells.push(other(Ranker::Fzf, QueryStyle::Infix, Slice::All, 3, 0.50));
+    cells.push(other(Ranker::Model, QueryStyle::Infix, Slice::All, 3, 0.48));
+    let v = verdicts(&cells, 5);
+    assert_eq!(v.r4.status, Status::Fail);
+    assert_eq!(v.r4.cell, "all/infix3");
+    assert!(close(v.r4.value, -0.02));
+    // Other slices and prefix cells do not count.
+    let mut cells = grid(300, &[cell(Ranker::Model, Slice::Gt10min, 2, 300, 0.62)]);
+    cells.push(other(
+        Ranker::Fzf,
+        QueryStyle::Fragment,
+        Slice::OtherDir,
+        1,
+        0.9,
+    ));
+    cells.push(other(
+        Ranker::Model,
+        QueryStyle::Fragment,
+        Slice::OtherDir,
+        1,
+        0.1,
+    ));
+    cells.push(other(Ranker::Fzf, QueryStyle::Fragment, Slice::All, 1, 0.3));
+    cells.push(other(
+        Ranker::Model,
+        QueryStyle::Fragment,
+        Slice::All,
+        1,
+        0.3,
+    ));
+    assert_eq!(verdicts(&cells, 5).r4.status, Status::Pass);
+}
+
+#[test]
 fn the_fzf_baseline_orders_by_fzf_score_then_newest() {
     // "gi": word starts in "git log" and "tig git" (equal under the history
     // scheme), scattered in "grep -i"; "ls" does not match at all, so the

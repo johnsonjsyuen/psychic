@@ -12,7 +12,7 @@ Numbers for the targets themselves are in 00 only; here they are cited by ID.
 |---|---|
 | Builds | `psychic internal bench-history` (Rust), `bench/history.py` (Python, pty), `docs/ctrl-r/results.md` |
 | Inputs (must exist) | D0 needs Phase A only. D needs Phases A, B, C |
-| Output | A results-log row per corpus showing R1-R3 and B1-B10 with PASS/FAIL, then the tuning loop of section 7 |
+| Output | A results-log row per corpus showing R1-R4 and B1-B10 with PASS/FAIL, then the tuning loop of section 7 |
 
 Done when all of these pass (D0: the first three lines and `generate`,
 `extract-agent`, `stats`; D: everything):
@@ -369,9 +369,11 @@ For each split, with `t_s` its training cut:
 | `prefix` | 0, 1, 2, 3 | The first `len` characters of the command text | **Headline**; every verdict reads it (continuity with the first results) |
 | `fragment` | 1, 2, 3, 5 | `fragment_query(text, len, splitmix64(run.id ^ FRAGMENT_SALT))`: the words after the first (split on whitespace), each from its first letter or digit (words without one are dropped); the hash picks one word, the same at every length; its first `len` characters. None (the lookup is skipped at that length) when the text has one word or the chosen word is shorter than `len` | Information: what a user types who remembers a word from the middle of the command. A prefix query flatters any scorer that rewards a match at the start of the text (Skim's, which `fzf_scored` uses) |
 
-A fragment is a substring of the target, so the target always matches it.
-The fragment style was added on 2026-11-17; before it every query was a
-prefix.
+| `infix` | 2, 3, 4, 5 | `infix_query(text, len, splitmix64(run.id ^ INFIX_SALT))`: every start, in the words after the first, at a letter or digit that is not the word's first letter or digit (inside a word, or after a `/`, `.`, `-` in it), with `len` characters left; the hash picks one; its first `len` characters. None when there is no such start | Information, and R4: a query rule training never uses (its fragments start a word), so it measures how the model does on queries it was not trained on |
+
+A fragment or infix is a substring of the target, so the target always
+matches it. The fragment style was added on 2026-11-17 (before it every
+query was a prefix), the infix style on 2026-11-18.
 
 ### 5.3 Rankers
 
@@ -408,7 +410,7 @@ Two information rows go with every table:
 
 | Row | Computed as | Why |
 |---|---|---|
-| `stage1_recall` | Share of lookups whose target the heuristic puts within its first `CMD_STAGE2_K` rows (all four metric columns hold it) | The model only re-orders those rows; a target outside them keeps its heuristic rank. B8 measures agreement of top-10s, not this |
+| `stage1_recall` | Share of lookups whose target is among the rows the model scores, `rank::stage2_rows` (fzf's first `CMD_STAGE2_K` rows and the directory's `CMD_STAGE2_DIR_ROWS`; all four metric columns hold it) | The model only re-orders those rows; a target outside them keeps its heuristic rank. B8 measures agreement of top-10s, not this |
 | Bayes ceiling (synthetic corpora only, not in the JSON) | `corpus::ceiling` (an ignored test, run by hand): re-simulate the generator with the corpus's arguments; for each reused run of the last 20% (every `stride`-th, about 2,000) compute the generator's exact probability of every command being next from the state it chose from; rank the chosen command among the commands with the same first `len` characters by that probability (equal probabilities share their places) | The best any ranker could do on the prefix style: it knows the generator and that the query is a prefix of the target (it ranks only the commands with the same first characters). The gap between the model and it is what remains to learn; the gap between it and 1 is irreducible |
 
 A third row, the share of lookups whose target has exactly the features of
@@ -422,16 +424,17 @@ so it was 1.000 everywhere and said nothing.
 | R1 | `model.top1.mean - recency.top1` on (`holdout`, `gt10min`, prefix length 2) | value, PASS/FAIL, and `n` |
 | R2 | min over the 8 headline cells of `model.top1.mean - recency.top1` | value, the worst cell, PASS/FAIL |
 | R3 | min over (`all`, `gt10min`, `other_dir`) x 4 lengths x 4 metrics of `heuristic - recency` | value, the worst cell, PASS/FAIL |
+| R4 | min over (`all`, `gt10min`) x the `fragment` and `infix` lengths of `model.top1.mean - fzf.top1` | value, the worst cell, PASS/FAIL (added 2026-11-18) |
 
 A cell with `n < 200` is printed with its value and marked `low n`; a verdict
 that depends on such a cell is `INCONCLUSIVE`, not PASS. For R2 and R3, which
 take a minimum over many cells: a cell with `n >= 200` below the bar makes the
 verdict FAIL (it names the worst such cell); otherwise any low-`n` or empty
-cell makes it `INCONCLUSIVE`; otherwise PASS. R1 and R2 are `INCONCLUSIVE`
+cell makes it `INCONCLUSIVE`; otherwise PASS. R4 follows the same rule. R1, R2 and R4 are `INCONCLUSIVE`
 when fewer than 3 seeds trained (E-N-12), whatever their cells say. A lookup whose target does not match
 its own prefix (none has been seen) counts as a miss for every ranker and is
 counted in the output. With `--strict` the
-process exits 1 unless all three verdicts are PASS.
+process exits 1 unless all four verdicts are PASS.
 
 ### 5.6 Output
 
@@ -452,7 +455,7 @@ model (5 seeds)           0.19   0.31      0.36   0.47      0.55   0.64      0.6
 ```
 
 (the numbers above show the format only), then the same tables for the `fragment` style for `all`,
-`gt10min` and `other_dir`, then the three verdict lines, then
+`gt10min` and `other_dir`, then those for the `infix` style, then the four verdict lines, then
 with `--folds` a compact per-fold table of `top1` at length 2 for `all` and
 `gt10min`, then the reference line `file search on its own benchmark: top-1
 0.7960, MRR 0.8656 (different task; see 00-blueprint.md section 2)`.
@@ -468,7 +471,8 @@ with `--folds` a compact per-fold table of `top1` at length 2 for `all` and
       { "ranker": "model", "slice": "gt10min", "style": "prefix", "len": 2, "n": 1412,
         "top1": {"mean": 0.0, "sd": 0.0, "min": 0.0, "max": 0.0}, "top3": {}, "top10": {}, "mrr": {} } ] } },
   "verdicts": { "R1": {"value": 0.0, "status": "PASS"}, "R2": {"value": 0.0, "cell": "all/len0", "status": "PASS"},
-                "R3": {"value": 0.0, "cell": "...", "status": "PASS"} } }
+                "R3": {"value": 0.0, "cell": "...", "status": "PASS"},
+                "R4": {"value": 0.0, "cell": "all/fragment1", "status": "PASS"} } }
 ```
 
 For unseeded rankers `sd` is 0 and `min == max == mean`. Each split also
@@ -804,6 +808,8 @@ Work top to bottom; within a row try the listed values one at a time.
 | TC-N-16 | fragment queries, verdict scope | `fragment_query("git commit --amend 'fix it'", len, pick)`; a fragment cell far below the baseline | Words `commit`, `amend`, `fix`, `it` (from the first letter or digit); the same word at every length; none past the word's length; `pick` wraps; verdicts unchanged by the fragment cell | One word, or no letter or digit -> none; characters, not bytes |
 | TC-N-17 | `fzf` baseline | `git log` (10), `tig git` (30), `grep -i` (40), `ls` (50); query `gi` | Ranks 2, 1, 3, 4 (equal word-start scores newest first, the scattered match, then the non-match) | Target absent -> `NOT_MATCHED`; empty query -> newest first |
 | TC-N-18 | Bayes ceiling (`src/cmd/corpus/ceiling.rs`) | `zipf_pmf` against 200,000 draws of `zipf_s` for (n, s) in (1, 1), (7, 1), (50, 1.5), (300, 1.8), (20, 0); the generator's distribution over 2,800 reused runs of interactive 500 / 20,000 | Each probability within 0.005 of the observed frequency; every distribution sums to 1; the mean probability of the chosen command equals the mean sum of squared probabilities within 0.01 (both estimate the same quantity only if the distribution is the generator's) | - |
+| TC-N-19 | infix queries | `infix_query("git commit src/a.rs", len, pick)` over picks 0-19 | Starts `om, mm, mi, it, rc, c/, ...`: inside a later word, never at a word's start or a separator, never in the first word; none for a one-word text, a word too short, or nothing after a first letter; a substring of the text | - |
+| TC-N-20 | R4 | fzf 0.40 and model 0.395 on fragment and infix cells of `all` and `gt10min`; then an infix cell 0.02 below | PASS, then FAIL naming `all/infix3` with -0.02; an `other_dir` cell far below does not count | - |
 | TC-N-11 | baselines | 3 candidates with (`last_run_at`, `fuzzy`) = (10, 5), (30, 5), (20, 9) | `recency` order: 2nd, 3rd, 1st; `fzf_scored` order: 3rd, 2nd, 1st | equal `last_run_at` -> higher `db_id` first |
 
 ### 11.2 Integration tests
@@ -848,7 +854,7 @@ the self-consistency rule of E-N-08.
 
 | Topic | Location |
 |---|---|
-| Every target (R1-R3, B1-B10) and the reference numbers | [00-blueprint.md section 2](00-blueprint.md#2-success-metrics) |
+| Every target (R1-R4, B1-B10) and the reference numbers | [00-blueprint.md section 2](00-blueprint.md#2-success-metrics) |
 | ADR-16, ADR-17, ADR-19 | [00-blueprint.md section 8](00-blueprint.md#8-architecture-decision-records) |
 | `record_run`, T1-T4 | [01-record.md section 6](01-record.md#6-sql-statements) |
 | Production importer used for corpus 1 | [01-record.md section 12](01-record.md#12-backfill) |

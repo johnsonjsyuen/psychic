@@ -11,7 +11,7 @@ the model stage of ranking (two-stage rank and blend).
 |---|---|
 | Builds | `features.rs`, `train.rs`, the model stage in `rank.rs`, `psychic history --retrain`, the detached retrain at picker start, the debug-pane feature list |
 | Inputs (must exist) | Phase A ([01](01-record.md)); Phase B: `CommandIndex` and its mutators/accessors ([02 section 5](02-browse.md#5-commandindex)), `rank_commands` heuristic stage ([02 section 7](02-browse.md#7-heuristic-ranking)), worker ([02 section 6](02-browse.md#6-worker)); Phase D0: the synthetic generator ([04 section 2](04-bench.md#2-files-touched-and-the-two-commits)) for the done-when commands |
-| Leaves for Phase D | Measuring R1-R3, B1, B6, B8 and tuning the constants of section 3 |
+| Leaves for Phase D | Measuring R1-R4, B1, B6, B8 and tuning the constants of section 3 |
 
 Done when all of these pass:
 
