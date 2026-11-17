@@ -230,6 +230,16 @@ fn main() -> Result<()> {
         return cmd::run_track_command(data_dir.as_deref(), args);
     }
 
+    // The benchmark's data-dir guard runs before the logger, which would
+    // create the data directory and its app.log: a refused run must leave the
+    // real data directory exactly as it was (IT-N-05).
+    if let Some(Commands::Internal {
+        command: InternalCommands::BenchHistory(_),
+    }) = &cli.command
+    {
+        cmd::check_bench_data_dir(cli.data_dir.as_deref())?;
+    }
+
     // Generate session ID early so we can include it in all logs
     let session_id = create_session_id();
 
@@ -511,7 +521,7 @@ fn main() -> Result<()> {
             }
             Commands::Internal { command } => match command {
                 InternalCommands::BenchHistory(args) => {
-                    return cmd::run_bench(&data_dir, cli.data_dir.is_some(), args);
+                    return cmd::run_bench(cli.data_dir.as_deref(), args);
                 }
                 InternalCommands::AnalyzePerf => {
                     let log_path = data_dir.join("app.log");

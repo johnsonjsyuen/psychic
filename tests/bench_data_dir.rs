@@ -29,6 +29,53 @@ fn tree(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Run the built binary with the scratch `HOME`, a cleared environment and
+/// exactly `args` (no `--data-dir` unless `args` has one). Returns whether it
+/// succeeded and its stderr.
+fn run_bare(scratch: &Scratch, args: &[&str]) -> (bool, String) {
+    let output = std::process::Command::new(support::BINARY)
+        .env_clear()
+        .env("HOME", scratch.path("home"))
+        .current_dir(scratch.path("work"))
+        .args(args)
+        .output()
+        .expect("psychic runs");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// TC-N-09 end to end: a refused benchmark run creates nothing, not even the
+/// data directory or the app.log the logger would open there.
+#[test]
+fn it_n_05_a_refused_benchmark_creates_nothing_under_home() {
+    let scratch = Scratch::empty("bench", "refused");
+    let default_dir = scratch.display("home/.local/share/psychic");
+    for args in [
+        vec!["internal", "bench-history", "stats"],
+        vec![
+            "--data-dir",
+            &default_dir,
+            "internal",
+            "bench-history",
+            "stats",
+        ],
+    ] {
+        let (succeeded, stderr) = run_bare(&scratch, &args);
+        assert!(!succeeded, "{args:?} is refused");
+        assert!(
+            stderr.contains("bench-history needs an explicit --data-dir"),
+            "{args:?} names the guard"
+        );
+        assert_eq!(
+            tree(&scratch.path("home")),
+            Vec::<PathBuf>::new(),
+            "{args:?} wrote nothing under HOME"
+        );
+    }
+}
+
 #[test]
 fn it_n_05_the_benchmark_writes_only_into_its_data_dir() {
     let scratch = Scratch::empty("bench", "data-dir");

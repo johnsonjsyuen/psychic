@@ -99,13 +99,26 @@ pub fn run_history(data_dir: &Path, args: cli::HistoryArgs) -> Result<()> {
     }
 }
 
-/// `psychic internal bench-history`. Refuses to run unless `--data-dir` was
-/// given and is not the real data directory: benchmarks never write there.
-pub fn run_bench(data_dir: &Path, data_dir_was_given: bool, args: bench::BenchArgs) -> Result<()> {
+/// The data-dir guard of `psychic internal bench-history`: the `--data-dir`
+/// it was given (`given`), refused when there is none or it is the real data
+/// directory. Benchmarks never write there.
+///
+/// `main` calls this before it sets up the logger, which would otherwise
+/// create the data directory and its `app.log` before the refusal.
+pub fn check_bench_data_dir(given: Option<&Path>) -> Result<&Path> {
     let real = crate::cli::get_default_data_dir().ok();
-    if !data_dir_was_given || real.is_some_and(|real| same_dir(data_dir, &real)) {
-        bail!("bench-history needs an explicit --data-dir that is not your real data directory");
+    match given {
+        Some(dir) if !real.is_some_and(|real| same_dir(dir, &real)) => Ok(dir),
+        _ => {
+            bail!("bench-history needs an explicit --data-dir that is not your real data directory")
+        }
     }
+}
+
+/// `psychic internal bench-history`, with the `--data-dir` it was given.
+/// Checks [`check_bench_data_dir`] again before anything runs.
+pub fn run_bench(given_data_dir: Option<&Path>, args: bench::BenchArgs) -> Result<()> {
+    let data_dir = check_bench_data_dir(given_data_dir)?;
     let env = bench::BenchEnv {
         now: jiff::Timestamp::now().as_second(),
         home: std::env::var_os("HOME").map(PathBuf::from),

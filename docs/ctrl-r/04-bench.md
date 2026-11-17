@@ -46,13 +46,18 @@ ls ~/.local/share/psychic -la     # mtimes unchanged by any command above
 
 ```rust
 // src/cmd/mod.rs
-pub fn run_bench(data_dir: &Path, data_dir_was_given: bool, args: bench::BenchArgs) -> anyhow::Result<()>;
+pub fn check_bench_data_dir(given: Option<&Path>) -> anyhow::Result<&Path>;
+pub fn run_bench(given_data_dir: Option<&Path>, args: bench::BenchArgs) -> anyhow::Result<()>;
 ```
 
-**Data-dir guard**, first statement of `run_bench`: `bail!("bench-history needs
+**Data-dir guard**, `check_bench_data_dir`: `bail!("bench-history needs
 an explicit --data-dir that is not your real data directory")` unless
-`data_dir_was_given` and `data_dir != cli::get_default_data_dir()` (compared
-after `canonicalize` when both exist, else after `std::path::absolute`). Benchmarks and tests never write to
+`--data-dir` was given (`given` is `Some`) and it is not `cli::get_default_data_dir()` (compared
+after `canonicalize` when both exist, else after `std::path::absolute`). `main`
+calls it for `internal bench-history` right after parsing the arguments and
+before it sets up the logger (which creates the data directory and opens its
+`app.log`), so a refused run creates and writes nothing; `run_bench` calls it
+again as its first statement. Benchmarks and tests never write to
 `~/.local/share/psychic`.
 
 ## 3. CLI surface
@@ -803,7 +808,7 @@ Work top to bottom; within a row try the listed values one at a time.
 | TC-N-06 | systematic sample | 10 reachable runs, `max_test_runs` 3 | stride 3 -> ordinals 0, 3, 6, 9 | `max_test_runs >= reachable` -> all |
 | TC-N-07 | slices | Target last run 601 s ago in another dir; 600 s ago same dir; an `import-synth:` run 5,000 s ago | `gt10min`+`other_dir`; neither; not in `gt10min` | unknown `run.cwd` -> never `other_dir` |
 | TC-N-08 | verdicts | Cells where model - recency is +0.12 on the R1 cell (`n` 300) and -0.02 on `all/len0` | R1 PASS, R2 FAIL naming `all/len0` | R1 cell with `n` 150 -> `INCONCLUSIVE` |
-| TC-N-09 (in `bench.rs`, so `cargo test cmd::bench` runs it) | data-dir guard | `run_bench(default dir, true, ..)`, `run_bench(tmp, false, ..)` | Both `Err` with the guard message | `run_bench(tmp, true, Stats)` on an empty dir succeeds and prints zeros |
+| TC-N-09 (in `bench.rs`, so `cargo test cmd::bench` runs it) | data-dir guard | `run_bench(Some(default dir), ..)`, `run_bench(None, ..)` | Both `Err` with the guard message | `run_bench(Some(tmp), Stats)` on an empty dir succeeds and prints zeros |
 | TC-N-10 | render purity (B5), in `src/cmd/render.rs` | `include_str!("render.rs")` with the `#[cfg(test)]` module cut off | Contains none of `rusqlite`, `std::fs`, `std::env`, `Instant::now`, `Timestamp::now`, `std::process`, `log::` | - |
 | TC-N-16 | fragment queries, verdict scope | `fragment_query("git commit --amend 'fix it'", len, pick)`; a fragment cell far below the baseline | Words `commit`, `amend`, `fix`, `it` (from the first letter or digit); the same word at every length; none past the word's length; `pick` wraps; verdicts unchanged by the fragment cell | One word, or no letter or digit -> none; characters, not bytes |
 | TC-N-17 | `fzf` baseline | `git log` (10), `tig git` (30), `grep -i` (40), `ls` (50); query `gi` | Ranks 2, 1, 3, 4 (equal word-start scores newest first, the scattered match, then the non-match) | Target absent -> `NOT_MATCHED`; empty query -> newest first |
@@ -820,7 +825,7 @@ Work top to bottom; within a row try the listed values one at a time.
 | IT-N-02 | Replay state equals a fresh load | Same data; a `Replayer` with every run applied versus `CommandIndex::load` at `now` = newest run + 1 for one (cwd, repo, session) | `rank_commands(.., usize::MAX, None)` over all commands returns the same order of `db_id`s from both, for queries `""` and `g`; the `CMD_RECENCY_RANK_CAP` newest matching commands are the same from serving's candidates (both fill paths) and from `train::newest_matching`; every feature per command is equal | `remove_dir_all` |
 | IT-N-03 | Agent extraction | Temp projects dir: `p1/s1.jsonl` (the TC-N-05 fixture), `p1/s1/subagents/agent-a9.jsonl` (two uses with `agentId` `a9`, timed between the main file's first two), a non-JSONL file | Runs from both files; `shell_session` values `agent:s1` and `agent:s1:a9`; rows in global time order with `prev_command_id` set inside one session only; `source = 'hook'`; the fixture files' mtimes unchanged | `remove_dir_all` |
 | IT-N-04 | Two-stage check | IT-N-01's data plus `retrain`; `twostage --queries 40` with `CMD_STAGE2_K` larger than the corpus | Overlap 1.0 and top-1 agreement 1.0 (no cut applies); exit 0 | `remove_dir_all` |
-| IT-N-05 | Real data dir is never written (`tests/bench_data_dir.rs`) | The built binary, cleared environment, `HOME` = a scratch `home`, `--data-dir` = a scratch `data`: `generate --commands 100 --runs 2000 --seed 3`, `relevance --seeds 1 --max-test-runs 100 --json data/out.json`, `stats` | All exit 0 and the report has `## Verdicts`; nothing at all exists under `home` (so nothing in the data directory `HOME` resolves to); the scratch root holds only `data`, `home`, `work`. Run against a scratch `HOME`, not the machine's real data dir: that one changes whenever its owner runs a command with recording on, so a snapshot of it failed spuriously | Scratch dropped |
+| IT-N-05 | Real data dir is never written (`tests/bench_data_dir.rs`) | The built binary, cleared environment, `HOME` = a scratch `home`, `--data-dir` = a scratch `data`: `generate --commands 100 --runs 2000 --seed 3`, `relevance --seeds 1 --max-test-runs 100 --json data/out.json`, `stats` | All exit 0 and the report has `## Verdicts`; nothing at all exists under `home` (so nothing in the data directory `HOME` resolves to); the scratch root holds only `bin`, `data`, `home`, `work`. Second test: `internal bench-history stats` with no `--data-dir`, then with `--data-dir` = `home/.local/share/psychic`: both exit non-zero with the guard message on stderr, and still nothing at all exists under `home` (no data directory, no `app.log`). Run against a scratch `HOME`, not the machine's real data dir: that one changes whenever its owner runs a command with recording on, so a snapshot of it failed spuriously | Scratch dropped |
 | IT-N-06 | No text leaks from the benchmark | IT-N-01 with one command text replaced by `SENTINEL_c0ffee` | Neither stdout, the JSON nor the Markdown contains `SENTINEL_c0ffee` | `remove_dir_all` |
 
 | IT-N-07 | Leakage controls (section 5.7) | IT-N-01's data; a three-run history | The model trained at a cut equals the one trained on the history truncated there; a test lookup is ranked before its own run is applied; shuffled labels keep the group counts and change the model | `remove_dir_all` |

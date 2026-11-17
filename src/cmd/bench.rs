@@ -488,14 +488,14 @@ mod tests {
             "bench-history needs an explicit --data-dir that is not your real data directory";
         // The guard runs before anything is opened, so the real dir is never touched.
         if let Ok(real) = crate::cli::get_default_data_dir() {
-            let error = super::super::run_bench(&real, true, stats()).unwrap_err();
+            let error = super::super::run_bench(Some(&real), stats()).unwrap_err();
             assert_eq!(error.to_string(), guard);
         }
         let dir = scratch("bench-guard");
-        let error = super::super::run_bench(&dir, false, stats()).unwrap_err();
+        let error = super::super::run_bench(None, stats()).unwrap_err();
         assert_eq!(error.to_string(), guard);
         assert!(!dir.exists(), "nothing was created");
-        super::super::run_bench(&dir, true, stats()).expect("an explicit scratch dir is fine");
+        super::super::run_bench(Some(&dir), stats()).expect("an explicit scratch dir is fine");
         std::fs::remove_dir_all(&dir).ok();
     }
 
