@@ -81,14 +81,22 @@ const SHELL_INTEGRATION: &str = include_str!("../shell/psychic.zsh");
 
 /// The functions `eval "$(psychic zsh)"` defines, read out of the script itself.
 ///
-/// A function's description is the first line of the comment block above it, so
-/// the help screen stays right as long as the script stays commented.
+/// A function is a line `name() {`, or `function name {` at any indentation
+/// (the form a conditional definition uses: zsh would expand an alias of the
+/// same name in `name() {`). Its description is the first line of the comment
+/// block above it, so the help screen stays right as long as the script stays
+/// commented.
 fn shell_commands(script: &str) -> Vec<Entry> {
     let lines: Vec<&str> = script.lines().collect();
     let mut entries = Vec::new();
 
     for (i, line) in lines.iter().enumerate() {
-        let Some(name) = line.strip_suffix("() {") else {
+        let declared = line.strip_suffix("() {").or_else(|| {
+            line.trim_start()
+                .strip_prefix("function ")
+                .and_then(|rest| rest.strip_suffix(" {"))
+        });
+        let Some(name) = declared else {
             continue;
         };
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -474,6 +482,13 @@ p() {
 pd() {
     :
 }
+
+if true; then
+    # Defined only sometimes
+    function ph {
+        :
+    }
+fi
 ";
         assert_eq!(
             shell_commands(script),
@@ -485,6 +500,10 @@ pd() {
                 Entry {
                     keys: "pd".to_string(),
                     description: "directories only".to_string(),
+                },
+                Entry {
+                    keys: "ph".to_string(),
+                    description: "defined only sometimes".to_string(),
                 },
             ],
             "The first comment line above a function is its description"
@@ -499,7 +518,12 @@ pd() {
             .collect();
         assert_eq!(
             names,
-            vec!["p".to_string(), "pd".to_string(), "pc".to_string()],
+            vec![
+                "p".to_string(),
+                "pd".to_string(),
+                "pc".to_string(),
+                "ph".to_string()
+            ],
             "These are the functions eval \"$(psychic zsh)\" defines"
         );
     }

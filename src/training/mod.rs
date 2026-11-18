@@ -73,6 +73,9 @@ pub struct TrainingSet {
     labels: Vec<f32>,
     episodes: Vec<i64>,
     timestamps: Vec<f64>,
+    /// A weight per row that multiplies its recency weight; 1.0 for every
+    /// row of a CSV.
+    row_weights: Vec<f64>,
 }
 
 impl TrainingSet {
@@ -140,6 +143,7 @@ impl TrainingSet {
             labels: Vec::with_capacity(rows.len()),
             episodes: Vec::with_capacity(rows.len()),
             timestamps: Vec::with_capacity(rows.len()),
+            row_weights: vec![1.0; rows.len()],
         };
         for row in rows {
             set.features.extend_from_slice(&row.values);
@@ -148,6 +152,47 @@ impl TrainingSet {
             set.timestamps.push(row.timestamp);
         }
         Ok(set)
+    }
+
+    /// A set built in memory rather than parsed: `labels.len()` rows of
+    /// `num_features` row-major `features`, sorted by `episodes`, each with a
+    /// timestamp and a weight that multiplies its recency weight.
+    pub fn from_parts(
+        num_features: usize,
+        features: Vec<f64>,
+        labels: Vec<f32>,
+        episodes: Vec<i64>,
+        timestamps: Vec<f64>,
+        row_weights: Vec<f64>,
+    ) -> Self {
+        assert_eq!(
+            features.len(),
+            labels.len() * num_features,
+            "features hold num_features values per row"
+        );
+        assert!(
+            episodes.len() == labels.len()
+                && timestamps.len() == labels.len()
+                && row_weights.len() == labels.len(),
+            "labels, episodes, timestamps and row weights have one entry per row"
+        );
+        assert!(episodes.is_sorted(), "rows are sorted by episode");
+        assert!(
+            row_weights.iter().all(|w| w.is_finite() && *w > 0.0),
+            "every row weight is finite and positive"
+        );
+        assert!(
+            labels.iter().all(|&l| l == 0.0 || l == 1.0),
+            "every label is 0 or 1"
+        );
+        TrainingSet {
+            features,
+            num_features,
+            labels,
+            episodes,
+            timestamps,
+            row_weights,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -174,7 +219,7 @@ struct ParsedRow {
 /// round count that `lgb.train` adds from its `num_boost_round` argument.
 ///
 /// The string is what LightGBM parses; key order does not matter to it.
-fn lightgbm_params(features: &[FeatureSpec], num_iterations: usize) -> String {
+fn lightgbm_params(features: &[FeatureSpec], num_iterations: usize, seed: u32) -> String {
     let monotone: Vec<String> = features.iter().map(|f| f.monotone.to_string()).collect();
     [
         "objective=lambdarank".to_owned(),
@@ -189,10 +234,10 @@ fn lightgbm_params(features: &[FeatureSpec], num_iterations: usize) -> String {
         "bagging_fraction=0.8".to_owned(),
         "bagging_freq=5".to_owned(),
         "verbose=-1".to_owned(),
-        "seed=42".to_owned(),
-        "bagging_seed=42".to_owned(),
-        "feature_fraction_seed=42".to_owned(),
-        "data_random_seed=42".to_owned(),
+        format!("seed={seed}"),
+        format!("bagging_seed={seed}"),
+        format!("feature_fraction_seed={seed}"),
+        format!("data_random_seed={seed}"),
         format!("num_iterations={num_iterations}"),
     ]
     .join(" ")
@@ -293,11 +338,16 @@ fn group_sizes(episodes: &[i64]) -> Vec<i32> {
 struct EarlyStopping {
     /// (best score, 0-based iteration it was reached at), per metric.
     best: Vec<(f64, usize)>,
+    /// Rounds at most: training stops at the last one.
+    max_rounds: usize,
 }
 
 impl EarlyStopping {
-    fn new() -> Self {
-        EarlyStopping { best: Vec::new() }
+    fn with_max_rounds(max_rounds: usize) -> Self {
+        EarlyStopping {
+            best: Vec::new(),
+            max_rounds,
+        }
     }
 
     /// Record iteration `iteration`'s validation scores. Returns the number
@@ -317,7 +367,7 @@ impl EarlyStopping {
             if !first_time && score > best.0 {
                 *best = (score, iteration);
             }
-            if iteration - best.1 >= STOPPING_ROUNDS || iteration == MAX_ROUNDS - 1 {
+            if iteration - best.1 >= STOPPING_ROUNDS || iteration + 1 == self.max_rounds {
                 return Some(best.1 + 1);
             }
         }
@@ -367,6 +417,24 @@ pub struct Fitted {
 /// most like what the user is about to search for; the held-out fit only
 /// decides how many trees it gets.
 pub fn fit(set: &TrainingSet, features: &[FeatureSpec]) -> Result<Fitted> {
+    fit_seeded(set, features, 42)
+}
+
+/// [`fit`] with `seed` as every LightGBM seed instead of 42.
+pub fn fit_seeded(set: &TrainingSet, features: &[FeatureSpec], seed: u32) -> Result<Fitted> {
+    fit_capped(set, features, seed, MAX_ROUNDS)
+}
+
+/// [`fit_seeded`] with at most `max_rounds` trees: early stopping still
+/// decides the count below the cap. For a model whose prediction time per
+/// tree counts (the command model, `docs/ctrl-r/03-learn.md` section 6).
+pub fn fit_capped(
+    set: &TrainingSet,
+    features: &[FeatureSpec],
+    seed: u32,
+    max_rounds: usize,
+) -> Result<Fitted> {
+    assert!(max_rounds > 0, "at least one tree");
     assert_eq!(
         set.num_features,
         features.len(),
@@ -374,6 +442,11 @@ pub fn fit(set: &TrainingSet, features: &[FeatureSpec]) -> Result<Fitted> {
     );
     let names: Vec<&str> = features.iter().map(|f| f.name).collect();
     let weights = recency_weights(&set.timestamps);
+    let weights: Vec<f64> = weights
+        .iter()
+        .zip(&set.row_weights)
+        .map(|(w, r)| w * r)
+        .collect();
     let split = time_split(&set.episodes)?;
 
     let dataset = |part: &Part, rows: Range<usize>, params: &str, reference| {
@@ -392,7 +465,7 @@ pub fn fit(set: &TrainingSet, features: &[FeatureSpec]) -> Result<Fitted> {
     };
 
     // The validated fit.
-    let params = lightgbm_params(features, MAX_ROUNDS);
+    let params = lightgbm_params(features, max_rounds, seed);
     let train_part = Part::new(set, &weights, split.train.clone());
     let validation_part = Part::new(set, &weights, split.validation.clone());
     let train_data = dataset(&train_part, split.train.clone(), &params, None)?;
@@ -405,10 +478,10 @@ pub fn fit(set: &TrainingSet, features: &[FeatureSpec]) -> Result<Fitted> {
     let mut booster = lgbm::Booster::new(&train_data, &params, set.num_features)?;
     booster.add_valid(&validation_data)?;
 
-    let mut stopping = EarlyStopping::new();
+    let mut stopping = EarlyStopping::with_max_rounds(max_rounds);
     let mut history: Vec<Vec<f64>> = Vec::new();
     let mut best_iteration = None;
-    for iteration in 0..MAX_ROUNDS {
+    for iteration in 0..max_rounds {
         booster.update_one_iter()?;
         let scores = booster.eval(1)?;
         let stop = stopping.observe(iteration, &scores);
@@ -423,7 +496,7 @@ pub fn fit(set: &TrainingSet, features: &[FeatureSpec]) -> Result<Fitted> {
     drop(booster);
 
     // The refit, on everything, with nothing held out to stop against.
-    let params = lightgbm_params(features, best_iteration);
+    let params = lightgbm_params(features, best_iteration, seed);
     let all = 0..set.len();
     let all_part = Part::new(set, &weights, all.clone());
     let all_data = dataset(&all_part, all, &params, None)?;
@@ -539,7 +612,7 @@ pub fn train(features_csv: &Path, data_dir: &Path) -> Result<TrainingReport> {
 
 /// Write a temp file beside `target` and rename it over: on POSIX a reader
 /// sees the whole old file or the whole new one, never a truncated one.
-fn atomic_write(target: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(target: &Path, contents: &[u8]) -> Result<()> {
     let dir = target.parent().context("target has a directory")?;
     std::fs::create_dir_all(dir)?;
     let name = target.file_name().context("target has a name")?;
@@ -648,7 +721,7 @@ label,episode_id,timestamp,query,b,a
 
     #[test]
     fn test_early_stopping_waits_for_every_metric() {
-        let mut stopping = EarlyStopping::new();
+        let mut stopping = EarlyStopping::with_max_rounds(MAX_ROUNDS);
         // Metric 0 peaks at iteration 2; metric 1 keeps improving until 30.
         let mut stopped = None;
         for i in 0..MAX_ROUNDS {
@@ -665,15 +738,23 @@ label,episode_id,timestamp,query,b,a
 
     #[test]
     fn test_early_stopping_ties_do_not_count_as_improvement() {
-        let mut stopping = EarlyStopping::new();
+        let mut stopping = EarlyStopping::with_max_rounds(MAX_ROUNDS);
         let stopped = (0..MAX_ROUNDS).find_map(|i| stopping.observe(i, &[0.5]));
         assert_eq!(stopped, Some(1));
     }
 
     #[test]
     fn test_early_stopping_at_the_last_round() {
-        let mut stopping = EarlyStopping::new();
+        let mut stopping = EarlyStopping::with_max_rounds(MAX_ROUNDS);
         let stopped = (0..MAX_ROUNDS).find_map(|i| stopping.observe(i, &[i as f64]));
         assert_eq!(stopped, Some(MAX_ROUNDS));
+        // A cap ends it there, keeping the best round below it.
+        let mut capped = EarlyStopping::with_max_rounds(120);
+        let stopped = (0..MAX_ROUNDS).find_map(|i| capped.observe(i, &[i as f64]));
+        assert_eq!(stopped, Some(120));
+        let mut capped = EarlyStopping::with_max_rounds(120);
+        let peak = |i: usize| if i <= 90 { i as f64 } else { 90.0 };
+        let stopped = (0..MAX_ROUNDS).find_map(|i| capped.observe(i, &[peak(i)]));
+        assert_eq!(stopped, Some(91));
     }
 }

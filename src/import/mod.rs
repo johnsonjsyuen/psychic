@@ -14,7 +14,7 @@
 //! extra term (`ranker.rs`). See "Importing what you already use" in
 //! `docs/how-it-works.md`.
 
-mod shell_history;
+pub(crate) mod shell_history;
 mod sources;
 
 use crate::db::{Database, ImportedRow};
@@ -209,6 +209,16 @@ fn is_off_limits(path: &Path, home: &Path) -> bool {
             .to_string_lossy()
             .ends_with(".photoslibrary")
     })
+}
+
+/// Whether `path` is a directory, decided without touching anywhere
+/// [`is_off_limits`]: it goes through [`resolve_safely`] rather than
+/// `Path::is_dir`, so a symlink into a macOS protected folder is never
+/// followed. Used by the shell history search importer to replay `cd`s.
+pub(crate) fn is_dir_within_limits(path: &Path, home: &Path) -> bool {
+    path.is_absolute()
+        && !is_off_limits(path, home)
+        && resolve_safely(path, home).is_some_and(|resolved| resolved.kind == PathKind::Dir)
 }
 
 /// Paths never worth suggesting, whatever a source says: scratch and system

@@ -2090,7 +2090,8 @@ It owns no content. It assembles what is already declared elsewhere:
 
 - keyboard and mouse bindings from `keymap::KEYMAP`
 - command line subcommands from the clap definition in `cli.rs`
-- shell functions (`p`, `pd`, `pc`) parsed out of the embedded `shell/psychic.zsh`,
+- shell functions (`p`, `pd`, `pc`, `ph`) parsed out of the embedded `shell/psychic.zsh`
+  (`name() {`, or `function name {` for one defined conditionally),
   taking each function's description from the comment above it
 
 **Layout:** `lay_out(&blocks, available_width)` returns equal-width columns:
@@ -2523,6 +2524,7 @@ define the same commands; the help screen reads them out of the zsh one.
 - `pd xy` - `cd` to `xy` if it is a directory; otherwise to `psychic jump xy`, with no TUI; if nothing matches, the TUI opens with `xy` typed in. See "Jumping without the TUI" below.
 - `pd -i xy` - the TUI with `xy` typed in (`--query=xy`)
 - `pc` - launch psychic in current-directory-only mode (same as `psychic --filter=cwd --on-cwd-visit=print-to-stdout`)
+- `ph [words]` - the command-history picker, typed rather than bound to Ctrl-R, searching for the words. zsh and fish put the pick on the next prompt's line (`print -rz`, `commandline --replace`); bash cannot from a plain function, so it adds the pick to the history list (`history -s`) and says to press Up. Nothing is run. Not defined over a `ph` the user already has, nor with `PSYCHIC_NO_PH`
 - **Automatic directory tracking**: The shell integration adds a `chpwd` hook that automatically tracks every directory you visit via `cd`. This allows psychic to learn which directories you frequently visit without requiring explicit clicks.
 - Without shell integration, Ctrl-J spawns a new shell in the selected directory (old behavior)
 - **Ctrl-T** inserts a path picked in psychic at the cursor, as fzf's Ctrl-T does: it runs
@@ -2530,6 +2532,10 @@ define the same commands; the help screen reads them out of the zsh one.
   anything prints it and exits. A pick under `$PWD` is inserted relative to it, anything
   else absolute, quoted for the shell (`${(q)}`, `printf %q`, `string escape`), with a
   trailing space.
+- **Ctrl-R** (once `psychic history --enable` is on) opens the command-history
+  picker with the line being edited as the query and replaces the line with
+  the pick; see "Shell history search" below. `psychic history` typed by hand
+  can only print the pick; it says so on stderr and points at Ctrl-R and `ph`.
 
 **Ctrl-T never takes a key someone else has.** Each script binds it only where it
 still does the shell's default (`transpose-chars`), or nothing: an fzf binding,
@@ -2541,8 +2547,9 @@ there either way for binding to another key. In bash it needs bash 4+ for
 **How each shell tracks directories.** zsh has a `chpwd` hook. fish runs a
 function `--on-variable PWD`, disowned so no "job has ended" line appears. bash
 has neither, so `__psychic_hook` runs from `PROMPT_COMMAND` (prepended once,
-however often the script is loaded) and acts only when `$PWD` differs from the
-last prompt's; it starts from the directory the shell opened in, so opening a
+however often the script is loaded), acts only when `$PWD` differs from the
+last prompt's, and returns the `$?` it was called with, so `PROMPT_COMMAND`
+entries after it still see the status of the user's command; it starts from the directory the shell opened in, so opening a
 shell is not a visit. Checked on bash 3.2 by `cd`ing and calling the hook: one
 visit per change. Because it compares only at prompts, several `cd`s on one
 command line count as one visit; fish records each.
@@ -2747,6 +2754,333 @@ Why dual dispatch: File for persistence, memory for debug pane. Never use eprint
 **Scroll event deduplication:** HashSet<(query, full_path)> tracks scrolled files per session.
 Why: User might scroll up/down many times. Only log once per (query, file) combination.
 
+### Shell history search: `src/cmd/`
+
+Ctrl-R over the user's shell history, ranked by directory, repository and
+the previous command. Specified in `docs/ctrl-r/` (start at its README); built
+in phases. **Phases A ("Record"), D0 (benchmark corpora), B ("Browse"),
+C ("Learn") and D ("Bench") are what exists today:** commands are recorded and imported,
+`psychic history` manages them, `psychic history` with no action flag is the
+Ctrl-R picker (a heuristic, and a learned model on top of it once one is
+trained), `psychic history --retrain` trains that model, and `psychic
+internal bench-history` builds and describes benchmark corpora and runs the
+relevance, two-stage and latency benchmarks; `bench/history.py` times the
+picker on a pty. Results are logged in `docs/ctrl-r/results.md`.
+
+New identifiers say `cmd`/`command`, never `history`, because `history.rs`,
+`history_mode` and `ToggleHistoryMode` already mean directory back/forward.
+
+| File | Does |
+|---|---|
+| `cmd/mod.rs` | `run_track_command`, `run_history`, and the `--enable/--disable/--status/--import/--purge` actions |
+| `cmd/cli.rs` | `TrackCommandArgs`, `HistoryArgs` (clap) |
+| `cmd/tuning.rs` | Every tunable constant of the feature |
+| `cmd/store.rs` | The command tables and every SQL statement on them (`CmdStore`); a plan test per indexed statement |
+| `cmd/template.rs` | Word splitting and `templatize` (`cd foo` -> `cd PATH`); own-command detection |
+| `cmd/repo.rs` | `find_repo_root`: nearest ancestor with a `.git` entry, on the logical path, stopping below `$HOME` (a dotfiles `~/.git` is no repository) |
+| `cmd/privacy.rs` | Opt-in marker, `PSYCHIC_HISTORY_IGNORE` globs, permissions, FNV-1a tombstones |
+| `cmd/track.rs` | `psychic track-command` |
+| `cmd/backfill.rs` | Import from Atuin, zsh, bash and fish history |
+| `cmd/bench.rs` | `psychic internal bench-history`: clap types, the data-dir guard's callee, `stats` |
+| `cmd/bench/relevance.rs` | `bench-history relevance`: train at a cut, replay what came after, rank every sampled run's command with four rankers |
+| `cmd/bench/perf.rs` | `bench-history twostage` (two-stage vs full scoring) and `latency` (filter + rank per keystroke, no terminal) |
+| `cmd/corpus.rs` | The seeded synthetic generator and the Claude Code transcript extractor |
+| `cmd/index.rs` | `CommandIndex`: every ranking statistic in memory, loaded at picker start or filled by replay (training) |
+| `cmd/worker.rs` | The picker's worker thread: requests and responses, the filter, narrowing and reuse, the `cmd_query` TIMING line |
+| `cmd/rank.rs` | The heuristic, `rank_commands` (partial sort) and the one total order; the model stage on top of the heuristic |
+| `cmd/model.rs` | `CmdModel`: whether a model may be used, its blend weight, prediction: `cmd_model.txt` read into a `Forest` whose trees are walked in Rust, LightGBM's scores bit for bit |
+| `cmd/features.rs` | The 23 command features: `COMMAND_FEATURE_REGISTRY`, `compute_all` (serving and training share it) |
+| `cmd/train.rs` | The replay that builds the training set, the fit, `cmd_model.txt`/`cmd_model_stats.json`, the lock, the detached retrain |
+| `cmd/app.rs` | The picker's UI thread: start-up, event loop, keys, pick output |
+| `cmd/terminal.rs` | The picker's terminal, given back on every way out: a drop guard, a panic hook that restores before the message prints, and SIGTERM/SIGHUP/SIGINT turned into an event that leaves, restores and dies of the signal |
+| `cmd/render.rs` | List, preview, debug pane, help overlay (pure: no I/O, no clock) |
+| `cmd/keys.rs` | `CmdAction`, `CMD_KEYMAP` (its own table, not `keymap::KEYMAP`) |
+| `cmd/events.rs` | Impression and pick logging into `command_events` |
+
+**Tables** (same `events.db`, created by `store::create_schema`, which
+`Database::prepare_schema` calls once per file per process): `commands` (one
+row per exact text, with aggregates kept up to date on every insert so the
+picker never counts runs), `command_runs` (one row per execution: start, cwd,
+repo root, exit code, duration, shell session, previous command within 30
+minutes in the same session, `hook` or `import`), `command_events` (written by
+Phase B), `command_imports` (which sources were imported) and
+`deleted_commands` (tombstones: the hash of a deleted text, never the text).
+A partial unique index on `(command_id, started_at) WHERE source = 'import'`
+makes imports idempotent.
+
+**Recording.** Off until `psychic history --enable` writes the marker file
+`history-enabled` into the data dir. The blocks appended to
+`shell/psychic.{zsh,bash,fish}` test that file with a shell builtin on every
+prompt (no process when off; `PSYCHIC_HISTORY=0|1` overrides), stash the
+command, its `$PWD` and start time before it runs, and make one background
+`psychic track-command ... -- TEXT` call before the next prompt. zsh uses
+`preexec`/`precmd`; fish `fish_preexec`/`fish_postexec`. bash has neither and
+psychic takes no DEBUG trap and no `PS0` (bash-preexec and Starship own
+those), so two functions run from `PROMPT_COMMAND`: a hook first, which keeps
+`$?` and reads `history 1`, and a sync last (its own array element on bash
+5.1+, so a later `PROMPT_COMMAND="$PROMPT_COMMAND; ..."` still runs before
+it), which notes the history count (`$HISTCMD` from 5.1; before that it is
+always 1 there, so the newest entry's number) and the time once every other
+entry - a `history -a; history -n`, say - has changed the list. The newest
+entry is the user's command only if the shell ran one (`\#` moved, bash 4.4+)
+and bash added it after the sync: one more entry, or (`erasedups`) as many but
+stamped later. The hook checks at every prompt that it is still first and the
+sync still last (looking past bash-preexec's own first and last entries),
+and moves them back if not. So `HISTCONTROL`/`HISTIGNORE` are honoured because
+only what bash itself kept is recorded, and lines other shells wrote to
+`HISTFILE` - which an earlier version recorded as this shell's, with this
+shell's cwd and status - never are. Checked on bash 3.2, 4.3, 4.4, 5.0, 5.1 and
+5.3. zsh also honours `HIST_NO_STORE` (zsh's own rule, repeated, aliases
+expanded), fish `fish_should_add_to_history` (called again: it is a
+predicate). zsh's `zshaddhistory` hooks are not honoured: their verdict cannot
+be observed, and calling them twice is unsafe (zsh-histdb would insert twice),
+so `--enable` says so. `PSYCHIC_BIN` and `PSYCHIC_DATA_DIR` point the hooks at
+another build and data dir (tests use them); fish checks the binary exists
+first, or it would print "command not found" and the command at every prompt.
+Known bash gaps (`docs/ctrl-r/01-record.md` section 11.3 has the full list):
+an immediate repeat under `ignoredups`/`ignoreboth` is not added to bash's
+history and so not recorded; under `erasedups` a repeat run within the second
+its prompt appeared is lost; the command after which the hook found itself no
+longer first is not recorded, and the one after the sync stopped being last
+is judged by its timestamp alone; a tool prepended to `PROMPT_COMMAND` after
+psychic that does not preserve `$?` makes the recorded exit code its own (load
+psychic last); durations have 1-second resolution.
+
+**`track-command`** is dispatched in `main` before the logger is set up, so
+it never opens `app.log` and command text cannot reach a log. It trims the
+text and skips it when empty, over 8,192 bytes, psychic's own (`psychic`,
+`p`, `pd`, `pc`, `ph` as the command word) or matching `PSYCHIC_HISTORY_IGNORE`
+(colon-separated globs over the whole text, matched by a 60-line matcher
+rather than a regex crate). Then one `Database::new`, a permissions check and
+a five-statement transaction. A non-UTF-8 `$PWD` or text is stored lossily
+(U+FFFD), never dropped. Measured at Phase A (release build, 300 runs
+each, spawned from Python, so including about 1.2 ms of spawn cost): p50
+5.4 ms, p95 7.6 ms for 300 distinct commands; p50 5.4 ms, p95 6.9 ms for one
+command repeated. The budget (B4) is 10 ms p95. Those runs used a data dir on
+tmpfs. On ext4 (NVMe), 400 runs of each interleaved: p50 15.7 ms, p95 19.4 ms
+for commit `4c37b59`, p50 15.9 ms, p95 19.1 ms after the bash-hook rework that
+followed it, so no change from that; the cost is the disk: the process
+holds the database's only connection, so on close SQLite checkpoints the
+write-ahead log into the database and deletes it, four `fsync`s worth about
+11 ms. Skipping only that checkpoint (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`)
+lets the log grow (18 MB after 400 runs), and every new process re-reads it:
+a process that opens the database alone rebuilds the log index with nothing
+marked as checkpointed, and SQLite rewinds the log only when everything is,
+so across one-shot processes it never rewinds. So `track-command` now opens
+with `CmdStore::open_for_recording` (no checkpoint on close) and closes with
+`close_recording`, which, once `events.db-wal` is over 2 MiB, runs
+`wal_checkpoint(TRUNCATE)` without waiting (busy: a later run does it). A
+crash can lose the last runs still only in the log, never the database.
+On ext4 at the perf DB, 500 runs per series, three series: p50 5.3-5.8 ms,
+p95 7.2-8.8 ms (before: 13.9-16.3 ms, 17.7-18.3 ms); the log stayed at or
+under 2,047 KiB over 5,000 runs. The picker's first open re-reads up to 2 MiB
+of log (+0.4-0.6 ms `db_open`). Details and the rejected options:
+`docs/ctrl-r/01-record.md` section 9.1.
+
+**Privacy.** Every `CmdStore::open` makes the data dir `0700` and `events.db`,
+its `-wal`/`-shm`, the marker and the command model files `0600` (only when
+they differ; file-only users who never enable history keep their modes).
+Errors from the command code name the operation and SQLite error code, never
+a bound value. `--purge` turns on `secure_delete`, empties the command tables
+except the tombstones (hashes, no text, so a deleted command stays deleted
+through a purge and a re-import),
+`VACUUM`s, and truncates the write-ahead log with a `TRUNCATE` checkpoint, so
+no deleted text stays in the database's files even while another psychic
+process has the database open; if one is in the middle of a read, the checkpoint cannot
+finish and purge fails telling the user to close it and purge again. It also
+removes the command model; the marker is left alone. Every connection to the
+command tables runs with `secure_delete` on, so whatever a write frees is
+zeroed. Deleting one command in the picker leaves a tombstone so a later import
+does not restore it, then checkpoints and truncates the write-ahead log without
+waiting, so its text is in neither `events.db` nor `events.db-wal`; if another
+process is in the log at that moment, the picker tries again at exit, and
+otherwise the next checkpoint clears it. The worker runs the delete; at exit
+the picker prints the pick first, then waits up to 1 s (`CMD_EXIT_DELETE_WAIT_MS`)
+for the worker to finish when a delete was sent, so Esc right after `y` does
+not roll the delete back. Shell history files are never edited.
+
+**Import** (`--import`, and the first `--enable` unless `--no-import`):
+Atuin's `history.db` first (opened read-only; true cwd, exit codes and
+durations; units told apart by magnitude; skipped with a reason - `locked`,
+`unreadable` or `unexpected schema`), then `~/.zsh_history` (and `$ZDOTDIR`'s),
+`~/.bash_history` and fish's history, through the parsers of
+`import/shell_history.rs`. bash's is read as bash reads it back: in a file
+that starts with a `#<epoch>` line, the lines up to the next one are one
+command (`parse_bash_entries`); the path import keeps reading it line by line. The cwd
+of each file entry comes from `replay_cwds`, the same `cd` replay the path
+import uses (state before the entry's own `cd`). Entries without a timestamp
+get synthetic ones, one second apart, ending at the file's mtime, and are
+imported once per file only. Nothing at or after the first hook-recorded run
+is imported (the hook has it).
+
+**The picker** (`psychic history [--query Q] [--session ID] [--cwd DIR]`,
+`docs/ctrl-r/02-browse.md`). A slim TUI of its own beside file mode's, not a
+mode of it (ADR-2), with the same shape: a worker thread answering
+`UpdateQuery`/`GetRows`/`Details`/`Delete` with query ids, stale answers
+dropped, consecutive queries collapsed. The worker is spawned before the
+terminal is set up. It loads `CommandIndex` with R1-R8 side by side: R1 (every
+command) split by id over four connections that each build their entries, R2-R8
+(this directory, this repository, 30 days of runs, the session's last three
+commands and what followed them, this session's commands, 30 days of picks) on
+a fifth, every one memory-mapped (`PRAGMA mmap_size`; the only connections in
+psychic that are), while the rayon pool starts and warms the matcher. After
+that no SQL runs per keystroke. A query is one pass over the index (rayon from 2,000 candidates,
+and only with a query; `src/cmd/fuzzy.rs`): a 64-bit mask of the byte
+classes each text holds rejects most commands unread; a command matches by
+Skim's rule (the whole query in order, ASCII smart case), which on an ASCII
+text is just an in-order byte scan, so Skim's matcher runs only on non-ASCII
+texts; and the same pass attaches fzf's `--scheme=history` score
+(`src/cmd/fzf.rs`, ASCII texts read as bytes). The cold-start order is that
+score, ties newest first (fzf's own Ctrl-R order); the model re-scores the
+first 2,000 of it and up to 100 more matches, the ones run most often in this
+directory. Only the first page is sorted (`select_nth` over 32-byte
+keys, then a sort of 200); the rest is sorted if a page reaches it. Matching
+happens in scope All and a scope keeps its own commands afterwards, so
+typing a longer query re-matches only the matches of its longest prefix
+typed before in any scope; deleting back to a query reuses its matches;
+while idle after start the worker precomputes the matches of each letter
+a-z, a slice of 8,192 commands at a time, so the first letter of a search
+costs no pass; and the empty query's ranking is kept per scope until a
+delete.
+One `cmd_query` TIMING line per query, after the answer, numbers only. The UI
+thread shows rank, a red `!` for a failed last run, `*` for "run here", the
+command (newlines as `↵`, control characters made safe) and its age; a preview
+with counts, last directories and what usually came before; Ctrl-O a debug
+pane with the heuristic's parts, the 25 features of a model-scored row and the
+model's trees, groups, weight and top features (`model: none` without one); Ctrl-G help
+generated from `CMD_KEYMAP`. Tab cycles the scope (all, this directory, this
+repo, this session), Delete/Ctrl-X deletes a command after a `y`. A query on
+screen for 200 ms logs its visible rows as impressions; Enter logs the pick
+(with every query of the episode, the cwd, repository and `--session`), bumps
+`pick_count`, restores the terminal and prints the command on stdout before
+asking the worker to stop (it is not waited for). A newer preview request
+replaces older queued ones, so scrolling cannot queue SQL ahead of a
+keystroke. Nothing re-ranks on a timer. Measured at Phase B on the 50,000-command perf DB (pty,
+release, rough): first results on screen 38-40 ms p50 / 46-52 ms p95 over three runs (B3 <= 50,
+so at the target, not under it), worker per keystroke 1.5 / 5.5 ms (B1 <= 8),
+keystroke to redraw 1.4 / 2.1-2.7 ms
+(B2 <= 16); the spec's section 12 has the breakdown.
+
+**The command model** (`docs/ctrl-r/03-learn.md`). A second LightGBM
+LambdaRank model, `cmd_model.txt` beside `model.txt`, trained by the same
+`training::fit_seeded` as the file model (same parameters, half-life and
+early stopping; `fit` is `fit_seeded(.., 42)`, and `bench/train_parity.py`
+still reads "identical, byte for byte") on a set `train.rs` builds by
+replaying everything recorded in time order into an empty `CommandIndex`
+through its mutators. Before each run is applied, a run of a command that ran
+before becomes a group: a synthetic query (the first 0, 1, 2 or 3 characters
+of its text, 40/20/20/20%, chosen by a seeded splitmix64 hash of the run id),
+the command as the positive, and 30 random negatives: 20 from the rows
+serving's model would score for that query there (fzf's top 2,000 and the
+directory's 100 most-run matches, `rank::stage2_rows`), 10 from every match,
+each row's 25
+features computed by the same `features::compute_all` serving uses (so
+train/serve skew would have to be in the index, and an integration test
+compares a replayed index with a loaded one feature by feature, bit for bit).
+A run within 300 s of a Ctrl-R pick of the same command in the same shell is
+that pick being executed and makes no group; the pick itself is a group of its
+picker's impressions, the picked command positive, weight 4. Imported runs
+weigh 0.3, hook runs 1. Only the newest 8,000 eligible runs make groups; below
+50 groups nothing is trained. The features: fzf's score for the query (Skim's
+score was a feature until 2026-11-18; it depended on the thread's earlier
+calls, so its column is now a constant) and whether the command or a word of
+it starts with it; how many newer commands match; picks for this query and
+in episodes with it; time since the last run and runs in the last hour, day,
+week and 30 days, all runs, picks; the share of its runs made in this
+directory and repository, time since the last run here, runs here; the share
+of its runs that followed this shell's previous command's template, or any of
+its last three; success rate (NaN when unknown); failed in the last 2 minutes;
+last exit non-zero; length; argument count. A model is refused (heuristic
+only) when a file is missing or unreadable or the feature names in the stats
+or in the model file differ from the registry's, in order. A training whose
+history was purged or shrunk while it ran writes nothing; the lock it holds
+carries a token and is kept fresh by a heartbeat, so a long fit is not taken
+over. Serving is two-stage: the heuristic orders
+every match, the model scores the first 2,000 of that order plus the
+directory's 100 most-run other matches (features on the
+rayon pool; prediction on the rayon pool too, not by LightGBM: `model.rs`
+reads `cmd_model.txt` into a `Forest` and walks its trees as LightGBM's
+`PredictRaw` does, giving the same scores bit for bit - the LightGBM that
+`lightgbm3-sys` builds has OpenMP off, so its one call is one thread at about
+4 us a row, its booster is neither `Send` nor safe to predict on from two
+threads at once, and it parses the file in 15 ms where the `Forest` takes
+4), and `(1 - w) * heuristic + w * logistic(score)` re-sorts
+them; the rest keep their heuristic order below. `w` is file mode's tanh blend
+on weighted groups / 10 (pick 4, hook 1, import 0.3): 0.5 at 300 hook groups.
+The model loads on the worker thread while a scoped thread loads the index,
+once (never reloaded); a failed prediction falls back to the heuristic for the
+rest of the process. Training never runs in the picker: after its first
+results the picker starts `psychic history --retrain --quiet` as a detached
+child (own process group) when the last attempt is an hour old and no fresh
+`cmd_train.lock` exists (`PSYCHIC_NO_RETRAIN` turns it off for tests and
+benchmarks); the new model is used from the next Ctrl-R. Reports go to stdout
+or, under `--quiet`, to `training.log`; neither they nor the model files hold
+command text. Measured on the 50,000-command perf DB: `--retrain` 8.5-8.8 s
+(8,000 groups, 234,227 rows, 132 trees; the file is 238 KB), model load
+3.8 ms p50 beside a 28 ms index load; with the model, worker per keystroke
+3.3-3.7 ms p50 / 6.8-7.8 ms p95 (stage 2: features 0.4, predict 1.1, blend
+0.4 ms p50), keystroke to redraw 1.5 / 3.0 ms, first results on screen
+39-41 ms p50 / 46-51 ms p95 (one run of three 0.9 ms over the 50 ms target;
+the model adds about 2 ms to the first query). On a held-out last 20% of that corpus (one
+seed, 600 lookups) the model's top-1 beat newest-first by 0.03-0.05 at query
+lengths 1-3 and lost 0.03 at length 0. Phase D's harness (below, and
+`docs/ctrl-r/results.md`) measured it on five seeds: on the interactive
+50,000-command corpus the model is 0.20 top-1 above newest-first for a
+two-character query on commands last run more than 10 minutes ago, but
+still below fuzzy-score order, and the heuristic is below newest-first;
+worker per keystroke 3.4-3.5 ms p50 / 8.2-9.5 ms p95 (the first letter's
+full scan), first results on screen 37-46 ms p50 / 43-58 ms p95.
+
+**Ctrl-R widgets.** Appended to the three scripts, after the recording block.
+Each passes the line being edited as `--query=` (with `=`, so a line starting
+with `-` stays a value), the shell's `$PWD` and its recording session id, and
+replaces the whole line with the pick, cursor at the end; Escape or a failing
+picker leaves the line alone. The pick is not run: the user presses Enter, and
+the recording hook records that run once, in the same session, so training can
+tie it to the pick event (same command and session, run within 300 s). Bound
+only when recording is on, `PSYCHIC_NO_CTRL_R` is unset, and Ctrl-R still has
+the shell's default binding, in each keymap or mode on its own (zsh
+`history-incremental-search-backward` or its pattern variant in emacs,
+`redisplay` in viins; bash `reverse-search-history` in emacs, vi-insert and
+vi-command, each bound with `bind -m KEYMAP -x`, so a later `set -o vi` keeps
+it; fish no user binding, asked per mode with `bind --user -M <mode> \cr` because
+fish 4 lists the preset beside the user's), so fzf's or Atuin's Ctrl-R is never taken over.
+What became of it is exported as `PSYCHIC_CTRL_R` (`bound`, `partly`, `taken`,
+`recording-off`, `opted-out`, `old-bash`), which `psychic history --status`
+explains, with the command that shows the binding and how to bind the picker to
+another key. fish's widget checks the binary with `command -q` first and stays
+quiet without it. The widget's `bind -x` never calls `history -s`; only `ph`
+does, and it then tells the recording hook to skip that prompt, so the pick is
+not taken for a command that ran.
+`tests/picker.rs` drives the picker alone and under each shell's Ctrl-R on a pty.
+
+**Benchmark corpora** (`psychic --data-dir DIR internal bench-history
+generate|extract-agent|stats`; `docs/ctrl-r/04-bench.md` section 4). Every
+subcommand refuses to run without an explicit `--data-dir`, or with the real
+one, and `generate`/`extract-agent` refuse a data dir that already holds
+commands. Both builders write through `CmdStore::record_run_in`, so a corpus
+is ordinary recorded history. `generate --commands N --runs M --seed S
+[--anchor T] [--profile interactive|repetitive|agent]` simulates a user over
+40 directories in 8 repositories: one splitmix64 stream, Zipf popularity,
+per-directory favourites, a working set of recent commands, edit-build-test
+chains, session repeats and retry-after-failure, about 300 s between runs;
+the same arguments give a byte-identical history. The default,
+`interactive`, is calibrated on `stats` of a real bash history (immediate
+repeats about 0.06, top-10 share about 0.4, most commands run once: half of
+the commands are one-offs the generator never picks again, so a heavy head
+carries the 10 runs per command); `repetitive` is the original D0 shape (half
+of all runs repeat the previous one) and `agent` a flat, low-repeat one; the
+targets and which of them are assumptions are in 04 section 4.3. 50,000
+commands / 500,000 runs take about 9 s and 120 MB as written. `extract-agent [--projects-dir D]`
+reads `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR`'s) read-only
+and records each Bash tool call with its cwd, time, exit status (`is_error`
+-> 1) and duration, in session `agent:<sessionId>[:<agentId>]`. `stats`
+prints aggregates only: counts, span, shares with cwd and exit code,
+sessions, immediate-repeat and first-ever shares, pick episodes, then top-10
+and top-100 shares, commands run once, the recurrence gap in runs and
+seconds, same-directory and same-session shares of recurring runs, and
+command length percentiles.
+
 ## Page-Based Caching
 
 **Problem:** Scrolling results list had noticeable lag when file list was large.
@@ -2905,6 +3239,9 @@ against a true 1.89ms.
 
 ### The two benchmark harnesses: `bench/`
 
+(Shell history search has its own pair, described at the end of this
+section: `psychic internal bench-history relevance` and `bench/history.py`.)
+
 There are two, because psychic has two things that can regress independently.
 **Speed** is `bench/run.py`: how long until the list appears, how long from a
 keystroke to a redraw. **Ranking quality** is `bench/model.py`: whether the file
@@ -3023,6 +3360,49 @@ count and be compared as two differently sized models. `objectives` trains one
 feature set two ways, because `compare` takes `train.py` from the working tree
 for *both* arms - a training-parameter change reads `+0.0000` there, and the tool
 now says so rather than letting the next person believe it.
+
+#### Shell history search: `bench-history relevance` and `bench/history.py`
+
+Command mode is measured by its own pair (`docs/ctrl-r/04-bench.md`
+sections 5 and 6), never by `run.py` or `model.py`, which stay untouched.
+
+```bash
+P="psychic --data-dir <scratch copy of a corpus>"
+$P internal bench-history relevance --seeds 5 --folds --json r.json --md r.md
+$P internal bench-history relevance --seeds 5 --shuffle-labels   # the control
+HOME=<scratch> ./bench/history.py --work <dir on a real disk> setup [--from <corpus dir>]
+HOME=<scratch> ./bench/history.py --work <dir> all               # B1-B4, B6-B8
+HOME=<scratch> ./bench/history.py --work <dir> latency 300        # stage times, no pty
+```
+
+**Relevance is a replay, in Rust, through the shipped code.** The timeline
+is cut at 80% of the runs (and at 60/70/80% with `--folds`); five models are
+trained on what came before the cut, side by side, with the production
+`build_training_set` and `fit_seeded`, written as model files and loaded back
+with `CmdModel::load`. Then the replay continues from the state at the cut,
+and every sampled later run is a lookup: its command's first 0-3 characters
+as the query, all matching commands as candidates (`filter_candidates`),
+ranked by newest first (the baseline of the pass bars), fuzzy score then
+newest (what fzf does), the heuristic, and each model (`rank_commands`), and
+only then is the run applied. A target never run before is unreachable, not
+a miss. Three tests guard the leakage that would make it look better than it
+is: the model trained at a cut is byte-identical to one trained on the
+history truncated there; a lookup sees its target's previous run, not
+itself; the replay state equals a fresh load from SQL, feature by feature.
+`--shuffle-labels` permutes the labels inside each training group, and the
+model then falls to about 0.03 top-1, far below every baseline: what it
+gains is learned, not leaked.
+
+**`history.py` refuses to run with the real `HOME`**, because every psychic
+subcommand but `track-command` writes a log into its data directory; every
+child gets a fixed environment and `--data-dir`. It times the picker on a
+40x120 pty against a 50,000-command perf DB with a pinned model and
+`PSYCHIC_NO_RETRAIN=1`. Two traps found in review: the first byte after a
+key is the echo of the query line, drawn before the worker answers, so the
+picker logs its own `cmd_key_to_results` line for the time to the results;
+and a key cycle that types the same word again is answered from the
+worker's trail of earlier matches, so the cycle uses six words with six
+different first letters to keep the full scan of a first letter in B1.
 
 ## Shutdown Sequence
 
@@ -3221,6 +3601,18 @@ psychic import             # replaces the previous import
 psychic import --dry-run   # print what it would store
 psychic import --undo      # forget everything imported
 
+# Shell history search (Ctrl-R; see "Shell history search")
+psychic history --enable [--no-import]   # start recording; imports history the first time
+psychic history --disable                # stop recording; keeps what is recorded
+psychic history --status
+psychic history --import                 # Atuin, zsh, bash, fish history
+psychic history --purge [--yes]          # delete every recorded command
+psychic history [--query Q] [--session ID] [--cwd DIR]
+                                         # the picker (what Ctrl-R and ph run); prints the pick,
+                                         # plus a hint on stderr when typed at a terminal
+psychic track-command --cwd DIR --exit-code N [--started-at S] [--duration-ms MS] --session ID -- TEXT
+                                         # what the shell hooks call; never logs
+
 # Internal commands (development/debugging)
 psychic internal analyze-perf
 psychic internal print-log
@@ -3242,4 +3634,5 @@ uv run train.py features.csv <output_prefix> [--data-dir DIR]
 - `~/.local/share/psychic/features.csv` - Generated training features
 - `~/.local/share/psychic/feature_schema.json` - Feature definitions, for `train.py` and `bench/model.py`
 - `~/.local/share/psychic/app.log` - Application logs
+- `~/.local/share/psychic/history-enabled` - Shell history recording is on while this exists
 - `~/.local/share/psychic/training.log` - Background model retraining output

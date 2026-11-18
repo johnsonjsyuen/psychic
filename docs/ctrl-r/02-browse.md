@@ -1,0 +1,1478 @@
+# Phase B: Browse (Implementation)
+
+Document type: **Implementation** (HOW). Strategy and targets:
+[00-blueprint.md](00-blueprint.md). This document is the single source for the
+`psychic history` picker: invocation, the in-memory `CommandIndex`, the worker,
+heuristic ranking, the UI, keys, event logging and the Ctrl-R shell widgets.
+
+## 1. Scope, inputs, done when
+
+| | |
+|---|---|
+| Builds | The picker with heuristic ranking only, scope filter, preview, debug pane, help, delete, impression/pick logging, Ctrl-R widgets |
+| Inputs (must exist) | Phase A: tables and `CmdStore` ([01 section 5](01-record.md#5-schema), [section 6](01-record.md#6-sql-statements)), `template.rs`, `repo.rs`, `privacy.rs`, `HistoryArgs` ([01 section 4.2](01-record.md#42-psychic-history)) |
+| Leaves for Phase C | `CmdRow.features` is empty, `ml_score` is `None`, `ml_weight` is `0.0`; the debug pane prints `model: none` |
+
+Done when all of these pass:
+
+```bash
+just build && cargo test && cargo clippy          # clean
+cargo test cmd::                                  # unit tests of src/cmd/
+cargo test --test picker -- --nocapture           # pty-driven picker tests (section 14.2)
+cargo test --test shell_hooks -- --nocapture      # Phase A tests still pass with the widget blocks appended
+./bench/run.py setup HEAD~1 && ./bench/run.py startup 6 && ./bench/run.py keystroke 30   # file mode unchanged; table in the commit message
+```
+
+The last line is for a human: agents never run `bench/run.py` (it writes to
+the real data directory). The Phase B commit carries instead a rough pty
+measurement of the picker on the perf DB (section 12, "Measured at Phase B").
+
+Metrics B1-B3 and B5 ([00 section 2](00-blueprint.md#2-success-metrics)) are
+first measured in Phase D ([04 section 6](04-bench.md#6-performance-benchmarks));
+this phase is built to the design in section 12 so that they pass there.
+
+## 2. Files touched
+
+New files: `src/cmd/{index,rank,worker,fuzzy,events,keys,app,render,terminal,integration}.rs`,
+`tests/picker.rs`. Extended: `src/cmd/mod.rs` (the no-action branch of
+`run_history`), `src/cmd/tuning.rs` (section 3), `src/cmd/store.rs` (R1 split
+by id and the start-up reader methods, [01 section 6.5](01-record.md#65-cmdstore-methods-and-row-types)),
+`tests/support/mod.rs` (the scratch home and shell set-up that
+`tests/shell_hooks.rs` had, so `tests/picker.rs` drives the same shells;
+`Pty::spawn_with_stdout`, `wait_quiet`, `wait_for`, `pid`, `is_cooked`).
+
+| Upstream file | Exact edit |
+|---|---|
+| `shell/psychic.zsh`, `shell/psychic.bash`, `shell/psychic.fish` | Append the widget blocks of section 11 after the Phase A recording blocks |
+| `docs/how-it-works.md` | Extend the "Shell history search" section with the picker |
+| `src/input.rs` | `leave_tui` takes any writer (`<W: std::io::Write>`), for the picker's buffered terminal (section 4, step 5) |
+
+Reused as they are, with no edit:
+
+| Item | Location | Used for |
+|---|---|---|
+| `tty_input::attach_stdin_to_terminal`, `tty_input::spawn`, `TtyInput::shutdown` | [src/tty_input.rs:267](../../src/tty_input.rs), [:187](../../src/tty_input.rs), [:159](../../src/tty_input.rs) | Terminal attach, input thread |
+| `input::leave_tui` | [src/input.rs:706-716](../../src/input.rs) | Restoring the terminal |
+| `path_display::{printable, truncate_to_width, display_width, get_time_ago}` | [src/path_display.rs:59](../../src/path_display.rs), [:21](../../src/path_display.rs), [:12](../../src/path_display.rs), [:263](../../src/path_display.rs) | Row and preview text |
+| `keymap::{Chord, Trigger, describe_trigger}` | [src/keymap.rs:83](../../src/keymap.rs), [:91](../../src/keymap.rs), [:513](../../src/keymap.rs) | Key table types and key names |
+| `fuzzy_matcher::skim::SkimMatcherV2` | as [src/search_worker.rs:808](../../src/search_worker.rs) | Which commands match, on non-ASCII texts (section 6.3); the model's `fuzzy_score` |
+| `crate::PROCESS_START` | [src/main.rs:99](../../src/main.rs) | Zero point of every startup timing (`crate::PROCESS_START.elapsed()`) |
+| The fern logger installed by `main` | [src/main.rs:229-265](../../src/main.rs) | `app.log`, TIMING lines |
+
+## 3. Constants (Phase B)
+
+Appended to `src/cmd/tuning.rs`. (The hand-weighted heuristic's
+`CMD_H_W_RECENCY`, `CMD_H_W_DIR`, `CMD_H_W_REPO`, `CMD_H_W_FUZZY` and
+`CMD_H_DIR_SATURATION` were removed on 2026-11-17 when the heuristic became
+fzf's order, section 7.)
+
+| Constant | Type | Value | Meaning |
+|---|---|---|---|
+| `CMD_H_RECENCY_SCALE_SECS` | `f64` | `3600.0` | Age at which the recency term is 0.5; it breaks fzf-score ties and shapes the value the model blends with (section 7) |
+| `CMD_LOAD_READERS` | `usize` | `4` | Connections that read R1 at picker start, each a slice of the id range (section 5.2) |
+| `CMD_PAR_FILTER_MIN` | `usize` | `2000` | Base-set size from which the filter (with a non-empty query) and the heuristic use rayon |
+| `CMD_PAGE_ROWS` | `usize` | `200` | Rows per `QueryUpdated` / `Rows` response |
+| `CMD_PAGE_PREFETCH` | `usize` | `50` | Request the next page when the selection is this close to the last loaded row |
+| `CMD_IMPRESSION_AGE_MS` | `u64` | `200` | A query on screen this long counts as seen (same value as [src/analytics.rs:22](../../src/analytics.rs)) |
+| `CMD_TICK_MS` | `u64` | `1000` | Tick thread sleep; each tick wakes the event loop once (file mode's idle redraw rate, [src/main.rs:840-848](../../src/main.rs)) |
+| `CMD_EXIT_DELETE_WAIT_MS` | `u64` | `1000` | At exit after a `Delete`, how long the picker waits for the worker to finish it (section 4 step 8); a delete still waiting for another process's write lock after this is lost |
+| `CMD_STACK_BELOW_COLS` | `u16` | `120` | Narrower terminals stack list over preview (as [src/render.rs:401](../../src/render.rs)) |
+
+## 4. Picker invocation
+
+`psychic [--data-dir DIR] history [--query Q] [--session ID] [--cwd DIR]` with
+no action flag runs `cmd::app::run`.
+
+| Input | Resolution |
+|---|---|
+| `cwd` | `--cwd` if given; else `$PWD` if set and absolute; else `std::env::current_dir()` as a string. Never canonicalised (ADR-7). Resolved once |
+| `repo_root` | `repo::find_repo_root(cwd, $HOME)`, once |
+| `shell_session` | `--session`; absent means no session scope and no sequence context |
+| `now` | `jiff::Timestamp::now().as_second()`, once; all ranking in this process uses it |
+| `tui_session_id` | `rand::random::<u64>().to_string()` (as [src/main.rs:205-207](../../src/main.rs)) |
+| `home` | `$HOME`, read once, for `~` abbreviation in the preview |
+
+| Outcome | stdout | Exit code |
+|---|---|---|
+| Enter on a row | The command text followed by `\n` (`println!`), written after the terminal is restored. When stdout is a terminal (typed by hand), the one-line hint of section 11.4 follows on stderr | 0 |
+| Esc / Ctrl-C / Ctrl-D, or Enter with an empty list | nothing | 0 |
+| Start-up failure (no tty, database unreadable) | nothing; the error on stderr through `main` | 1 |
+
+A multi-line command is printed with its newlines; the widgets of section 11
+keep them. The picker opens even when no command is recorded; section 8.3 says
+what it shows then.
+
+Start-up order in `cmd::app::run` (the worker is spawned first so the index
+loads while the terminal is being set up):
+
+1. Resolve the table above. Create `mpsc::channel::<CmdEvent>()`.
+2. `worker::spawn(data_dir, LoadParams { now, cwd, repo_root, shell_session }, event_tx.clone())`.
+3. Send `CmdRequest::UpdateQuery { query: args.query, query_id: 1, scope: Scope::All }`.
+4. `tty_input::attach_stdin_to_terminal()`; `tty_input::spawn(event_tx.clone())`.
+5. `terminal::restore_on_panic()` and `TerminationSignals::watch` (both
+   below), then `PickerTerminal::enter()`: open `/dev/tty` read+write, `enable_raw_mode`, `EnterAlternateScreen`,
+   `EnableMouseCapture`, `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`,
+   `Terminal::new(CrosstermBackend::new(BufWriter::with_capacity(64 KiB, tty)))` - the sequence of
+   [src/main.rs:765-781](../../src/main.rs), so `input::leave_tui` undoes it exactly.
+   The writer is buffered (file mode's is not): ratatui flushes once per
+   `draw`, so a frame is one `write` instead of one per escape sequence.
+   Unbuffered, a redraw of the list took 5.6 ms p50 of syscalls on a pty
+   (the render itself 0.2 ms); buffered 0.8 ms.
+   From here every way out gives the terminal back exactly once (a
+   process-wide flag says whether it is still set up; restoring twice would
+   pop the terminal's keyboard-flag stack twice):
+
+   | Way out | Restored by |
+   |---|---|
+   | Enter, Esc, an `Err` from the loop | `PickerTerminal::leave` (step 8) |
+   | An early `?`, or a panic unwinding through `run` | `Drop` of `PickerTerminal` (`input::leave_tui`) |
+   | A panic on the UI thread | The panic hook of `restore_on_panic`, installed once per process: on the UI thread only (a worker panic is E-B-04), it writes `input::leave_tui`'s sequence to a fresh `/dev/tty` handle and leaves raw mode, then calls the previous hook, so the message prints on the main screen in cooked mode (E-B-20) |
+   | SIGTERM, SIGHUP, SIGINT | `TerminationSignals` (signal-hook's `flag` and `low_level::pipe`, already a dependency): the handler sets a flag and writes a byte; a thread sends `CmdEvent::Terminate(signal)`; the loop returns, step 8 restores, prints nothing and re-raises the signal with its default action (`emulate_default_handler`), so the shell sees it killed. A second signal of the same kind, or any after `TerminationSignals` is dropped, takes the default action at once (E-B-21) |
+
+   `PSYCHIC_HISTORY_TEST_PANIC` set in the environment makes the picker
+   panic in its first draw; it exists for E-B-20's test.
+6. Open the UI thread's own `CmdStore` for event logging, with `busy_timeout = CMD_EVENT_WAIT_MS` (section 10); spawn the tick thread.
+7. Event loop (section 8.2).
+8. On exit: `input.shutdown()`, `PickerTerminal::leave()`; on `Ended::Signal`, stop
+   the worker (below) and die of the signal (above); else print the pick if there is one
+   (and flush), then stop the worker (`stop_worker_at_exit`): send `CmdRequest::Shutdown`;
+   if no `Delete` was sent this session, join the worker only if it has already
+   finished, since it may be busy (a load, a query) and the shell must not wait
+   for that. If a `Delete` was sent (`deleted_any`), wait up to
+   `CMD_EXIT_DELETE_WAIT_MS` (1 s) for the worker to finish, polling
+   `JoinHandle::is_finished` every millisecond, then join it: the worker
+   handles requests in order, so it has then finished every delete; a delete it
+   was still inside when the process exited would be rolled back (Esc right
+   after `y`, IT-B-15). The pick is already on stdout by then; the shell's
+   `$(...)` still waits for the exit, so the prompt can be up to 1 s late, and
+   only after a delete. The worker waits up to `busy_timeout` (5 s) for another
+   process's write lock, so a delete still waiting after the 1 s is lost: a
+   `log::warn!`, and the command is still there next time. A `TIMING` line
+   `cmd_exit_delete_wait` records the wait.
+   (The error paths of steps 4-5 still stop and join it.) If a `Delete` was
+   sent this session (`deleted_any`), `events.truncate_log()` then runs D6 once
+   more on the UI thread's connection, without waiting: the write-ahead log is
+   emptied of the deleted text if the worker's own D6 found it busy
+   ([01 section 10.5](01-record.md#105-delete-and-purge)); still busy is a
+   `log::warn!`.
+
+## 5. `CommandIndex`
+
+`src/cmd/index.rs`. All ranking statistics in memory. It has two fill paths and
+one read path (ADR-12): `load` (SQL aggregates, this phase) and the mutators
+(replay, [03 section 5](03-learn.md#5-training-set-replay)). Heuristic and
+features read only through the accessors below.
+
+```rust
+pub(super) struct Interner { /* FxHashMap<Box<str>, u32> + Vec<Box<str>> */ }
+impl Interner { pub fn intern(&mut self, s: &str) -> u32; pub fn get(&self, s: &str) -> Option<u32>; pub fn name(&self, id: u32) -> &str; }
+
+pub(super) struct CommandEntry {
+    pub db_id: i64,
+    pub text: std::sync::Arc<str>,
+    pub classes: u64,                  // fuzzy::text_classes(text): one bit per byte class present (section 6.3)
+    pub last_run_at: i64,
+    pub run_count: u32,
+    pub success_count: u32,
+    pub fail_count: u32,
+    pub pick_count: u32,               // all-time Ctrl-R picks (R1); display only, no feature reads it
+    pub last_exit_code: Option<i32>,
+    pub last_fail_at: i64,             // newest run with a non-zero exit code; 0 = none known
+    pub run_times: Vec<i64>,           // ascending; every run newer than CMD_EVENT_WINDOW_SECS is present
+    pub deleted: bool,
+}
+pub(super) struct DirStat { pub runs: u32, pub last_run_at: i64 }
+
+pub(super) struct CommandIndex {
+    pub entries: Vec<CommandEntry>,                         // position = "idx" (u32) used everywhere below
+    filter_classes: Vec<u64>,                               // per idx: entry.classes | fuzzy::LIVE, LIVE cleared by remove; read by the filter only
+    by_db_id: FxHashMap<i64, u32>,
+    pub dirs: Interner, pub repos: Interner, pub templates: Interner,
+    dir_stats: FxHashMap<(u32, u32), DirStat>,              // (idx, dir id)
+    repo_runs: FxHashMap<(u32, u32), u32>,                  // (idx, repo id)
+    followers: FxHashMap<(u32, u32), u32>,                  // (idx, template id of the previous command) -> runs
+    picks: FxHashMap<u32, Vec<i64>>,                        // idx -> pick times, ascending
+    picks_by_query: FxHashMap<Box<str>, FxHashMap<u32, Vec<i64>>>,
+    episode_picks_by_query: FxHashMap<Box<str>, FxHashMap<u32, Vec<i64>>>,
+    pub session_commands: FxHashSet<u32>,                   // serving only: commands run in --session
+}
+
+/// The moment and place being ranked for.
+pub(super) struct RankContext {
+    pub now: i64,
+    pub dir: Option<u32>,                 // id in `dirs` of the cwd; None = unknown
+    pub repo: Option<u32>,                // id in `repos` of the repo root; None = not in a repository
+    pub prev_templates: [Option<u32>; 3], // [0] = template id of the most recent command in the shell session
+}
+```
+
+### 5.1 Mutators (the only writers)
+
+| Method | Effect |
+|---|---|
+| `add_command(db_id, text) -> u32` | Push an entry with zero counts; fill `classes`; push `classes | LIVE` to `filter_classes`; register in `by_db_id`. Asserts `db_id` is new |
+| `record_run(idx, at, dir: Option<u32>, repo: Option<u32>, exit: Option<i32>, prev_template: Option<u32>)` | `run_count += 1`; `success_count`/`fail_count` by `exit`; if `at >= last_run_at` then `last_exit_code = exit`; `last_run_at = max`; non-zero `exit` -> `last_fail_at = max(last_fail_at, at)`; insert `at` into `run_times` at `partition_point(\|&t\| t <= at)`; for a `Some` dir: `dir_stats[(idx, dir)].runs += 1` and its `last_run_at = max(last_run_at, at)`; for a `Some` repo: `repo_runs += 1`; for a `Some` prev_template: `followers += 1` |
+| `record_pick(idx, at, query: &str, episode_queries: &[String])` | Push `at` to `picks[idx]`, to `picks_by_query[query][idx]`, and to `episode_picks_by_query[q][idx]` for each distinct `q` in `episode_queries` |
+| `remove(idx)` | `entries[idx].deleted = true`; clear `fuzzy::LIVE` in `filter_classes[idx]` |
+
+### 5.2 `load` (picker start)
+
+```rust
+pub(super) struct LoadParams { pub now: i64, pub cwd: Option<String>, pub repo_root: Option<String>, pub shell_session: Option<String> }
+impl CommandIndex { pub(super) fn load(store: &CmdStore, p: &LoadParams) -> anyhow::Result<(CommandIndex, RankContext)>; }
+```
+
+Runs R1-R8 of [01 section 6.2](01-record.md#62-read-path-at-picker-start-r-each-run-exactly-once-per-process),
+each once, and fills the fields directly. The reads run side by side, because
+one connection reading them in order took 40-50 ms of the 50 ms B3 budget at
+50,000 commands (R1 alone 25-30 ms, R6 several):
+
+| Thread | Connection | Reads |
+|---|---|---|
+| the worker | `store` | R1 ids, then R1 over the first of `CMD_LOAD_READERS` equal slices of that id range, building its `CommandEntry`s as rows arrive |
+| `CMD_LOAD_READERS - 1` scoped threads | one `CmdStore::open_file` each | R1 over one more slice each, building its entries |
+| one scoped thread | `CmdStore::open_file` | R2-R8, in order, into plain row vectors |
+
+Every one of these connections first sets `map_for_reading` (`PRAGMA
+mmap_size`): R1 then reads pages from the page cache without copying them,
+about 6 of 17 ms cold. The entries are pushed in id order, so `idx` order is
+the same as one full scan's; then the R2-R8 rows are applied. An in-memory
+store (tests), which another connection would see empty, reads everything on
+`store`, in order. Rows of R2-R8 whose command is missing from R1 (recorded
+or deleted between the reads) are skipped. The worker starts the rayon pool
+and warms the matchers (section 6.2, step 2) on another thread while the load
+runs.
+
+| Query | Fills |
+|---|---|
+| R1 | One entry per row, built from the borrowed row on the reader's thread: `db_id`, `text`, `last_run_at`, the four counts, `last_exit_code`; `run_times` empty, `last_fail_at = 0` |
+| R2 | `ctx.dir = Some(dirs.intern(cwd))`; `dir_stats[(idx, dir)] = DirStat { runs, last_run_at }` |
+| R3 | `ctx.repo = Some(repos.intern(repo_root))`; `repo_runs[(idx, repo)] = count` |
+| R4 | Push `started_at` to `run_times` (rows arrive ascending); non-zero `exit_code` -> `last_fail_at = max` |
+| R5 | `ctx.prev_templates[i] = Some(templates.intern(template))` for row `i` |
+| R6 | `followers[(idx, templates.intern(template))] = count` |
+| R7 | `session_commands` |
+| R8 | `record_pick(idx, timestamp, query, episode_queries)` in the order returned (ascending time); rows whose `command_id` is unknown are skipped |
+
+A row whose `command_id` is not in `by_db_id` (deleted concurrently) is skipped
+in every query. `ctx.now = p.now`.
+
+### 5.3 Accessors (the only readers)
+
+| Accessor | Returns |
+|---|---|
+| `dir_stat(idx, dir: Option<u32>) -> Option<&DirStat>` | `None` when `dir` is `None` or no entry |
+| `runs_in_repo(idx, repo: Option<u32>) -> u32` | 0 when absent |
+| `follower_runs(idx, template: Option<u32>) -> u32` | 0 when absent |
+| `runs_in_window(idx, now, secs) -> u32` | Count of `run_times` in `(now - secs, now]` by two `partition_point`s; requires `secs <= CMD_EVENT_WINDOW_SECS` (assert) |
+| `picks_in_window(idx, now, secs) -> u32` | Same over `picks[idx]` |
+| `picks_for_query(query, idx, now, secs) -> u32`, `episode_picks_for_query(...)` | Same over the per-query maps |
+
+## 6. Worker
+
+`src/cmd/worker.rs`. One thread; owns the `CommandIndex`, the `RankContext`,
+a `CmdStore` connection, and (Phase C) the model.
+
+### 6.1 Protocol
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Scope { All, Directory, Repo, Session }   // next(): All->Directory->Repo->Session->All; prev(): the reverse
+
+pub(super) enum CmdRequest {
+    UpdateQuery { query: String, query_id: u64, scope: Scope },
+    GetRows { query_id: u64, start: usize },             // CMD_PAGE_ROWS rows from `start`
+    Details { command_id: i64 },
+    Delete { command_id: i64, query_id: u64 },           // delete, then answer like UpdateQuery for the current query
+    Shutdown,
+}
+pub(super) enum CmdResponse {
+    Loaded { commands: usize, load_ms: f64, model: Option<CmdModelStats> },   // model: Phase C (03 section 7.4)
+    LoadFailed { message: String },                      // never contains command text
+    QueryUpdated { query_id: u64, query: String, total_matched: usize, total_commands: usize, rows: Vec<CmdRow>, rank_ms: f64 },
+    Rows { query_id: u64, start: usize, rows: Vec<CmdRow> },
+    Details(CmdDetails),
+    DeleteFailed,                                        // E-B-07; the QueryUpdated that follows still lists the command
+    ModelDropped,                                        // Phase C, E-L-07: sent once, before that query's QueryUpdated
+}
+pub(super) struct CmdRow {
+    pub command_id: i64, pub text: Arc<str>, pub last_run_at: i64,
+    pub run_count: u32, pub pick_count: u32, pub runs_here: u32, pub last_exit_code: Option<i32>,
+    pub score: f64, pub heuristic: f64, pub heuristic_parts: HeuristicParts,
+    pub ml_score: Option<f64>, pub ml_weight: f64, pub fuzzy_score: Option<i64>,   // Skim's score, for the debug pane only (not a feature since 2026-11-18): only for model-scored rows, computed when the row is built
+    pub features: Vec<f64>,                              // registry order; empty when no model scored the row
+}
+pub(super) struct CmdDetails { pub command_id: i64, pub dirs: Vec<DirUse>, pub preceded_by: Vec<PrecededBy> }
+// DirUse (R9) and PrecededBy (R10) are the row types of store.rs (01 section 6.5).
+
+pub(super) fn spawn<T>(data_dir: &Path, params: LoadParams, event_tx: Sender<T>)
+    -> (Sender<CmdRequest>, JoinHandle<()>) where T: From<CmdResponse> + Send + 'static;
+```
+
+### 6.2 Thread body
+
+1. `CmdStore::open`, `CommandIndex::load`. On error send `LoadFailed`, then
+   answer every later `UpdateQuery` (and `Delete`) with an empty `QueryUpdated`,
+   and `Details` with empty vectors, until `Shutdown`.
+1a. (Phase C) The index load of step 1 runs on a scoped thread while this
+   thread loads the command model ([03 section 7.1](03-learn.md#71-loading-the-model)).
+2. On a scoped thread, while step 1 runs:
+   `rayon::broadcast(|_| fuzzy::warm_up())` - the rayon pool starts, and
+   every rayon thread creates fzf's and Skim's scratch space (and the one
+   `static` Skim matcher is created), off the load's critical path and not
+   inside the first query.
+3. Send `Loaded`. (`CommandIndex::load` has logged `TIMING {"op":"cmd_index_stages","readers":N,"context_ms":..,"read_ms":..,"pushed_ms":..,"applied_ms":..}`:
+   when R2-R8, all reads, the entries' move into the index and the
+   application of R2-R8 ended, in ms from the load's start.) Log `TIMING {"op":"cmd_index_load","ms":..,"commands":N}` and
+   `TIMING {"op":"cmd_worker_ready","ms":<since PROCESS_START>}`.
+4. Loop: `rx.recv()`, then drain with `try_recv` into a queue applying the
+   supersession rule; process the queue in order. While seeds (section 6.3)
+   remain to be computed, `try_recv` instead, computing one slice of a seed
+   whenever nothing is waiting.
+
+Supersession rule (same as `drain_requests`, [src/search_worker.rs:1508-1534](../../src/search_worker.rs)):
+when the request being queued is an `UpdateQuery` and the last request already
+in the queue is an `UpdateQuery`, remove that older one. When the request being
+queued is a `Details`, remove every `Details` already in the queue: holding Down
+asks for one per row, each is two queries (R9, R10; about 1 ms, up to 25 ms at
+50,000 commands) on this thread, and they must not pile up ahead of the next
+keystroke. The UI's half of the rule is in section 8.2.
+
+### 6.3 Filter
+
+The matching itself is a free function, so the benchmark can call it without a worker thread:
+
+```rust
+/// `base`: the idx list to test, ascending; `None` = every entry.
+pub(super) fn filter_candidates(index: &CommandIndex, ctx: &RankContext,
+                                query: &str, scope: Scope, base: Option<&[u32]>) -> Vec<CommandCandidate>;
+pub(super) fn in_scope(index: &CommandIndex, ctx: &RankContext, scope: Scope, idx: u32) -> bool;   // the table below
+```
+
+**Which commands match, and the score they carry.** A command matches a
+non-empty query by **Skim's rule** (`SkimMatcherV2`, `fuzzy-matcher`
+0.3.7, the matcher the model's features were built on): the whole query,
+spaces included, is a subsequence of the text, ASCII case ignored unless
+the query has an ASCII upper-case letter (Skim folds ASCII case only,
+`skim.rs`). Each match carries **fzf's score** (section 7.1), which is what
+the ranking orders by; nothing scores a candidate a second time
+(`CommandCandidate { idx, fzf }`). Every Skim match is an fzf match: each
+space-separated fzf term lies inside the whole query's alignment, and a term
+fzf treats as case-sensitive was matched exactly. The exceptions: a term with a non-ASCII character whose lower case differs from it (an upper-case or title-case letter: fzf then compares that term's case, Skim does not) or a TAB (fzf reads it as a space); such a command keeps
+`fzf = NO_FZF_MATCH`, below every other match (found by review; the random
+test's alphabet covers upper case, the code handles all three). fzf's own matching (terms in
+any order, a trailing space ignored) was measured as the filter and
+rejected: the training sets it implies cost the model 0.012 top-1 at two
+characters and tripled the seed spread (results.md, 2026-11-17 merge
+entry).
+
+The per-command test (`src/cmd/fuzzy.rs`, `Pattern::test`), one pass:
+
+1. `filter_classes[idx]` (the entry's `classes`, a 64-bit mask: `a`-`z`
+   case-folded, `0`-`9`, common punctuation, one bit for the rest, one for
+   any byte of a multi-byte character, plus `LIVE`) must hold every class
+   bit of the query and `LIVE`; most texts are rejected without being read.
+2. The text must hold the query's bytes in order (ASCII case folded unless
+   case-sensitive). On an ASCII text this *is* Skim's match, so Skim's
+   dynamic program never runs. On any other text it is only necessary, and
+   `SkimMatcherV2::fuzzy_match` decides.
+3. `FzfQuery::score` (built once per pass) gives the score.
+
+Tests: `the_test_matches_exactly_what_skim_does_and_scores_like_fzf`
+(300,000 random texts and queries over colliding ASCII and multi-byte
+characters), `ascii_texts_never_need_skim`, and
+`the_filter_returns_exactly_what_matching_every_command_does` (every live,
+in-scope command through Skim, scored by fzf, against the filter with the
+prefilter, the chunked pool and narrowed bases).
+
+The worker wraps it in `fn filter(&mut self, query: &str, scope: Scope) -> Filtered`
+(the candidates, `all_newest` (below), the base-set size, `narrowed`,
+`reused`). **Matching happens in scope `All`; a scope then keeps its own
+commands** (`in_scope`, in idx order). So the narrowing state serves every
+scope, Tab keeps it, and the model's `recency_rank` can count among every
+matching command, as training does: for a scope other than `All`, with a
+model loaded, `Filtered.all_newest` is `rank::newest_of` the `All` matches
+(for the empty query, of every live command), passed to
+`rank::rank_scoped` (section 7.2). The state is a *trail*: the matches
+(`Vec<CommandCandidate>`, scope `All`) of the non-empty query being typed
+and of its prefixes typed before it, each entry's query a prefix of the
+next one's. The base set is decided with
+`pub(super) fn narrowing_applies(query: &str, last_query: &str) -> bool`
+(the "Base set" rule below; also used by the benchmark's `latency`). The
+worker holds, separately, `current_query`, `current_scope`,
+`current_query_id` (what `Delete` and `GetRows` refer to):
+
+| Step | Rule |
+|---|---|
+| Empty query | Every live idx of the scope, `fzf = 0`; the trail is neither used nor changed (typing the same letters again after clearing reuses it) |
+| Trail | Drop entries from its end until the last one satisfies `narrowing_applies(query, entry.query)`, that is `!query.is_empty() && !entry.query.is_empty() && query.starts_with(&entry.query)` |
+| Seed | If the trail is then empty and a seed's query (below) satisfies `narrowing_applies(query, seed.query)`, the seed starts the trail |
+| Reuse | If the trail's last entry has exactly this query: its candidates are the result (`reused = true`, base-set size 0, no matching). Deleting back to a query typed before costs no filter, in any scope |
+| Base set | Otherwise the last entry's idx list (`narrowed = true`), or every idx `0..entries.len()` when the trail is empty. (A text that holds a longer query in order holds its prefix, so narrowing loses nothing) |
+| Per idx | Skip when `filter_classes[idx]` lacks `LIVE` (deleted). Then the test above (scope `All`) |
+| Parallelism | When the query is non-empty and the base set has at least `CMD_PAR_FILTER_MIN` entries, the base set is cut into chunks of `FILTER_CHUNK` (1,024, `worker.rs`), one rayon task each with its own output vector, joined in order; a plain loop otherwise (with no query there is nothing to match, and a pass over 50,000 entries costs less than waking the pool). Output order is ascending idx in both cases |
+| Afterwards | A non-empty query that was not reused is pushed onto the trail with its `All` result. Then the scope's commands are kept. `Delete` clears the trail (not `current_query`/`current_scope`) |
+| Empty-query cache | The worker keeps the `CommandRanking` of the empty query per scope (`empty_rankings`, shared `Arc`s): asking for it again skips filter and ranking (`reused = true`, stage times 0). `Delete` clears it. When a page needs the rest sorted, the cache's handle is taken out first so `sort_rest` runs in place, and the sorted ranking is cached |
+
+**Seeds.** While no request waits, the worker computes the `All` matches
+of each single character of `SEED_CHARS` (`a`-`z`; an upper-case letter is
+a case-sensitive query of its own, and a digit or punctuation rarely starts
+a search; at 50,000 commands the 26 seeds hold about 530,000 candidates,
+4.2 MB), in the order of how many commands start with each letter. A seed
+is computed a slice at a time: one loop turn tests the next `SEED_SLICE`
+(8,192, `worker.rs`) commands of it (`Seeding { query, pattern, next,
+candidates }`), and a request that arrives meanwhile is answered before
+the next slice, so it waits for at most one slice (about 0.1-0.3 ms at
+50,000 commands), not a pass over every command. Typing the first letter of
+a search is then a reuse and the second narrows from it, in every scope.
+`Delete` clears the seeds and the seed in progress (they are computed
+again).
+
+| Scope | Row is in scope when |
+|---|---|
+| `All` | always |
+| `Directory` | `index.dir_stat(idx, ctx.dir).is_some()` |
+| `Repo` | `index.runs_in_repo(idx, ctx.repo) > 0` |
+| `Session` | `index.session_commands.contains(&idx)` |
+
+A seed holds exactly the candidates a fresh pass would, and the ranking is
+a function of the candidates, so a seeded query ranks as an unseeded one,
+with or without a model (test `seeded_letters_rank_like_unseeded_ones`; at
+the merge of the speed work, the `--dump` digests (04 section 6.6) of a
+build with seeding switched off were byte-equal on the interactive,
+repetitive and 243-command perf DBs, with the pinned model and without
+one). Test `a_seed_is_computed_a_slice_at_a_time_and_a_query_can_come_between`
+covers the slices.
+
+The closure captures `&CommandIndex`, `&RankContext` and the prepared
+`Pattern`: nothing lazily initialised, no lock, no allocation other than the
+output ([docs/how-it-works.md:1205-1207](../how-it-works.md)). (Skim's
+matcher, needed only for non-ASCII texts and for the debug pane's
+`fuzzy_score`, is one `static` resolved before the loop; its scratch
+space is warmed on every rayon thread at start, section 6.2.)
+
+### 6.4 Handling each request
+
+| Request | Action | Response |
+|---|---|---|
+| `UpdateQuery` | Set `current_query`, `current_scope`, `current_query_id`; `filter`, then `rank::rank_commands` (section 7) with `head = CMD_PAGE_ROWS`; keep the `CommandRanking` as `current` | `QueryUpdated` (echoing `query`) with rows `0..CMD_PAGE_ROWS`; then the TIMING line (6.5) |
+| `GetRows` | Ignore unless `query_id == current_query_id`. If the page reaches past `current.sorted`, `current.sort_rest(index)` first (once per query, off the keystroke path; see the empty-query cache in 6.3) | `Rows` with rows `start..start + CMD_PAGE_ROWS` (clamped) |
+| `Details` | R9 and R10 | `Details` |
+| `Delete` | `store.delete_command(id, text, now)` (D1-D6 of 01 section 6.4; a busy D6 is not a failure); `index.remove(idx)`; clear the trail; re-run `current_query`/`current_scope` under the given `query_id`. On a database error: `DeleteFailed` first, the index untouched (E-B-07) | `QueryUpdated` |
+| `Shutdown` | Return from the thread | - |
+
+Building a `CmdRow` from a `CommandScore` clones the `Arc<str>` (no text copy),
+reads `runs_here` from `dir_stat(idx, ctx.dir)`, and copies the row's
+`features_of(rank)` (Phase C).
+
+### 6.5 TIMING line
+
+One per `UpdateQuery`/`Delete`, written **after** the response is sent
+(convention: [docs/how-it-works.md:73-90](../how-it-works.md)):
+
+```
+TIMING {"op":"cmd_query","filter_ms":0.412,"heuristic_ms":0.201,"features_ms":null,
+        "predict_ms":null,"blend_ms":null,"total_ms":0.655,"candidates":50000,
+        "matched":1840,"stage2":0,"query_len":2,"narrowed":true,"reused":false}
+```
+
+Built by `CmdQueryTimings { filter_ms: f64, rank: CmdRankTimings, total_ms: f64, candidates: usize, matched: usize, query_len: usize, narrowed: bool, reused: bool }::to_json() -> String`
+(`query_len` in characters). Milliseconds rounded to 3 decimals. `candidates` is the base-set size
+(0 when `reused`: deleting back to a query typed before, or the cached empty query),
+`stage2` the number of rows the model scored (0 and `null` stage times in this
+phase). The line holds numbers and two booleans: no query text, no command text.
+The op is `cmd_query`, not `query`, so `bench/harness.py` `parse_timings`
+([bench/harness.py:165-173](../../bench/harness.py)) does not mistake it for a
+file-mode line.
+
+## 7. Heuristic ranking
+
+`src/cmd/rank.rs` and `src/cmd/fzf.rs`. Without a model this is the whole
+ranking (the "cold start"); Phase C adds a model stage on top of it
+([03 section 7](03-learn.md#7-serving-two-stage-rank-and-blend)), and this
+order is its stage 1.
+
+**The heuristic is fzf's Ctrl-R order.** fzf's own history widgets
+(`shell/key-bindings.{bash,zsh,fish}` of fzf) list the history newest first
+with duplicates removed (keeping the newest) and run fzf with
+`--scheme=history`; that scheme sorts by match score only (`parseScheme` in
+`src/options.go`: criteria `[byScore]`), so equal scores keep the input
+order, newest first, and an empty query shows the list as given, newest
+first. The commands of the index are already distinct, so the order here is:
+**fzf's score descending, then `last_run_at` descending, then `db_id`
+descending**, and for an empty query newest first. It replaced, on
+2026-11-17, a hand-weighted mean of recency, directory, repository and
+relative fuzzy terms that lost to plain newest-first on most cells of the
+benchmark (R3 -0.262; [results.md](results.md)).
+
+### 7.1 fzf's score (`src/cmd/fzf.rs`)
+
+A reimplementation from the source of **fzf v0.74.5 (commit `c0a193e`, MIT
+licence, (c) Junegunn Choi)**, credited in the module comment; nothing is
+copied. What it computes:
+
+| Part | fzf source | Here |
+|---|---|---|
+| Match and score of one term | `FuzzyMatchV2` (`src/algo/algo.go`): a Smith-Waterman variant without omissions; score = 16 per matched character, gap -3 to open and -1 to extend, plus a bonus per matched character: 8 at a word boundary, 8 for a non-word character, 7 for camelCase/digit starts, at least 4 inside a consecutive chunk (a chunk carries its first character's bonus), and the first pattern character's bonus doubled | Same, score only (no positions) |
+| `--scheme=history` | `Init("history")`: the boundary bonus after whitespace and after a delimiter (`/,:;|`) is 8, the same as any other word boundary; the default scheme gives 10 and 9, so there the start of the text and a word after a space outrank a word after `/` | The history scheme. Consequence: the start of a command is worth exactly as much as the start of any later word |
+| Long texts | V2 falls back to the greedy `FuzzyMatchV1` + `calculateScore` when `text chars * pattern chars > 100 * 1024` (the slab) or the pattern is over 1,000 characters | Same thresholds, same fallback |
+| Query | Extended search (`BuildPattern`, `parseTerms` in `src/pattern.go`): leading spaces and unescaped trailing spaces dropped, split on runs of spaces, `\ ` a literal space; each term smart-case (case-sensitive only if it has an upper-case letter); a command must match every term; the score is the sum of the terms' scores | Same, for fuzzy terms |
+| Case folding | ASCII `A-Z` lower-cased; other upper-case letters by a one-character mapping | Same for ASCII. Non-ASCII differs at the edges: Rust's `is_lowercase`/`is_uppercase`/`is_alphabetic` are wider than Go's `IsLower`/`IsUpper`/`IsLetter` (e.g. `ª`, `Ⓐ`, `Ⅰ`), V1 folds only upper-case letters where Go folds every non-ASCII rune, and `İ` has no one-character lower case |
+| Sort value | `util.AsUint16(score)`: a negative total (V1 on a long text with long gaps) counts as 0 | Same: the sum is clamped to `0..=65535`, so every match scores at least 0 and `NO_FZF_MATCH` is below all of them |
+
+Not adopted, with the reason:
+
+| fzf behaviour | Why not |
+|---|---|
+| Latin-script normalisation (`é` matches `e`; on by default, `--literal` turns it off) | The candidate filter (section 6.3, Skim's rule) does not normalise, so a normalised query would not reach those commands anyway; the score is fzf's with `--literal` |
+| Extended-search operators: `'exact`, `^prefix`, `suffix$`, `!negation`, `|` (OR), and fzf's matching itself (terms in any order, a trailing space ignored) | They change which commands match, and matching is the filter's, which keeps Skim's rule (section 6.3): fzf's matching as the filter was measured and cost the model 0.012 top-1 at two characters (results.md, 2026-11-17 merge entry). Every term here is a fuzzy term matched literally |
+| `--tiebreak=index` as an option | `--scheme=history` already has no tiebreak criterion; the newest-first input order is the tiebreak |
+
+The filter (section 6.3) decides which commands match, by Skim's rule, and
+computes this score in the same pass; `rank.rs` never scores again. Every
+command the filter keeps is an fzf match (Skim's matches are a subset of
+fzf's: a multi-term query's terms all lie inside the whole query's
+alignment), except for a term with a non-ASCII character whose lower case differs from it (an upper-case or title-case letter: fzf then compares that term's case, Skim does not) or a TAB (fzf reads it as a space); such a command gets `NO_FZF_MATCH = -1`, below
+every match. Normalisation is not
+adopted (above), so accented letters do not differ.
+
+**Speed (2026-11-17, at the merge with the speed work).** An ASCII text is
+read as bytes, with fzf's own ASCII classes, never decoded into `char`s; a
+non-ASCII text is decoded once per call. A one-character term skips V2's
+matrix: its score is the best `16 + 2 * bonus` over its occurrences, which
+is what V2 returns for it, and the scan stops at the largest bonus
+possible. Tests `ascii_texts_read_as_bytes_score_as_decoded_ones` (bytes
+against chars, both schemes, both cases) and
+`the_one_character_path_scores_as_the_full_v2`; the 333-query check below
+was re-run on this code, identical.
+
+Checked against the fzf 0.74.5 release binary (`fzf --filter=QUERY
+--scheme=history`, empty `FZF_DEFAULT_OPTS`): the orders of 333 queries
+(substrings, scattered subsequences, multi-term, smart-case) over 3,504
+synthetic command lines were identical (again after the byte path, 333 of
+333); the only differences, before the one line with accented letters was
+removed, came from normalisation. fzf's own
+`algo_test.go` score vectors (default scheme) pass for V1 and V2. Fixed
+vectors from the binary are TC-B-22.
+
+### 7.2 Types and the value
+
+```rust
+pub(super) struct CommandCandidate { pub idx: u32, pub fzf: i32 }   // from the filter: a match (Skim's rule) and fzf's score for it (0 for the empty query)
+pub(super) struct HeuristicParts { pub recency: f64, pub fzf: i32 }
+pub(super) const NO_FZF_MATCH: i32 = -1;
+pub(super) struct CommandScore {
+    pub idx: u32, pub score: f64, pub heuristic: f64, pub parts: HeuristicParts,
+    pub ml_score: Option<f64>, pub ml_weight: f64,
+}
+pub(super) struct CmdRankTimings { pub heuristic_ms: f64, pub features_ms: Option<f64>, pub predict_ms: Option<f64>, pub blend_ms: Option<f64>, pub stage2: usize }
+pub(super) struct CommandRanking {
+    pub scores: Vec<CommandScore>,   // scores[..sorted] in rank order; the rest after them, unordered
+    pub sorted: usize,
+    pub timings: CmdRankTimings,
+    pub model_failed: bool,          // Phase C (03 section 7.2)
+    pub features: Vec<f64>,          // Phase C: the model-scored rows' features, row-major
+    pub feature_rows: Vec<u32>,      // Phase C: rank -> row of `features`
+}
+impl CommandRanking {
+    pub(super) fn sort_rest(&mut self, index: &CommandIndex);   // sorted = scores.len() afterwards
+    pub(super) fn features_of(&self, rank: usize) -> &[f64];    // registry order; empty when not model-scored
+}
+
+pub(super) struct FzfQuery { .. }                              // src/cmd/fzf.rs
+impl FzfQuery { pub(super) fn new(query: &str) -> Self; pub(super) fn score(&self, text: &str) -> Option<i32>; }
+pub(super) fn fzf_score(query: &FzfQuery, text: &str) -> i32;  // score, or NO_FZF_MATCH (training's pick rows)
+pub(super) fn heuristic(index: &CommandIndex, ctx: &RankContext, idx: u32, fzf: i32) -> HeuristicParts;
+pub(super) fn combine(parts: &HeuristicParts, lo: i32, hi: i32) -> f64;
+pub(super) fn rank_commands(query: &str, candidates: &[CommandCandidate], index: &CommandIndex, ctx: &RankContext,
+                            head: usize, model: Option<&CmdModel>) -> CommandRanking;   // = rank_scoped(.., None)
+pub(super) fn rank_scoped(query: &str, candidates: &[CommandCandidate], index: &CommandIndex, ctx: &RankContext,
+                          head: usize, model: Option<&CmdModel>, all_newest: Option<&[(i64, i64)]>) -> CommandRanking;
+pub(super) fn rank_order(index: &CommandIndex, a: &CommandScore, b: &CommandScore) -> std::cmp::Ordering;   // the total order below
+```
+
+For candidate `c` with entry `e`:
+
+| Term | Formula | Range |
+|---|---|---|
+| `fzf` | `c.fzf`, computed by the filter (section 6.3); 0 for an empty query | integer, usually 16-400 |
+| `recency` | `1 / (1 + max(0, now - e.last_run_at) / CMD_H_RECENCY_SCALE_SECS)` | (0, 1] |
+| `heuristic` | `(fzf - lo + recency) / (hi - lo + 1)`, `lo..=hi` the range of `fzf` among this call's candidates | (0, 1] |
+
+Because scores are integers and `recency` lies in (0, 1], ordering by
+`heuristic` is exactly ordering by `fzf`, then by the newer last run; the
+value exists so that the model stage has a heuristic to blend with
+([03 section 7.3](03-learn.md#73-blend)). Equal values (the same score and a
+recency equal in `f64`) fall to `last_run_at` and `db_id`.
+
+`rank_commands` in this phase: compute the parts from each candidate's
+`fzf` (no matching, no scoring) (rayon `par_iter` from `CMD_PAR_FILTER_MIN`
+candidates); `lo`, `hi`; `score = heuristic`, `ml_score = None`,
+`ml_weight = 0.0`, `features` empty; order by the total order **`score`
+descending (`f64::total_cmp`), then `last_run_at` descending, then `db_id`
+descending** - exactly for the first `head` rows, `sorted = min(head, len)`:
+`select_nth_unstable_by(sorted - 1)`, then sort `[..sorted]`; with
+`head >= len` the whole list (`par_sort_unstable_by` from
+`CMD_PAR_FILTER_MIN`). What is selected and sorted is a 32-byte key per
+candidate (`score`, `last_run_at`, `db_id`, position); the `CommandScore`s
+are built once, in key order, afterwards. The worker passes
+`head = CMD_PAGE_ROWS`; a caller that needs the full order (the benchmark's
+relevance mode) passes `usize::MAX`, or calls `sort_rest`. `rank_scoped`
+is the same with `all_newest`: for the candidates of a narrower scope, the
+newest commands matching in every scope, which the model stage's
+`recency_rank` counts among instead of the candidates
+([03 section 4](03-learn.md#4-features), feature 25); the worker passes it
+(section 6.3).
+
+What psychic's own signals add on top of fzf, without a model: nothing.
+Six were measured as tie-breakers inside equal fzf scores (all-time runs at
+two weights, runs in 30 days, the directory share, recency in this
+directory, a 900 s recency scale), on the five tuning corpora, both query
+styles, every cell of `all`/`gt10min`/`other_dir` x lengths x four
+metrics (results.md, 2026-11-17). The bar for adding one is that it is
+below pure fzf on no cell; every one was below somewhere (the mildest,
+recency in this directory, by 0.006; frequency by 0.09-0.17 at length 0 on
+the repetitive corpora, where the newest command is the answer half the
+time). So the cold start is pure fzf; the model uses those signals.
+
+## 8. UI thread
+
+### 8.1 State (`src/cmd/app.rs`)
+
+```rust
+pub(super) enum CmdEvent { Input(crossterm::event::Event), Worker(CmdResponse), Tick }   // + From<Event>, From<CmdResponse>
+
+pub(super) struct CmdApp {
+    pub query: String, pub scope: Scope,
+    pub rows: Vec<CmdRow>,               // contiguous from rank 0
+    pub total_matched: usize, pub total_commands: usize,
+    pub selected: usize, pub scroll: usize, pub visible_rows: usize,
+    pub shown_query_id: u64,             // id of the QueryUpdated the rows came from
+    pub next_query_id: u64,              // starts at 2 (1 is the initial query)
+    pub rows_requested_to: usize,        // highest `start` already asked for with GetRows
+    pub confirm_delete: Option<i64>,     // command_id awaiting the one-key confirm
+    pub deleted_any: bool,               // a Delete was sent: wait for the worker, then D6 again at exit (section 4 step 8)
+    pub help_visible: bool, pub debug_visible: bool,
+    pub details: FxHashMap<i64, CmdDetails>, pub details_requested: FxHashSet<i64>,
+    pub list_clock: i64,                 // "now" for time-ago; steps once a minute on Tick
+    pub status: Option<String>,
+    pub loaded: Option<LoadInfo>,        // LoadInfo { commands: usize, load_ms: f64 }, from CmdResponse::Loaded
+    pub recording_on: bool,              // privacy marker / PSYCHIC_HISTORY, read once at start
+    pub timings: CmdTimings,             // CmdTimings { first_results_ms, last_rank_ms, last_round_trip_ms: Option<f64> }
+    pub home: Option<String>, pub cwd: String,
+    pub events: events::CmdEvents,
+    worker_tx: Sender<CmdRequest>, query_sent_at: Option<Instant>,
+}
+```
+
+### 8.2 Event loop
+
+Each iteration, in this order: `if visible_rows > 0 && events.wants_impressions(false) { events.log_impressions(&shown) }`
+(section 10; `shown` = the rows on screen); `terminal.draw(|f| layout = render::draw(f, &app))`; store
+`layout.visible_rows`; request details and the next page (below); block on
+`event_rx.recv()`; handle the event.
+
+| Event | Handling |
+|---|---|
+| `Worker(QueryUpdated)` | Accept only when `query_id >= shown_query_id` (same test as [src/main.rs:1045](../../src/main.rs)). Replace `rows`, totals; `shown_query_id = query_id`; `selected = 0`, `scroll = 0`; `rows_requested_to = 0`; `confirm_delete = None` (the selection moved, so `y` would delete another row); `events.new_subsession(query_id, <the response's query>)` (not `app.query`, which may already be longer); record `last_rank_ms` and the round trip since `query_sent_at` |
+| `Worker(Rows)` | Accept only when `query_id == shown_query_id && start == rows.len()`; append |
+| `Worker(Details)` | Insert into `details`; clear `details_requested` (the worker answers only the newest of the `Details` queued together, so a row selected again must be able to ask again) |
+| `Worker(Loaded)` / `LoadFailed` | Store; `LoadFailed` sets `status = Some("Could not read history: <message>")` |
+| `Tick` (every `CMD_TICK_MS`) | `list_clock` advances to the current minute boundary; the loop iteration that follows runs the impression check and redraws |
+| `Input(Key)` | Section 9 |
+| `Input(Mouse ScrollUp/ScrollDown)` | As `MoveUp` / `MoveDown`; ignored while `confirm_delete` or `help_visible` is set |
+| `Input(Resize)` | Redraw (next iteration) |
+
+After each draw: if the selected row's `command_id` is in neither `details` nor
+`details_requested`, send `Details`. If `selected + CMD_PAGE_PREFETCH >= rows.len()`,
+`rows.len() < total_matched` and `rows.len() > rows_requested_to`, send
+`GetRows { query_id: shown_query_id, start: rows.len() }` and set `rows_requested_to`.
+
+Changing the query or the scope: assign `query_id = next_query_id++`, send
+`UpdateQuery`, set `query_sent_at`. The list on screen stays as it is until the
+answer arrives. Nothing else reorders the list: there is no timer-driven
+refresh and no model reload (ADR-11).
+
+Scrolling: rank 1 is the top row. After every change of `selected`:
+`if selected < scroll { scroll = selected }`;
+`if visible_rows > 0 && selected >= scroll + visible_rows { scroll = selected + 1 - visible_rows }`.
+
+TIMING lines written by the UI thread, each once per process, of the form
+`TIMING {"op":"<name>","ms":<milliseconds since PROCESS_START>}`: `cmd_first_render` (end of the first draw),
+`cmd_first_results` (first accepted `QueryUpdated`), `cmd_first_full_render`
+(end of the first draw that had at least one row, or that followed a
+`QueryUpdated` with zero rows). `cmd_first_full_render` is what B3 measures.
+One more, per accepted `QueryUpdated` (Phase D): `TIMING
+{"op":"cmd_key_to_results","ms":<ms>,"draw_ms":<ms>}` after the draw that follows it, `ms`
+counted from when the UI thread sent the query (the key handler) to the end
+of that draw, `draw_ms` that draw alone: the key-to-results time `bench/history.py` reports beside B2
+([04 section 6.3](04-bench.md#63-keystroke-n200---pause-s---b2-and-b1)).
+
+### 8.3 Layout and rows
+
+`src/cmd/render.rs`: `pub(super) fn draw(f: &mut Frame, app: &CmdApp) -> CmdLayout`
+(`CmdLayout { visible_rows: usize }`). It takes `&CmdApp`, performs no I/O, reads
+no clock and no environment variable (B5).
+
+| Terminal width | Debug off | Debug on |
+|---|---|---|
+| `>= CMD_STACK_BELOW_COLS` | Horizontal: list 50%, preview 50% | Horizontal: list 35%, preview 30%, debug 35% |
+| `< CMD_STACK_BELOW_COLS` | Vertical: list 60%, preview 40% | Vertical: list 40%, debug 60% (preview hidden) |
+
+Below them, full width, a 3-row bordered input box. Its title:
+`` history - <scope label> - <total_matched>/<total_commands> `` where the scope
+label is `all`, `this directory`, `this repo` or `this session`; the right end
+of the bottom border shows `Ctrl-G help`. The box content is `> ` + query. When
+`confirm_delete` is set the box content is instead
+`Delete this command from psychic's history? y = delete, any other key = keep`.
+`status`, when set, replaces the title until the next key press.
+
+List row, left to right:
+
+| Part | Width | Content |
+|---|---|---|
+| Rank | 4 | 1-based rank, right-aligned, dim |
+| Fail marker | 1 | `!` in red when `last_exit_code` is `Some(n)` with `n != 0`, else a space |
+| Here marker | 2 | `*` + space, dim, when `runs_here > 0`, else two spaces |
+| Command | remaining | `text` with every `\n` replaced by `↵ ` (U+21B5 and a space), then `path_display::printable`, then `truncate_to_width` |
+| Time | 16, right-aligned | `get_time_ago(Some(last_run_at), app.list_clock)` |
+
+The selected row is drawn reversed. Matched characters are not highlighted.
+When `rows` is empty the list area shows one centred line: `Could not read
+history.` after `LoadFailed` (the status that said so is gone after a key),
+else `No commands recorded yet.` if `total_commands == 0`, else `No match.`; and a second line `Recording
+is off. Turn it on with: psychic history --enable` when `!recording_on` (not after a
+failed load). Until
+the first `QueryUpdated` is accepted it shows nothing (the index is still
+loading; `No commands recorded yet.` would be a lie for those milliseconds).
+
+Preview pane for the selected row, top to bottom:
+
+| Block | Content |
+|---|---|
+| Command | The full text, one screen line per text line, each through `printable`, wrapped at the pane width |
+| blank line | |
+| `Last run` | `get_time_ago` |
+| `Runs` | `<runs_here> here / <run_count> total` |
+| `Last exit` | `0`, `<n> (failed)` or `unknown` |
+| `Picked` | `<pick_count> times with Ctrl-R`; omitted when 0 |
+| blank line, `Last directories` | Up to 5 `DirUse`: path (leading `home` shown as `~`, truncated), `<runs> runs`, time-ago. While the details are not in `app.details`: `...` |
+| blank line, `Usually after` | Up to 3 `PrecededBy`: template, `<runs> times`. Omitted when empty |
+
+Debug pane (Ctrl-O), for the selected row: `score`, `heuristic`, its two
+`heuristic_parts` (`fzf`, `recency`), `ml_score`, `ml_weight`, `fuzzy_score` (`-` when the model did not score the row); then one line per
+feature `name = value` when `features` is non-empty (names from
+[03 section 4](03-learn.md#4-features)), else `model: none`; then model stats
+(Phase C, [03 section 7.4](03-learn.md#74-what-the-debug-pane-shows)); then
+`here <cwd>` (`~`-abbreviated), `load <ms>, <n> commands`, `first results <ms>`,
+`rank <ms>`, `round trip <ms>`, `matched <n> of <n>`.
+
+Help overlay (Ctrl-G / F1): a centred bordered box listing every `CMD_KEYMAP`
+row as `keys  description`, generated from the table (section 9), followed by
+the line `Ctrl-R or ph in your shell opens this; Enter puts the command on your prompt.`
+
+## 9. Keys
+
+`src/cmd/keys.rs`. A separate table (ADR-3); `src/keymap.rs` and `src/help.rs`
+are not edited.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumIter)]
+pub(super) enum CmdAction { AppendToQuery, DeleteFromQuery, ClearQuery, MoveUp, MoveDown, Accept,
+    ScopeForward, ScopeBackward, DeleteSelected, ToggleDebug, ToggleHelp, Cancel }
+pub(super) struct CmdBinding { pub action: CmdAction, pub triggers: &'static [Trigger], pub description: &'static str }
+pub(super) static CMD_KEYMAP: &[CmdBinding];
+pub(super) fn lookup(code: KeyCode, modifiers: KeyModifiers) -> Option<CmdAction>;  // explicit chords first, then AnyChar for a plain char
+pub(super) fn lookup_mouse(kind: MouseEventKind) -> Option<CmdAction>;
+```
+
+| Action | Triggers (in declaration order) | Description (help text) | Effect |
+|---|---|---|---|
+| `AppendToQuery` | `AnyChar` (a `KeyCode::Char` with neither CONTROL nor ALT; SHIFT is allowed) | type to search | Append the char; new query |
+| `DeleteFromQuery` | Backspace | delete the last character | Pop one char; new query if it changed |
+| `ClearQuery` | Ctrl-U | clear the query | Empty the query; new query if it changed |
+| `MoveUp` | Up, Ctrl-P, wheel up | previous command | `selected -= 1` (stops at 0) |
+| `MoveDown` | Down, Ctrl-N, wheel down | next command | `selected += 1` (stops at `total_matched - 1`, and at the last loaded row) |
+| `Accept` | Enter | put the command on your prompt | Section 10 pick, then exit with the text; with no rows: exit with nothing |
+| `ScopeForward` | Tab | next scope: all, this directory, this repo, this session | `scope.next()`; new query |
+| `ScopeBackward` | Shift-Tab (`BackTab`) | previous scope | `scope.prev()`; new query |
+| `DeleteSelected` | Delete, Ctrl-X | delete this command from psychic's history | Set `confirm_delete` to the selected `command_id` (no-op with no rows) |
+| `ToggleDebug` | Ctrl-O | show why this command ranks here | Toggle `debug_visible` |
+| `ToggleHelp` | Ctrl-G, F1 | show this help | Toggle `help_visible` |
+| `Cancel` | Esc, Ctrl-C, Ctrl-D | leave without choosing | Exit with nothing |
+
+Modal rules, applied before `lookup`, on key **press** events only:
+
+| State | Rule |
+|---|---|
+| `confirm_delete = Some(id)` | Plain `y` or `Y`: send `Delete { command_id: id, query_id: next_query_id++ }`. Any other key: nothing. Either way clear `confirm_delete` and consume the key. An accepted `QueryUpdated` also clears it, and the wheel does nothing meanwhile (section 8.2) |
+| `help_visible` | Any key closes help and is consumed (Esc does not cancel the picker here) |
+| `status.is_some()` | Clear `status`; the key is then handled normally |
+
+The helpers `key`, `ctrl_key`, `chr`, `ctrl` ([src/keymap.rs:204-232](../../src/keymap.rs)),
+`chord_matches` ([:440-444](../../src/keymap.rs)) and `is_plain_char`
+([:447-451](../../src/keymap.rs)) are private; `keys.rs` has its own copies
+(`Chord`'s fields are `pub`, so `Trigger::Key(Chord { code, ctrl, alt })` can
+be built in a `const fn`).
+
+## 10. Event logging
+
+`src/cmd/events.rs`, mirroring `Analytics` ([src/analytics.rs:37-193](../../src/analytics.rs)).
+Rows go to `command_events` through E1/E2 of [01 section 6.4](01-record.md#64-events-delete-purge-import-status)
+on the UI thread's own connection.
+
+```rust
+pub(super) struct CmdEvents { /* session_id, cwd, repo_root, shell_session, store,
+    current: Option<Subsession { id, query, created_at: Instant, logged: bool, logged_ids: FxHashSet<i64> /* command ids, filled by log_impressions */ }>,
+    episode_queries: Vec<String> */ }
+impl CmdEvents {
+    pub fn new_subsession(&mut self, query_id: u64, query: String);
+    pub fn wants_impressions(&mut self, force: bool) -> bool;
+    pub fn log_impressions(&mut self, shown: &[Shown]) -> anyhow::Result<()>;   // Shown { command_id: i64, rank: usize }
+    pub fn log_accept(&mut self, shown: &[Shown], picked: Shown) -> anyhow::Result<()>;  // Enter: forced impressions + pick + E2, one transaction
+    #[cfg(test)] pub fn log_pick(&mut self, picked: Shown) -> anyhow::Result<()>;      // log_accept(&[], picked)
+    pub fn truncate_log(&self);   // D6 at exit after a delete (section 4 step 8); busy or failure is logged only
+}
+// `store` is `Option<CmdStore>`: `None` when the UI thread could not open it (E-B-19); every method is then a no-op.
+```
+
+| Rule | Definition |
+|---|---|
+| Subsession | Starts when a `QueryUpdated` is accepted; id = its `query_id`; query = the `query` field of that `QueryUpdated` |
+| `wants_impressions(force)` | Push the subsession's query into `episode_queries` if absent (always). Return `!logged && (force \|\| created_at.elapsed() >= CMD_IMPRESSION_AGE_MS)` - the logic of [src/analytics.rs:94-111](../../src/analytics.rs) |
+| Impressions | The rows on screen: ranks `scroll + 1 ..= scroll + visible_rows` that exist. One transaction, one E1 per row with `action = 'impression'`, `rank`, `query`, `session_id`, `subsession_id`; `episode_queries`, `cwd`, `repo_root`, `shell_session` NULL. Then `logged = true`. Nothing is logged before the first draw (`visible_rows == 0`) |
+| When checked | Top of every loop iteration with `force = false` (so within one tick, `CMD_TICK_MS`, of the query settling); with `force = true` immediately before a pick |
+| Pick | `log_accept(shown, picked)`, one transaction (`CmdStore::log_pick_events`): the forced impressions (`shown`, empty when `wants_impressions(true)` says none are due); if the picked `command_id` is not in the current subsession's `logged_ids` (the user scrolled after the impressions were logged), one more E1 `impression` for it (same query, its rank), so every pick has a label-1 impression. Then one E1 with `action = 'pick'`, the row's `rank`, the query, `episode_queries` = JSON array of `episode_queries`, and `cwd`, `repo_root`, `shell_session`; then E2. Then `episode_queries.clear()` |
+| Waiting for the lock | The UI thread's connection has `busy_timeout = CMD_EVENT_WAIT_MS` (100 ms, `pub(super) const` in `events.rs`), not `Database`'s 5 s. Another process can hold the write lock for seconds (an `--import`'s per-file transaction, a purge's `VACUUM`). Enter writes once, so after Enter the pick reaches stdout at most about 100 ms later than on an idle database; under contention the episode's rows are lost and logged (E-B-06), never shown. An impression check mid-session can hold the UI for up to the same 100 ms |
+| Cancel | Nothing more is written; the impressions already logged stay and train nothing (no positive) |
+| Failure | Section 15, E-B-06: logged, never shown, never blocks the pick |
+
+## 11. Shell widgets
+
+Appended to each script after the Phase A block. Each replaces the **whole**
+prompt buffer with the pick and passes the current buffer as the initial query
+(what fzf and Atuin do). Bound only when all hold at the time the script is
+sourced: recording is enabled (`__psychic_history_enabled`,
+[01 section 11](01-record.md#11-shell-hooks)), `PSYCHIC_NO_CTRL_R` is unset, and
+Ctrl-R still has the shell's default binding, checked and bound in each
+editing keymap or mode on its own (zsh `emacs`, `viins`; bash `emacs`,
+`vi-insert`, `vi-command`; fish `default`, `insert`), so turning on vi editing
+later in the startup file keeps it. A user who enables history in a
+running shell gets the binding in the next shell (`--enable` says so,
+[01 section 13.1](01-record.md#131---enable---no-import)).
+
+Each script also exports `PSYCHIC_CTRL_R`, what became of the binding, for
+`--status` (section 11.4), and defines `ph`, the same picker typed at the
+prompt (section 11.4). The picker command line lives once per script, in
+`__psychic_history_run`, which both use.
+
+### 11.1 zsh
+
+```zsh
+# =============================================================================
+# Ctrl-R: search command history in psychic
+# =============================================================================
+
+# The picker, searching for $1 first. Prints the pick, or nothing (Escape).
+__psychic_history_run() {
+    \command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
+        history --session="${__psychic_session}" --cwd="${PWD}" --query="$1"
+}
+
+# Enter on a command replaces the line being edited with it; Escape leaves the
+# line alone. What is already typed becomes the search.
+__psychic_history_widget() {
+    \builtin local result
+    result="$(__psychic_history_run "${BUFFER}")"
+    if [[ -n "${result}" ]]; then
+        BUFFER="${result}"
+        CURSOR=${#BUFFER}
+    fi
+    \builtin zle reset-prompt
+}
+\builtin zle -N __psychic_history_widget
+
+# Bound to Ctrl-R only where history search is on, in each of the emacs and
+# viins keymaps where Ctrl-R is still one of zsh's own (its default, or a
+# history search oh-my-zsh and others bind). A plugin that binds Ctrl-R after
+# this runs wins: load this last. Set PSYCHIC_NO_CTRL_R before loading this to
+# skip it; bind the widget yourself with, e.g.,
+#   bindkey '^X^R' __psychic_history_widget
+# What became of it goes into PSYCHIC_CTRL_R, for `psychic history --status`:
+# bound (both keymaps), partly, taken (neither: something else has Ctrl-R),
+# recording-off or opted-out.
+if [[ -n "${PSYCHIC_NO_CTRL_R-}" ]]; then
+    PSYCHIC_CTRL_R=opted-out
+elif ! __psychic_history_enabled; then
+    PSYCHIC_CTRL_R=recording-off
+else
+    __psychic_keymaps=''
+    for __psychic_keymap in emacs viins; do
+        case "$(\builtin bindkey -M "${__psychic_keymap}" '^R' 2>/dev/null)" in
+            *history-incremental-search-backward|*history-incremental-pattern-search-backward|*redisplay|*undefined-key|'')
+                \builtin bindkey -M "${__psychic_keymap}" '^R' __psychic_history_widget
+                __psychic_keymaps+=' bound' ;;
+            *__psychic_history_widget) __psychic_keymaps+=' bound' ;; # an earlier `source`
+            *) __psychic_keymaps+=' taken' ;;
+        esac
+    done
+    case "${__psychic_keymaps}" in
+        ' bound bound') PSYCHIC_CTRL_R=bound ;;
+        *bound*) PSYCHIC_CTRL_R=partly ;;
+        *) PSYCHIC_CTRL_R=taken ;;
+    esac
+    \builtin unset __psychic_keymap __psychic_keymaps
+fi
+export PSYCHIC_CTRL_R
+
+# `ph [words]`: the same picker, typed instead of bound, searching for the
+# words. The pick goes onto the next prompt's line (`print -rz`), ready to
+# edit and run; nothing is run.
+__psychic_history_typed() {
+    \builtin local result
+    result="$(__psychic_history_run "$*")" || \builtin return
+    [[ -n "${result}" ]] && \builtin print -rz -- "${result}"
+    \builtin return 0
+}
+
+# Defined unless PSYCHIC_NO_PH is set or `ph` is already the user's (an alias,
+# function or command); kept as ours when this script is sourced again.
+if [[ -z "${PSYCHIC_NO_PH-}" ]] && { [[ -n "${__psychic_ph_ours-}" ]] || ! \builtin whence ph >/dev/null; }; then
+    __psychic_ph_ours=1
+    # Search command history; the pick goes on your prompt to edit and run
+    function ph {
+        __psychic_history_typed "$@"
+    }
+fi
+```
+
+zsh defaults: `^R` is `history-incremental-search-backward` in `emacs` and
+`redisplay` in `viins`; oh-my-zsh's `lib/key-bindings.zsh` binds
+`history-incremental-search-backward` again, and
+`history-incremental-pattern-search-backward` is zsh's own too, so both are
+taken over. A plugin that rebinds `^R` after the script runs (loaded later in
+`.zshrc`, or deferred to the first prompt) wins; `--status` says to load
+psychic last. `print -rz` puts `ph`'s pick on the buffer stack, which the next
+prompt's line editor starts with: `-r`, so a backslash in the command is kept.
+
+### 11.2 bash
+
+```bash
+# =============================================================================
+# Ctrl-R: search command history in psychic
+# =============================================================================
+
+# The picker, searching for $1 first. Prints the pick, or nothing (Escape).
+__psychic_history_run() {
+    \command "${PSYCHIC_BIN:-psychic}" ${PSYCHIC_DATA_DIR:+--data-dir} ${PSYCHIC_DATA_DIR:+"${PSYCHIC_DATA_DIR}"} \
+        history --session="${__psychic_session}" --cwd="${PWD}" --query="$1"
+}
+
+# Enter on a command replaces the line being edited with it; Escape leaves the
+# line alone. Needs bash 4 or newer, for READLINE_LINE.
+__psychic_history_widget() {
+    \builtin local result
+    result="$(__psychic_history_run "${READLINE_LINE}")" || return
+    [[ -n "${result}" ]] || return
+    READLINE_LINE="${result}"
+    READLINE_POINT=${#READLINE_LINE}
+}
+
+# Binds Ctrl-R in one keymap if it still does what readline does by default
+# there, and adds `bound` (Ctrl-R is the widget now) or `taken` to
+# __psychic_keymaps.
+# From bash 5.1 each keymap has its own `bind -x` commands; before, one
+# command per key sequence serves every keymap, so a `bind -x` of anyone
+# else's (fzf's) on Ctrl-R anywhere keeps it in all of them.
+__psychic_history_bind() {
+    \builtin local keymap="$1" readline unix
+    readline="$(\builtin bind -m "${keymap}" -p 2>/dev/null | \command grep '^"\\C-r":')"
+    unix="$(\builtin bind -m "${keymap}" -X 2>/dev/null | \command grep '^"\\C-r"')"
+    if [[ "${readline}" == *': reverse-search-history' ]] &&
+        { [[ -n "${__psychic_hist_new}" ]] || [[ -z "${unix}" || "${unix}" == *__psychic_history_widget* ]]; }; then
+        \builtin bind -m "${keymap}" -x '"\C-r": __psychic_history_widget'
+        __psychic_keymaps+=' bound'
+    elif [[ -z "${readline}" && "${unix}" == *__psychic_history_widget* ]]; then
+        __psychic_keymaps+=' bound' # already, from an earlier `source`
+    else
+        __psychic_keymaps+=' taken'
+    fi
+}
+
+# Bound only in an interactive bash 4+, where history search is on, in each of
+# the emacs, vi-insert and vi-command keymaps where Ctrl-R still does what
+# readline does by default (so `set -o vi` later in ~/.bashrc keeps it). Set
+# PSYCHIC_NO_CTRL_R before loading this to skip it; bind the function
+# yourself with, e.g.,
+#   bind -x '"\C-x\C-r": __psychic_history_widget'
+# What became of it goes into PSYCHIC_CTRL_R, for `psychic history --status`:
+# bound (all three keymaps), partly, taken (none: something else has Ctrl-R),
+# recording-off, opted-out or old-bash.
+if [[ $- == *i* ]]; then
+    if [[ -n "${PSYCHIC_NO_CTRL_R-}" ]]; then
+        PSYCHIC_CTRL_R=opted-out
+    elif ((BASH_VERSINFO[0] < 4)); then
+        PSYCHIC_CTRL_R=old-bash
+    elif ! __psychic_history_enabled; then
+        PSYCHIC_CTRL_R=recording-off
+    else
+        __psychic_keymaps=''
+        __psychic_history_bind emacs
+        __psychic_history_bind vi-insert
+        __psychic_history_bind vi-command
+        case "${__psychic_keymaps}" in
+            ' bound bound bound') PSYCHIC_CTRL_R=bound ;;
+            *bound*) PSYCHIC_CTRL_R=partly ;;
+            *) PSYCHIC_CTRL_R=taken ;;
+        esac
+        \builtin unset __psychic_keymaps
+    fi
+    export PSYCHIC_CTRL_R
+fi
+
+# `ph [words]`: the same picker, typed instead of bound, searching for the
+# words. bash gives a plain function no way to fill the next prompt's line
+# (READLINE_LINE counts only under `bind -x`), so the pick goes into the
+# history list instead: Up brings it back, ready to edit and run. Nothing is
+# run, and the hook does not take the new history entry for a command that
+# ran: with nothing to compare with, it records nothing at this prompt.
+__psychic_history_typed() {
+    \builtin local result
+    result="$(__psychic_history_run "$*")" || return
+    [[ -n "${result}" ]] || return 0
+    \builtin history -s -- "${result}"
+    __psychic_hist_count=''
+    \builtin printf '%s\n' 'psychic: press Up to get the command on your prompt' >&2
+}
+
+# Defined unless PSYCHIC_NO_PH is set or `ph` is already the user's (an alias,
+# function or command); kept as ours when this script is sourced again.
+if [[ -z "${PSYCHIC_NO_PH-}" ]] && { [[ -n "${__psychic_ph_ours-}" ]] || ! \builtin type -t ph >/dev/null 2>&1; }; then
+    __psychic_ph_ours=1
+    # Search command history; the pick goes on your prompt to edit and run
+    function ph {
+        __psychic_history_typed "$@"
+    }
+fi
+```
+
+Checked on bash 5.3.9 (and 4.4 and 5.0 in containers): `bind -x` binds in the
+current keymap only, so the old single `bind -x` left Ctrl-R as readline's
+search after a later `set -o vi`; each keymap is now bound with `bind -m`.
+`bind -m KEYMAP -p` does not list a key bound with `-x`, so a
+`reverse-search-history` line there means the key is still readline's own in
+that keymap. Before 5.1, `bind -x` keeps one command per key sequence for
+every keymap (`bind -X` lists it under each), so there a `bind -x` of anyone
+else's on Ctrl-R keeps the key in every keymap. A plain function cannot set the
+next prompt's line (`READLINE_LINE` counts only under `bind -x`; measured: a
+function assigning it leaves the next prompt empty), so `ph` puts the pick in
+the history list with `history -s`, which replaces the history entry of the
+`ph` line itself when bash added one; it then empties
+`__psychic_hist_count`, so the recording hook has nothing to compare with at
+this prompt and does not take the new entry for a command that ran (01 section
+11.3).
+
+### 11.3 fish
+
+```fish
+# =============================================================================
+# Ctrl-R: search command history in psychic
+# =============================================================================
+
+# The picker, searching for $argv[1] first. Prints the pick, or nothing
+# (Escape). Fails, printing nothing, when the binary is not installed.
+function __psychic_history_run
+    set -l __psychic_bin psychic
+    set -q PSYCHIC_BIN; and set __psychic_bin $PSYCHIC_BIN
+    command -q $__psychic_bin; or return 1
+    set -l __psychic_dir
+    set -q PSYCHIC_DATA_DIR; and set __psychic_dir --data-dir $PSYCHIC_DATA_DIR
+    command $__psychic_bin $__psychic_dir history --session="$__psychic_session" --cwd="$PWD" --query="$argv[1]"
+end
+
+# Enter on a command replaces the command line with it; Escape leaves it alone.
+function __psychic_history_widget
+    set -l result (__psychic_history_run (commandline | string collect) | string collect)
+    if test -n "$result"
+        commandline --replace -- $result
+    end
+    commandline --function repaint
+end
+
+# Bound to Ctrl-R only where history search is on and nothing else has claimed
+# the key, in the default and insert modes each. Set PSYCHIC_NO_CTRL_R before
+# loading this to skip it; bind the function yourself with, e.g.,
+#   bind \cx\cr __psychic_history_widget
+# What became of it goes into PSYCHIC_CTRL_R, for `psychic history --status`:
+# bound (both modes), partly, taken (neither: something else has Ctrl-R),
+# recording-off or opted-out.
+if set -q PSYCHIC_NO_CTRL_R
+    set -gx PSYCHIC_CTRL_R opted-out
+else if not __psychic_history_enabled
+    set -gx PSYCHIC_CTRL_R recording-off
+else
+    # --user: fish 4 lists the preset binding beside the user's own. Each
+    # mode on its own: a user's insert-mode Ctrl-R is theirs too.
+    set -l __psychic_bound 0
+    for __psychic_mode in default insert
+        set -l __psychic_current (bind --user -M $__psychic_mode \cr 2>/dev/null)
+        if string match -q -- '*__psychic_history_widget*' $__psychic_current
+            set __psychic_bound (math $__psychic_bound + 1) # an earlier `source`
+        else if test -z "$__psychic_current"; or string match -q -- '*history-pager*' $__psychic_current
+            bind -M $__psychic_mode \cr __psychic_history_widget
+            set __psychic_bound (math $__psychic_bound + 1)
+        end
+    end
+    switch $__psychic_bound
+        case 2
+            set -gx PSYCHIC_CTRL_R bound
+        case 1
+            set -gx PSYCHIC_CTRL_R partly
+        case '*'
+            set -gx PSYCHIC_CTRL_R taken
+    end
+end
+
+# `ph [words]`: the same picker, typed instead of bound, searching for the
+# words. The pick goes onto the next prompt's command line, ready to edit and
+# run; nothing is run.
+function __psychic_history_typed
+    set -l result (__psychic_history_run "$argv" | string collect)
+    if test -n "$result"
+        commandline --replace -- $result
+    end
+    return 0
+end
+
+# Defined unless PSYCHIC_NO_PH is set or `ph` is already the user's (a
+# function or command); kept as ours when this script is sourced again.
+if not set -q PSYCHIC_NO_PH; and begin; set -q __psychic_ph_ours; or not type -q ph; end
+    set -g __psychic_ph_ours 1
+    function ph --description 'Search command history in psychic; the pick goes on the prompt'
+        __psychic_history_typed $argv
+    end
+end
+```
+
+`string collect` keeps a multi-line pick as one value. fish 3.6+ binds Ctrl-R
+to `history-pager` by default; older fish has no default binding (empty output).
+Checked on fish 4.2.1: `bind \cr` prints the preset (`bind --preset ctrl-r
+history-pager`) next to a user's own binding, so without `--user` the guard
+matched `history-pager` and took over an fzf or Atuin Ctrl-R; `bind --user \cr`
+prints only the user's binding, or nothing (and fails) when there is none; it
+covers one mode, so the default and insert modes are checked and bound each on
+its own (a user's insert-mode Ctrl-R stays theirs). The
+widget checks the binary with `command -q` first, as the recording hook does,
+so a missing binary prints nothing (E-B-16). fish 4 asks the terminal for its
+attributes at start-up and waits 2 s for an answer a test pty never gives; the
+pty tests wait for fish's first prompt mark before typing.
+
+| Detail common to all three | Decision |
+|---|---|
+| Option form | `--query=VALUE` / `--cwd=VALUE` / `--session=VALUE` with `=`, so a buffer starting with `-` is a value, as the existing `pd` does ([shell/psychic.zsh:46](../../shell/psychic.zsh)) |
+| Cursor after a pick | End of the buffer |
+| Empty result (cancel) | Buffer untouched |
+| The picked command is not executed | The user presses Enter |
+| `ph [words]` | The picker with the words as the query: zsh `print -rz`, fish `commandline --replace` (the next prompt's line), bash `history -s` and `psychic: press Up to get the command on your prompt` on stderr. Defined unless `PSYCHIC_NO_PH` is set or `ph` is already an alias, function or command (kept as ours when the script is sourced again, by `__psychic_ph_ours`). `ph` is in `CMD_OWN_COMMANDS`, so it is never recorded |
+
+### 11.4 Typed by hand, and `--status`
+
+A user's first try may be to type `psychic history` at the prompt. The picker
+cannot reach the shell's line editor from there: it can only print. When stdout
+is a terminal (no widget or `ph` captured it), the pick is printed as always
+and one line follows on stderr (`integration::by_hand_hint`, no command text):
+
+```
+psychic: printed only, not put on your prompt. To get a pick on the prompt, ready to run, press Ctrl-R or type ph instead. Ctrl-R opens something else? See psychic history --status
+```
+
+Without `PSYCHIC_SHELL` (integration not loaded), `press Ctrl-R or type ph
+instead` reads `set up the shell integration (psychic init), then press Ctrl-R
+or type ph`. With stdout a pipe or file nothing is added: the widgets get only
+the command. Typing into the terminal's input queue (`TIOCSTI`) was rejected:
+Linux 6.2+ disables it by default and it lets one program type commands into
+another's terminal.
+
+`--status` ends with the integration lines of `integration::status_lines`,
+from `PSYCHIC_SHELL` and `PSYCHIC_CTRL_R` as the shell exported them when it
+loaded the script:
+
+| `PSYCHIC_CTRL_R` | `Ctrl-R:` line |
+|---|---|
+| `bound` | `psychic's picker, bound when this shell started; if it opens something else, a plugin rebound it later: load psychic last` |
+| `partly` | `psychic's picker in some editing modes only; something else had Ctrl-R in the others when this shell started` |
+| `taken` | `left alone: something else (fzf, Atuin, a plugin) had Ctrl-R when this shell started` |
+| `recording-off` | `not bound: recording was off when this shell started; open a new shell` |
+| `opted-out` | `not bound: PSYCHIC_NO_CTRL_R is set` |
+| `old-bash` | `not bound: needs bash 4 or newer` |
+| unset | `unknown: this shell loaded an older integration; open a new shell` |
+
+Before it: `shell integration: <PSYCHIC_SHELL>`. After it, for zsh, bash and
+fish: `  see what Ctrl-R runs: <command>   (psychic's is __psychic_history_widget)`
+(`bindkey -M emacs '^R'; bindkey -M viins '^R'`, `bind -X | grep -F '\C-r'`,
+`bind \cr`); for `partly` and `taken` also
+`  bind psychic's to another key: <the rebind line of the script's comment>`;
+last, `ph [words]: the picker; the pick goes on your prompt to edit and run`
+(bash: `ph [words]: the picker; Up then brings the pick back to edit and run`).
+Without `PSYCHIC_SHELL` the two lines are
+`shell integration: not loaded in this shell; set it up with: psychic init` and
+`Ctrl-R: not psychic's here (it needs the shell integration)`.
+
+## 12. Latency design
+
+Targets B1-B3, B5, B10. The decisions that make them reachable:
+
+| Decision | Detail |
+|---|---|
+| No SQL per keystroke | Everything a query needs is in `CommandIndex`; the only SQL after start-up is `Details` (off the query path), event logging (UI thread, not in `draw`, waiting at most `CMD_EVENT_WAIT_MS` for a lock, section 10) and `Delete` |
+| Bounded start-up SQL | Exactly R1-R8, one full read (R1), the rest index-covered and proportional to one directory, one repo, 30 days or one session |
+| Start-up reads side by side | R1 split by id over `CMD_LOAD_READERS` connections that also build the entries, R2-R8 on one more, each memory-mapped (section 5.2); the rayon pool starts and warms meanwhile (section 6.2) |
+| Work in parallel with terminal set-up | The worker is spawned before the terminal is touched (section 4, steps 2-5) |
+| Parallel filter with a floor | rayon from `CMD_PAR_FILTER_MIN` candidates and only with a query; sequential otherwise, where waking the pool costs more than it saves |
+| Reject before scoring | A 64-bit byte-class mask per command in one array, then an in-order byte scan, before the scorer (section 6.3): most commands are rejected without reading their text, and the empty query reads only the array |
+| First letters precomputed | The matches of each single lower-case letter are computed while the worker is idle after start-up (section 6.3, seeds), so the first letter of a search, a scan of every command, costs no filter |
+| Narrowing and reuse | Typing a longer query re-matches only the matches of its longest prefix typed before; deleting back to a query typed before reuses its matches; the empty query's ranking is kept per scope until a delete (section 6.3) |
+| Sort only what is shown | `select_nth` + sort of the first `CMD_PAGE_ROWS` 32-byte keys; the rest is sorted only when a page reaches it (section 7) |
+| No cold global in the parallel loop | fzf's and Skim's scratch space warmed on every rayon thread at start (section 6.2, step 2); the Skim `static` resolved before the loop; the registry of Phase C is a `static` array, not a `Lazy` |
+| No per-row allocation on the query path | `Arc<str>` texts; the model-scored rows' features in one buffer of the ranking, not a vector per row; `CmdRow`s built only for the 200 sent |
+| One log write per query, after the send | Section 6.5 |
+| Render is pure | `draw(&mut Frame, &CmdApp)`; time-ago uses `list_clock`; `~` uses `app.home` |
+| One write per frame | The terminal's writer is a 64 KiB `BufWriter` (section 4, step 5): the redraw after a keystroke went from 5.6 to 0.8 ms p50 |
+| Match once | The filter decides the match (Skim's rule, a byte scan on ASCII texts) and gives fzf's score in the same pass; Skim's score is computed for the model's rows only (section 6.3) |
+| Bounded model | At most `CMD_MODEL_MAX_TREES` (100) trees ([03 section 3](03-learn.md#3-constants-phase-c)) |
+| Less derived data at load | `CommandEntry` keeps the text and its byte classes only; the lower-case copy, the character count and the word count, which only features read, are computed for the model's rows (at most `CMD_STAGE2_K`) when it scores them ([03 section 4](03-learn.md#4-features), features 2, 3, 22, 23): one allocation and two scans fewer per command at start-up |
+
+Start-up allowances per stage; they sum to the B3 target:
+
+| Stage | Allowance | Thread |
+|---|---|---|
+| Process start, clap, logger | 3 ms | main |
+| Terminal set-up, input thread | 5 ms | main |
+| `CmdStore::open` | 1 ms | worker |
+| R1 over 50,000 rows, split over `CMD_LOAD_READERS`, entries built | 20 ms | worker + readers |
+| R2-R8 | 6 ms | one reader, during R1 (not on the critical path) |
+| Model load (Phase C) | 3 ms (measured 3.8 ms p50, 5.3 ms p95; beside the index load, so off the critical path) | worker, while a scoped thread loads the index |
+| First query: 50,000 heuristics + sort (+ stage 2 in Phase C) | 8 ms | worker |
+| First full draw | 4 ms | main |
+
+Per-keystroke allowances on the worker, summing to the B1 target: filter 3 ms,
+heuristic + sort 1.5 ms, features + predict + blend 3.5 ms (Phase C).
+
+Measured at Phase B (not the Phase D harness; a stdlib Python pty driver
+shaped like [04 section 6](04-bench.md#6-performance-benchmarks): release
+build, the perf DB of 50,000 commands / 500,000 runs from `generate --seed 1`,
+`--cwd` its most-used directory (13,517 runs; the directory does not exist on
+disk, so no repository root), `--session` the newest run's, 40 x 120 pty,
+50 start-ups after one warm-up, 360 keys of the 6.3 cycle with 50 ms between
+them; i9-12950HX, 24 threads, `powersave` governor, load average about 2 from
+other work; ranges over the last three runs of the final code):
+
+| Metric | p50 | p95 | Target |
+|---|---|---|---|
+| B3 `cmd_first_full_render` | 37.7-40.4 ms | 46.0-52.4 ms | <= 50 ms |
+| `cmd_first_results` / `cmd_index_load` | 33-35 / 29-31 ms | 39-45 / 35-40 ms | - |
+| first query, worker | 2.4-2.7 ms | 3.9-4.6 ms | - |
+| B1 `cmd_query.total_ms` (all but the first) | 1.5 ms | 5.4-5.6 ms | <= 8 ms |
+| filter / heuristic + sort | 0.15 / 0.67 ms | 3.9 / 2.6-2.7 ms | 3 / 1.5 ms allowance |
+| B2 keystroke -> first byte of redraw | 1.4 ms | 2.1-2.7 ms | <= 16 ms |
+
+B3 is at its target, not under it with room: one run of three was 2.4 ms over
+at p95 (an earlier run of the same design, before the review fixes, read 44 ms);
+the load is most of it, R1 being 50,000 rows however it is split.
+
+Measured at Phase C with the model active (same driver, corpus and context;
+a model trained on the perf DB: 8,000 groups, 132 trees, ml weight 1.0;
+load average 1.5-2.5 from other work; three runs of the final code): B1
+`cmd_query.total_ms` 3.3-3.7 ms p50, 6.8-7.8 ms p95 (target 8); stage 2 alone
+(2,000 rows) features 0.41 / 0.90, predict 1.13 / 1.99, blend 0.42 / 0.69 ms
+(p50 / p95); B2 1.5-1.6 / 2.9-3.0 ms; B3 38.7-41.0 ms p50 and 46.1, 47.5,
+50.9 ms p95 (one run of three 0.9 ms over the 50 ms target; an earlier run of
+the same design under a load average of 3 read 46-61 ms, the spread being the
+index load's); the first query 4.4-5.0 ms p50 against 2.4-2.7 ms without a
+model. See [03 section 7.2](03-learn.md#72-rank_commands-with-a-model) for
+why prediction is not a LightGBM call.
+
+By query: one letter (typed over all 50,000, 37,000 match; or deleted back
+to, reused) 2.4-2.5 ms p50, 3.8-4.3 ms p95; two letters, narrowed, 2.0-2.4 /
+6.3-6.5 ms; longer queries under 4 ms p95; the empty query again 0.5 ms (kept). The heaviest cases are the
+fuzzy matcher over tens of thousands of texts and the rayon pool waking from
+idle at a low clock; at p95 they exceed the Phase B allowances (filter 3.9
+against 3 ms, heuristic + sort 2.7 against 1.5 ms), which leaves Phase C
+about 2.5 ms at p95 rather than 3.5 ms. The same code measured
+in-process with the pool hot takes about half these times. Before the
+start-up reads were split (one connection, R1-R8 in order) B3 was 55 / 61 ms;
+before the partial sort and the reuse rules B1 was 4.9 / 11.7 ms.
+
+**Measured 2026-11-17, after the merge with the speed work** (the Phase D
+harness, `bench/history.py`; interactive 50,000 / 500,000 perf DB, 40 x 120
+pty, release, each build with the model its own `setup` trained, load below 2;
+before = 4cc43bf, after = this section's design; full tables in
+[results.md](results.md)):
+
+| Metric | before p50 / p95 | after p50 / p95 | Target |
+|---|---|---|---|
+| B3 first results on screen (`startup 200`, 3 rounds each) | 37.5-37.9 / 45.2-46.1 ms | 29.6-30.5 / 35.7-36.5 ms | <= 50 ms |
+| B1 worker per keystroke (`keystroke 200`, 2 rounds) | 5.3-5.5 / 10.5-11.5 ms | 3.1-3.2 / 5.8-6.4 ms | <= 8 ms |
+| B1 with a 0.3 s pause before each key | 5.3-5.4 / 10.7-11.3 ms | 3.4-3.5 / 5.8-6.0 ms | <= 8 ms |
+| B2 keystroke -> first byte (the echo) | 1.7 / 4.0 ms | 1.6 / 2.3-2.5 ms | <= 16 ms |
+| B10 keystroke -> results drawn | 10.5-10.6 / 17.4-18.6 ms | 4.1-4.2 / 6.8-7.3 ms | <= 16 ms |
+| B10 with a 0.3 s pause | 10.6-10.7 / 18.2-19.2 ms | 4.4-4.5 / 9.5-9.7 ms | <= 16 ms |
+| the draw itself | (not logged) | 0.8 / 1.1-1.2 ms | - |
+
+Start-up stages after (p50): R1 read with entries built 15.2-15.8 ms,
+entries moved into the index +4 ms, R2-R8 applied +0.5 ms (index load
+22-23 ms from the worker's start), first query 4.6-4.8 ms, first paint
+3.6-3.7 ms. Per keystroke in the picker (not reused, p50): filter 1.5 ms,
+heuristic 0.1 ms, features 0.8 ms, predict 0.5 ms, blend 0.4 ms. The
+allowances above stand; the filter now fits its 3 ms at p95 (3.6 ms max of
+a 200-key series), the heuristic + sort its 1.5 ms at p50 but not at p95
+(2.3 ms: selecting the head among 37,000 candidates of a first letter).
+
+## 13. Anti-patterns (DO NOT)
+
+| Don't | Do instead | Why |
+|---|---|---|
+| Make `search_worker`, `App`, `render` or `preview` generic over files and commands | Parallel slim TUI in `src/cmd/` (ADR-2) | Fork drift; they are file-shaped throughout |
+| Add rows to `keymap::KEYMAP` or variants to `keymap::Action` | `CMD_KEYMAP` (ADR-3) | `test_every_action_is_bound` and the file help screen |
+| Run SQL, `stat`, `Timestamp::now()` or `std::env::var` inside `render::draw` | Read from `&CmdApp`; fetch on the worker; step `list_clock` on Tick | B5 |
+| Query SQLite per keystroke | `CommandIndex` | B1 |
+| Restore the terminal only on the normal return, or in more than one place without the shared flag | `PickerTerminal` (guard), `restore_on_panic`, `TerminationSignals` (section 4 step 5) | A panic or SIGTERM left the shell in raw mode on the alternate screen with mouse capture on; a second restore pops a keyboard-flag entry that is not the picker's |
+| Unregister the signal handlers when done, or do work in them | Arm the flags (the next signal takes the default action); handlers only set a flag and write a byte | signal-hook cannot put the default disposition back: an unregistered SIGTERM would be ignored |
+| Write events on the UI thread with `Database`'s 5 s `busy_timeout`, or in several transactions on Enter | `busy_timeout = CMD_EVENT_WAIT_MS` on the UI connection; `log_accept`, one transaction | Another process's long write (an import, a `VACUUM`) held Enter for up to 5 s per write before the pick reached the shell |
+| Sort every candidate to show one page, or move 112-byte scores while sorting | `rank_commands(.., head)`: select and sort 32-byte keys; `sort_rest` when a page needs it | Most of an empty query's cost at 50,000 commands |
+| Share one `CmdStore` between threads | One connection per thread (`CmdStore::open_file`) | A rusqlite `Connection` is `Send`, not `Sync` |
+| Create a `SkimMatcherV2` per query or per candidate | One on the worker, shared by reference | Allocation per call; cold scratch space on every rayon thread |
+| Put a `Lazy`/`OnceCell`/thread-local first-use inside the `par_iter` closure | Resolve before the loop and capture by reference | Startup cliff ([docs/how-it-works.md:1205-1207](../how-it-works.md)) |
+| Write the TIMING line before sending `QueryUpdated`, or one line per stage | One line after the send | A log write is a syscall between the keystroke and the results |
+| Put the query or a command in a TIMING or `log::` line | Lengths and counts only | [01 section 10.6](01-record.md#106-no-command-text-outside-eventsdb) |
+| Re-rank, reload the model or refresh the index on a timer or when retraining finishes | Rank only in response to `UpdateQuery`/`Delete` | The list must not move without user input |
+| Reset the selection on `Rows` or `Details` | Only an accepted `QueryUpdated` resets `selected` | A page arriving must not move the cursor |
+| Print the pick while the alternate screen is active by writing to `/dev/tty` | `println!` to stdout after `leave_tui` | stdout is the widget's pipe |
+| Execute the picked command, or append a newline that the shell would run | Print the text; the widget assigns the buffer | Requirement: lands on the prompt for editing |
+| Take over Ctrl-R when the user rebound it (fzf, Atuin) or when recording is off | The three binding guards of section 11 | Never break a working Ctrl-R |
+| Bind Ctrl-R with one `bind -x` (bash) or in one keymap | `bind -m` per keymap, each with its own guard (section 11.2) | A later `set -o vi` left readline's search on Ctrl-R |
+| Leave `psychic history` typed at the prompt as a silent dead end, or type the pick into the terminal (`TIOCSTI`) | Print it, plus the stderr hint of section 11.4; `ph` for a typed entry | A user typed the command, got the pick as output, and could not run it with Enter |
+| Define `ph` over the user's own `ph`, or let bash's `history -s` look like a run | The `ph` guard; `__psychic_hist_count=''` after `history -s` | A user's alias must keep working; a pick that never ran must not be recorded |
+| Check that the pick appears on screen and stop there | IT-B-16/17: no side effect after the picker's Enter, the prompt drawn before the pick, the side effect after the shell's Enter | Text on screen passes whether it is on the prompt or printed as output |
+| `--query "$BUFFER"` with a space | `--query="$BUFFER"` | A buffer beginning with `-` would parse as an option |
+| Use tuples for multi-field results (`(String, u32, i64)`) | Named structs (`DirUse`, `PrecededBy`, `Shown`) | [llm.md:5](../../llm.md) |
+| Hard-code a heuristic weight or page size in `rank.rs`/`worker.rs` | `tuning.rs` constants (section 3) | The benchmark tunes them in one place |
+| Add a hand-weighted term to the cold-start order | Measure it as a tie-break inside equal fzf scores against pure fzf on every corpus and both query styles (04 section 9); add it only if it loses nowhere | The hand-weighted heuristic lost to newest-first; fzf's order is the floor |
+
+## 14. Test case specifications
+
+### 14.1 Unit tests
+
+Fixtures use `now = 1_000_000` and an index built with the mutators of 5.1.
+
+| ID | Component | Input | Expected | Edge cases covered |
+|---|---|---|---|---|
+| TC-B-01 | `heuristic` recency | Command last run 10 s ago, empty query | `recency = 0.99723`, `heuristic = combine(.., 0, 0) = 0.99723` (+-1e-5) | `last_run_at > now` -> `recency = 1.0` |
+| TC-B-02 | `rank_commands` fzf order | `git status` (7,200 s ago), `tig git` (60 s), `grep -i x` (1 s); query `gi` | `tig git`, `git status`, `grep -i x` (equal scores newest first, then the scattered match); empty query: newest first | - |
+| TC-B-03 | `combine` | parts (recency 1.0, fzf 10) and (1e-9, 11) with `lo = 10`, `hi = 11` | the second is higher; (0.5, 11) gives 0.75; never above 1 | - |
+| TC-B-04 | `rank_commands` tie-break | Two commands, identical stats, `db_id` 5 and 9 | 9 before 5 | Same `score`, different `last_run_at` -> newer first |
+| TC-B-05 | `rank_commands` takes the filter's score | `zz top` (1 s ago, `fzf` 30) and `abc zz` (100 s ago, `fzf` 60) passed as candidates of `zz` | `abc zz` first: the order follows the given scores, nothing is scored again; no model fields set | - |
+| TC-B-06 | `filter` | Texts `git status`, `cargo build`, `ls`; query `gs` (not `cargo test`: its `g`...`s` is a fuzzy match) | Only `git status` | Empty query keeps all 3 with `fzf = 0`; a `deleted` entry is never returned |
+| TC-B-07 | `filter` narrowing | Queries `g` then `gi` then `x` on 3 texts | Second call's base-set size equals the first call's match count; the third call's base set is all entries | A scope change keeps the trail (matching is in scope `All`): `gi` in Session after `g` narrows and equals a fresh Session filter; result of narrowed `gi` equals un-narrowed `gi` |
+| TC-B-08 | `filter` scopes | A run here only, B in repo only, C in session only, D none | `Directory` -> [A]; `Repo` -> [B]; `Session` -> [C]; `All` -> 4 | `ctx.dir = None` with `Directory` -> empty |
+| TC-B-09 | supersession | Queue `UpdateQuery(1)`, `UpdateQuery(2)`, `Details`, `UpdateQuery(3)`, `UpdateQuery(4)` drained in that order | Processed: `UpdateQuery(2)`, `Details`, `UpdateQuery(4)` | A single request passes through unchanged; `Details(1)`, `Details(2)`, `GetRows`, `Details(3)` -> `GetRows`, `Details(3)` |
+| TC-B-10 | stale responses | `shown_query_id = 5`; deliver `QueryUpdated(4)`, then `(6)`; `Rows(5, ..)` | 4 ignored, 6 applied (selection reset to 0), `Rows(5)` ignored | `Rows` with `start != rows.len()` ignored |
+| TC-B-11 | `CMD_KEYMAP` | Iterate `CmdAction` | Every action has exactly one row; no trigger appears in two rows; every description is non-empty | `lookup(Char('x'), CONTROL)` -> `DeleteSelected`; `lookup(Char('x'), NONE)` -> `AppendToQuery`; `lookup(Char('q'), CONTROL)` -> `None` |
+| TC-B-12 | modal keys | `confirm_delete = Some(7)`; press `n`, then set again and press `y` | First: no request, cleared, `deleted_any` false. Second: one `Delete { command_id: 7, .. }`, `deleted_any` true | `help_visible` + Esc -> help closed, picker still running; with a confirmation up, the wheel moves nothing and an accepted `QueryUpdated` clears it |
+| TC-B-13 | row text | `"echo a\nb\tc\x1b[31m"`, width 40 | `echo a↵ b    c·[31m` | Width 6 -> `echo …`; a CJK command truncates on a character boundary |
+| TC-B-14 | impressions | New subsession; `wants_impressions(false)` at once, then after `created_at` is aged 200 ms, then again after logging | `false`, `true`, `false` | `force = true` at once -> `true`; `episode_queries` gains the query on the first call even when it returns `false` |
+| TC-B-15 | `CommandIndex` windows | `run_times = [now-4000, now-3000, now-10]` | `runs_in_window(.., 3600) = 2`, `(.., 60) = 1`, `(.., 5) = 0` | A run exactly at `now - secs` is excluded; at `now` included |
+| TC-B-16 | `record_run` ordering | Runs at 300 (exit 0), 100 (exit 1), 200 (exit NULL) | `run_times = [100, 200, 300]`, `last_exit_code = Some(0)`, `last_fail_at = 100` | - |
+| TC-B-17 | TIMING shape | A `CmdQueryTimings` with known numbers -> `to_json()` | Exactly the keys of section 6.5 (with `reused`); `features_ms` is `null`; contains no string value but `op` | - |
+| TC-B-18 | filter reuse | Queries `g`, `gi`, `g`, `""`, `g`; then `g` in another scope; then a delete | The second `g` is `reused` (base set 0, same candidates), also after `""` and in another scope (its own commands among them); not after `forget_narrowing`; `gr` after `gi` narrows from `g` and equals a fresh filter | - |
+| TC-B-19 | partial order | 2,500 commands, `head` in {0, 1, 200, len-1} | `scores[..head]` equal the full order's head; the rest holds the same commands; after `sort_rest` the whole order equals the full one | - |
+| TC-B-20 | empty-query cache | `""`, `c1`, `""` on 230 commands; `GetRows` past 200; delete | The second `""` answers with the same `Arc` (no ranking); the page past the head is in rank order and the cache holds the sorted copy; a delete empties the cache | - |
+| TC-B-22 | `fzf.rs` | fzf's `TestFuzzyMatch` vectors (default scheme, V1 and V2, 20 matches and 3 non-matches); the history scheme on `git status` / `tig git` / `tig/git` for `gi`; extended-search splitting and smart case; a 60,000-character text; 17 queries over a 12-line list | The scores of fzf's tests; equal history-scheme scores (48 each), default 10 > 9; the V1 fallback's score; the orders the fzf 0.74.5 binary printed (`src/cmd/fzf/expected.rs`) | An ignored test writes this module's orders for a list and queries, to diff against `fzf --filter` (section 7.1) |
+| TC-B-21 | id split | `split_ids` of `1..=10` in 4, `5..=6` in 4, `i64::MIN..=i64::MAX` in 4 | `[1-3, 4-6, 7-9, 10]`; `[5, 6]`; 4 contiguous parts covering both ends | - |
+| TC-B-23 | match and score in one pass (`fuzzy.rs`) | 300,000 random texts and queries over ASCII case pairs, shared mask bits, multi-byte characters (the Kelvin sign, `İ`, `é`), spaces and backslashes; 200,000 ASCII-only pairs | `Pattern::test` keeps exactly what `SkimMatcherV2` matches, with fzf's score; on ASCII texts the byte scan alone equals Skim | A non-ASCII query character whose lower case differs, or a TAB: fzf may not match, `NO_FZF_MATCH` |
+| TC-B-24 | fzf's byte path (`fzf.rs`) | 100,000 random ASCII texts and patterns, both schemes, both cases; 50,000 one-character patterns | Byte and `char` paths give the same scores; the one-character path equals full V2 | Non-ASCII text decoded; a non-ASCII term matches no ASCII text |
+| TC-B-25 | seeds in slices | `2 * SEED_SLICE + 100` commands | One idle step tests one slice; a query between slices is answered in full and leaves the seed where it was; three steps finish it, equal to a fresh filter; a delete drops the seed in progress | - |
+| TC-B-26 | a scope's `recency_rank` | Trained fixture, scope Directory, queries `""`, `g`, `m`, `c`, `ls` | Every model-scored row's `recency_rank` counts newer commands among the `All` matches; at least one differs from a count among the scope's | - |
+| TC-B-27 | seeded and unseeded rankings | 2,005 random commands; queries `g` ... `a b`, with and without a stub model | Candidates and every score bit-equal | - |
+| TC-B-28 | event writes under a held lock | `CmdEvents` on a file store with `busy_timeout = CMD_EVENT_WAIT_MS`; another connection in `BEGIN IMMEDIATE`; `log_accept` | `Err` after between 50 and 300 ms; nothing written | - |
+
+### 14.2 Integration tests
+
+| ID | Flow | Setup | Verification | Teardown |
+|---|---|---|---|---|
+| IT-B-01 | `CommandIndex::load` | Temp data dir; `record_run` 6 runs over 3 commands, 2 dirs, 1 repo, 2 sessions; 1 pick event | `entries.len() == 3`; `dir_stat`, `runs_in_repo`, `follower_runs`, `session_commands`, `picks_in_window` equal hand-written expected values; `ctx.prev_templates` lists the session's last 3 templates newest first | `remove_dir_all` |
+| IT-B-02 | Worker round trip | As IT-B-01; `worker::spawn`; send `UpdateQuery("", 1, All)`, `UpdateQuery("g", 2, All)`, `Details`, `Delete`, `Shutdown` | `Loaded`, then `QueryUpdated` per accepted query with the expected texts in order; `Details` has the expected dirs; after `Delete` the command is absent from the rows and from the three tables; the thread joins | `remove_dir_all` |
+| IT-B-03 | Pick logging | `CmdEvents` on a temp store; subsessions `g` (impressions for 3 rows), `gi` (`log_accept` of the same 3 rows and the pick of rank 2) | `command_events`: 3 impressions with ranks 1-3 and subsession ids, 1 pick with `episode_queries = ["g","gi"]`, `cwd`, `repo_root`, `shell_session` set; `commands.pick_count == 1` | `remove_dir_all` |
+| IT-B-04 | Render | `ratatui::backend::TestBackend` 140x30 and 100x30 with a `CmdApp` holding 3 rows (one failed, one run here, one multi-line) | 140 wide: list and preview side by side; 100 wide: stacked; the failed row has `!`, the here row `*`, the multi-line row `↵`; the preview shows `Runs` and `Last exit` lines; debug on shows `model: none`; help overlay lists 12 key rows | none |
+| IT-B-05 | Picker end to end (`tests/picker.rs`, pty helper `tests/support/mod.rs`) | Temp data dir with `echo one`, `echo two` (newer); spawn `psychic --data-dir T history --cwd /tmp` on a pty with stdout redirected to a file | Environment includes `PSYCHIC_NO_RETRAIN=1`. Before every key, wait until the pty has been quiet for 300 ms (the list is drawn). Send Enter: exit 0, file is `echo two\n`. Second run, send `one`, wait for quiet again, then Enter: `echo one\n`. Third run, send Esc: exit 0, file empty. `app.log` in T contains `cmd_first_full_render` and no `echo` | `remove_dir_all` |
+| IT-B-06 | Widget blocks ship | Output of `psychic zsh`, `psychic bash`, `psychic fish` | Each contains `__psychic_history_widget`, `PSYCHIC_NO_CTRL_R`, `__psychic_history_enabled`, `--query=`, `PSYCHIC_CTRL_R`, `PSYCHIC_NO_PH` and `__psychic_history_typed`; none contains `--query "` | none |
+| IT-B-07 | No query text in logs | IT-B-05's second run with the query `SENTINELq` | `app.log` does not contain `SENTINELq` | `remove_dir_all` |
+| IT-B-08 | Ctrl-R in each shell (`tests/picker.rs`) | zsh, bash and fish on a pty with the script, recording on by the marker; `echo alpha`, `echo beta` recorded in session `seed` | Type `beta`, Ctrl-R, Enter (picker), Enter (shell): `echo beta` runs, is recorded once in the shell's session, and the one pick event has `query = beta`, the shell's session and cwd, and a timestamp 0-300 s before that run (the link `follows_pick` of [03 section 5.1](03-learn.md#51-inputs-and-the-replayer) makes, `CMD_PICK_RUN_SECS`). Then `echo kept`, Ctrl-R, Esc, Enter: `echo kept` runs as typed and no second pick is logged | Scratch dropped |
+| IT-B-09 | Binding guards | Each shell: recording on; `PSYCHIC_NO_CTRL_R=1`; recording off; the user's own Ctrl-R bound before the script (bash: a readline function, and `bind -x` as fzf does; fish: both modes, and insert mode only) | The widget is bound in the first case only; fish with only insert mode taken binds the default mode and leaves insert alone | Scratch dropped |
+| IT-B-10 | A failing or missing picker | Each shell with `PSYCHIC_BIN=false`; fish also with a binary that does not exist | Ctrl-R then Enter runs the typed line unchanged; fish prints nothing about the missing binary | Scratch dropped |
+| IT-B-11 | The line goes over verbatim | Each shell; `echo -x '$HOME'` recorded; type `-x '$H`, Ctrl-R, Enter, Enter | The pick event's query is `-x '$H` exactly; `-x $HOME` is printed | Scratch dropped |
+| IT-B-12 | Enter under another process's write lock (`tests/picker.rs`) | `echo locked-one` recorded; the test holds `BEGIN IMMEDIATE` on a second connection for the picker's whole run | Enter to exit under 1 s (before: `busy_timeout` 5 s per write); stdout `echo locked-one\n`, exit 0; no pick row; `app.log` has `command event logging failed: starting a transaction failed: database busy` | Scratch dropped |
+| IT-B-13 | A panic gives the terminal back (`tests/picker.rs`, E-B-20) | The picker on a pty with `PSYCHIC_HISTORY_TEST_PANIC=1` | Exit 101; after the last `\x1b[?1049h`, in order: `\x1b[<1u`, `\x1b[?1000l`, `\x1b[?1049l`, `\x1b[?25h`; the panic message after them; the pty's slave termios has `ICANON` and `ECHO`; stdout empty. Fails without the hook (the guard alone restores after the message) | Scratch dropped |
+| IT-B-14 | SIGTERM and SIGHUP give the terminal back (`tests/picker.rs`, E-B-21) | The picker on a pty, settled; `kill(pid, SIGTERM)`, then a fresh one with `SIGHUP` | Killed by that signal; the restore sequences and cooked termios as IT-B-13; stdout empty. Fails without `TerminationSignals` | Scratch dropped |
+| IT-B-15 | Esc right after a delete still deletes (`tests/picker.rs`) | `echo keep-me` and `echo delete-me` recorded; the picker on a pty, settled; the test takes the write lock (`BEGIN IMMEDIATE` on its own connection), presses Delete, `y`, Esc, holds the lock 300 ms more and rolls back. Second test: the lock held until the picker exits | First: exit 0, nothing printed, `commands` holds only `echo keep-me` and `deleted_commands` one row. Second: Esc to exit takes 0.9-2.5 s (`CMD_EXIT_DELETE_WAIT_MS`, not the worker's 5 s `busy_timeout`), exit 0, and `app.log` has the warning that a delete may not have finished | Scratch dropped |
+| IT-B-16 | One Enter picks, the next runs (`tests/picker.rs`) | Each shell, recording on, `touch <scratch>/marker` recorded; set-ups: plain; bash with a two-line `PS1` and another tool's `PROMPT_COMMAND` entry; zsh with a two-line `PROMPT`; vi editing turned on after the script (`set -o vi`, `bindkey -v`, `fish_vi_key_bindings`). A known prompt `PROMPT> ` | Ctrl-R, Enter: `marker` does not exist, and after the picker's `\x1b[?1049l` the screen (escapes and `\r` removed) shows `PROMPT> touch `. Enter: `marker` appears; one run recorded. Fails with a widget that prints the pick, accepts the line, skips the prompt redraw (zsh), or binds bash's current keymap only (vi) | Scratch dropped |
+| IT-B-17 | `ph` (`tests/picker.rs`) | As IT-B-16, plain | `ph touch`, Enter in the picker: zsh and fish as IT-B-16; bash prints `psychic: press Up to get the command on your prompt`, and Up shows `PROMPT> touch `; `marker` absent until Enter at the prompt. One run recorded (no `ph` run, no run from `history -s`); one pick with `query = touch` in the shell's session. Fails without bash's `__psychic_hist_count=''` | Scratch dropped |
+| IT-B-18 | `ph` guard and `PSYCHIC_CTRL_R` | Each shell: recording on; the user's own `ph` (alias, fish function) before the script; `PSYCHIC_NO_PH` and `PSYCHIC_NO_CTRL_R`; recording off; Ctrl-R taken in every keymap | `ph` ours / the user's / absent / ours / ours; `PSYCHIC_CTRL_R` `bound`, `bound`, `opted-out`, `recording-off`, `taken` | Scratch dropped |
+| IT-B-19 | Typed by hand (`tests/picker.rs`) | The picker on a pty with stdout the pty, without and with `PSYCHIC_SHELL` | After the picker leaves: the pick, then the hint of section 11.4 naming Ctrl-R, `type ph` and `psychic history --status`; `psychic init` only without `PSYCHIC_SHELL`. IT-B-05 (stdout a file): no hint | Scratch dropped |
+
+Unit tests of `integration.rs`: every `PSYCHIC_CTRL_R` value has its own
+line; the check and rebind lines per shell; no commands for an unknown shell;
+the hint is one line naming Ctrl-R, `ph` and `--status`.
+
+`tests/support/mod.rs` holds the pty helper shared by `tests/shell_hooks.rs`
+and `tests/picker.rs` ([01 section 15.3](01-record.md#153-shell-level-tests-testsshell_hooksrs)).
+
+## 15. Error handling matrix
+
+| # | Failure | Detection | Response | Fallback | Logging |
+|---|---|---|---|---|---|
+| E-B-01 | Database cannot be opened or R1-R8 fail | `Err` in the worker's load | `CmdResponse::LoadFailed { message }` (operation and sqlite code only) | Picker stays open with an empty list, the status `Could not read history: <message>` and, once that is cleared, `Could not read history.` in the list; Enter/Esc exit 0 with nothing | `log::error!` |
+| E-B-02 | No controlling terminal (`/dev/tty` cannot be opened) | `Err` at section 4 step 5 | Worker shut down; `Err` to `main`, exit 1, stdout empty | Widget leaves the buffer untouched | stderr via `main` |
+| E-B-03 | Terminal set-up fails midway | `Err` after raw mode is on | `input::leave_tui` is called before returning the `Err` | As E-B-02 | stderr via `main` |
+| E-B-04 | Worker thread panics | `event_rx`/`worker_tx` send fails, or `JoinHandle::join` is `Err` | UI sets status `History worker stopped`; list frozen; keys still work | Enter prints the selected row from `rows` | `log::error!` |
+| E-B-05 | Fuzzy match yields nothing | `total_matched == 0` | List shows `No match.` | Enter exits with nothing | None |
+| E-B-06 | Event logging fails (database busy/locked: another process held the write lock for more than `CMD_EVENT_WAIT_MS`) | `Err` from `log_impressions`/`log_accept` | Ignored for the user: the pick is still printed, at most `CMD_EVENT_WAIT_MS` later | That episode (impressions, pick, pick count) is not logged | `log::error!("command event logging failed: <operation> failed: database busy")` |
+| E-B-07 | `Delete` fails in the database | `Err` from `delete_command` (D1-D5; a busy D6 is E-R-25 of 01, not this) | Worker does not call `index.remove`; sends `CmdResponse::DeleteFailed`, then answers with the unchanged list | UI status `Could not delete` | `log::error!` |
+| E-B-08 | `Details` query fails | `Err` | `Details` with empty vectors | Preview shows no directory lines | `log::warn!` |
+| E-B-09 | Stale `QueryUpdated`/`Rows` | id tests of section 8.2 | Dropped | - | None |
+| E-B-10 | `--session` given but that session has no rows | R5 returns nothing | `prev_templates` all `None`; R6 skipped; `Session` scope shows `No match.` | Sequence terms are 0 | None |
+| E-B-11 | cwd unknown (no `--cwd`, no `$PWD`, `current_dir` fails) | all three absent | `cwd = ""`, `ctx.dir = None`, `repo_root = None` | Directory terms are 0; `Directory`/`Repo` scopes empty | `log::warn!` |
+| E-B-12 | Terminal narrower than 20 columns or shorter than 5 rows | `f.area()` | Draw only the input box | - | None |
+| E-B-13 | Command text contains control or escape characters | - | `path_display::printable` in rows and preview | - | None |
+| E-B-14 | Query contains characters invalid for the matcher (any Unicode) | - | Passed through; the filter keeps or drops the command (section 6.3) | - | None |
+| E-B-15 | The picker binary fails or is killed under the widget | Non-zero exit / empty stdout | zsh, fish: buffer untouched, prompt repainted. bash: `\|\| return` leaves `READLINE_LINE` untouched. The terminal itself is given back by the picker (E-B-20, E-B-21), except on SIGKILL, which nothing can catch | - | None |
+| E-B-16 | `psychic` not on PATH under the widget | zsh, bash: shell error "command not found" on the terminal. fish: `command -q` fails | Buffer untouched; fish prints nothing | - | None |
+| E-B-17 | Recording is off and nothing is recorded | `total_commands == 0 && !recording_on` | The two-line hint of section 8.3 | Esc/Enter exit 0 | None |
+| E-B-18 | `tty_input::spawn` fails | `Err` | As E-B-02 | - | stderr via `main` |
+| E-B-19 | The UI thread's `CmdStore::open` fails (section 4 step 6) | `Err` | `CmdEvents` is built with `store = None` | No impressions or picks are logged this session; the picker works | `log::error!` |
+| E-B-20 | The UI thread panics | Panic hook (UI thread only) | The hook restores the terminal (`leave_tui`'s sequence, raw mode off), then the default hook prints the message; unwinding drops `PickerTerminal`, which does nothing more | Exit 101, nothing on stdout; widget as E-B-15 | The panic message on stderr |
+| E-B-21 | SIGTERM, SIGHUP or SIGINT while the picker runs | `TerminationSignals` | `CmdEvent::Terminate`: the loop ends, the terminal is restored, nothing is printed, the process dies of the same signal | A second signal kills at once (the default action) | `log::info!` with the signal number |
+| E-B-22 | Exit (Esc, Enter, a signal) while the worker is still inside a `Delete` (its transaction, or waiting for another process's write lock) | `deleted_any` at section 4 step 8 | Pick printed first; then wait up to `CMD_EXIT_DELETE_WAIT_MS` for the worker to stop, so the delete commits before the process exits | Still busy after the wait: the process exits, the delete is rolled back and the command stays (the user deletes it again) | `log::warn!` (no text); `TIMING` `cmd_exit_delete_wait` |
+| E-B-23 | `psychic history` typed at the prompt | stdout is a terminal | The pick is printed, then the hint of section 11.4 on stderr | `ph`, or Ctrl-R | None |
+| E-B-24 | Ctrl-R is someone else's (fzf, Atuin, a plugin), or rebound after the script ran | The binding guards; `PSYCHIC_CTRL_R` | Left alone; `--status` names the state, how to see the binding and how to bind the picker to another key | `ph` | None |
+| E-B-25 | `ph` is already the user's | `whence` / `type -t` / `type -q` at load | Not defined; `ph` keeps doing what it did | Ctrl-R, or the user's own binding of `__psychic_history_widget` | None |
+
+## 16. References
+
+| Topic | Location |
+|---|---|
+| Targets B1, B2, B3, B5, R3; ADR-2, ADR-3, ADR-7, ADR-11, ADR-12 | [00-blueprint.md section 2](00-blueprint.md#2-success-metrics), [section 8](00-blueprint.md#8-architecture-decision-records) |
+| SQL R1-R10, E1-E2, D1-D5 | [01-record.md section 6](01-record.md#6-sql-statements) |
+| `HistoryArgs` | [01-record.md section 4.2](01-record.md#42-psychic-history) |
+| Opt-in check used by the binding guards | [01-record.md section 10.1](01-record.md#101-opt-in) |
+| Model stage added to `rank_commands` | [03-learn.md section 7](03-learn.md#7-serving-two-stage-rank-and-blend) |
+| How B1-B3 are measured | [04-bench.md section 6](04-bench.md#6-performance-benchmarks) |
+| File-mode worker protocol and supersession | [src/search_worker.rs:112-203](../../src/search_worker.rs), [src/search_worker.rs:1508-1534](../../src/search_worker.rs) |
+| File-mode "send, then log one TIMING line" | [src/search_worker.rs:1285-1302](../../src/search_worker.rs), [src/search_worker.rs:1229-1271](../../src/search_worker.rs) |
+| File-mode event loop to mirror | [src/main.rs:877-1146](../../src/main.rs) |
+| File-mode terminal set-up and shutdown order | [src/main.rs:765-781](../../src/main.rs), [src/main.rs:796-820](../../src/main.rs) |
+| File-mode pick output | [src/main.rs:1126-1129](../../src/main.rs) |
+| Impression rule and episode queries | [src/analytics.rs:22](../../src/analytics.rs), [src/analytics.rs:94-111](../../src/analytics.rs), [src/analytics.rs:168-175](../../src/analytics.rs) |
+| Existing Ctrl-T widgets and binding guards | [shell/psychic.zsh:71-94](../../shell/psychic.zsh), [shell/psychic.bash:75-95](../../shell/psychic.bash), [shell/psychic.fish:70-91](../../shell/psychic.fish) |
+| Keymap types reused | [src/keymap.rs:83-97](../../src/keymap.rs), [src/keymap.rs:513-522](../../src/keymap.rs) |
+| Layout threshold precedent | [src/render.rs:392-460](../../src/render.rs) |

@@ -462,7 +462,7 @@ impl Ranker {
     /// Crossover is at `k * l` = 30 positives, saturating around 60.
     ///
     /// Returns: (w_simple, w_lightgbm) where weights sum to 1.0
-    fn compute_blend_weights(num_positive_examples: usize) -> (f64, f64) {
+    pub(crate) fn compute_blend_weights(num_positive_examples: usize) -> (f64, f64) {
         let k = 15f64;
         let l = 2f64;
 
@@ -704,7 +704,7 @@ impl<'a> QueryClicks<'a> {
 ///
 /// Not `Ranker::sigmoid`, which carries the slope and midpoint tuned for the
 /// simple model's raw score and would flatten this one to nothing.
-fn logistic(score: f64) -> f64 {
+pub(crate) fn logistic(score: f64) -> f64 {
     1.0 / (1.0 + (-score).exp())
 }
 

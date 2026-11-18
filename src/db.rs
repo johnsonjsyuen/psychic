@@ -290,7 +290,8 @@ impl Database {
             [],
         )?;
 
-        Self::migrate(conn)
+        Self::migrate(conn)?;
+        crate::cmd::store::create_schema(conn)
     }
 
     /// Bring an existing database up to what the code above expects.

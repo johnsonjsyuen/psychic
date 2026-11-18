@@ -1,0 +1,4 @@
+# Link native Linux builds with mold for faster incremental links.
+# Scoped to the Linux target so macOS/other builds keep their default linker.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

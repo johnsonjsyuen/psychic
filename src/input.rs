@@ -703,7 +703,7 @@ fn send_query_update(app: &mut App) {
 /// subshell, printing a path on the way out, or shutting down. There were three
 /// copies of this sequence; the one in main's shutdown had drifted into being
 /// written out longhand.
-pub fn leave_tui(terminal: &mut Terminal<CrosstermBackend<std::fs::File>>) -> Result<()> {
+pub fn leave_tui<W: std::io::Write>(terminal: &mut Terminal<CrosstermBackend<W>>) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
